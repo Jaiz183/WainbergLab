@@ -128,6 +128,7 @@ def profile_faiss_ivf(cells: np.ndarray,
     into. More voronoi cells => more accuracy, but less speed.
     :param num_centroids: number of centroids initialized in k-means clustering.
     More centroids => more accuracy, less speed.
+    :return: neighbours, indexing time, searching time.
     """
     # Depth is dimensionality of space that PCs are in (number of PCs per
     # sample). Subtract one for ID column.
@@ -163,6 +164,7 @@ def profile_faiss_pq(cells: np.ndarray, vec_resolution: int,
     into. More voronoi cells => more accuracy, but less speed.
     :param num_centroids: number of centroids initialized in k-means clustering.
     More centroids => more accuracy, less speed.
+    :return: neighbours, indexing time, searching time.
     """
     # Filter out any PCs with null entries.
     # cells = cells[[not any(np.isnan(cell)) for cell in cells]]
@@ -219,6 +221,7 @@ def profile_faiss_sq(cells: np.ndarray, float_resolution: int,
     into. More voronoi cells => more accuracy, but less speed.
     :param num_centroids: number of centroids initialized in k-means clustering.
     More centroids => more accuracy, less speed.
+    :return: neighbours, indexing time, searching time.
     """
     # Construct empty index for L2 norm and wrap with product quantizer.
     depth = len(cells[0])
@@ -242,6 +245,42 @@ def profile_faiss_sq(cells: np.ndarray, float_resolution: int,
     # Compute nearest neighbour.
     start = time.time()
     distances, indices = quantized_index.search(query, num_neighbours)
+    search_time = time.time() - start
+
+    return indices, index_time, search_time
+
+
+def profile_faiss_imi(cells: np.ndarray,
+                      num_voronoi_cells: int, num_centroids: int,
+                      num_neighbours: int,
+                      query: np.ndarray, search_untrained: bool):
+    """
+    Monitors performance of FAISS algorithm (IMI - multi index quantizer).
+    :param cells: PCs corresponding to individual cells.
+    :param num_voronoi_cells: number of voronoi cells that the space is split
+    into. More voronoi cells => more accuracy, but less speed.
+    :param num_centroids: number of centroids initialized in k-means clustering.
+    More centroids => more accuracy, less speed.
+    :return: neighbours, indexing time, searching time.
+    """
+    depth = len(cells[0])
+
+    # Create index.
+    start = time.time()
+    index = faiss.index_factory(depth,
+                                f'IMI2x{int(np.log2(num_centroids) // 2)},Flat')
+
+    # Train and add actual data.
+    index.train(cells)
+    index.add(cells)
+    index_time = time.time() - start
+
+    # Number of neighbours to visit on each search action.
+    index.nprobe = num_voronoi_cells
+
+    # Compute nearest neighbour.
+    start = time.time()
+    distances, indices = index.search(query, num_neighbours)
     search_time = time.time() - start
 
     return indices, index_time, search_time
@@ -745,7 +784,7 @@ def plot_trials(df: pl.DataFrame, save_to: str) -> None:
     plt.savefig(save_to)
 
 
-if __name__ == '__main__':
+def load_pcs():
     # Compute PCs.
     if not os.path.exists(f'{KNN_DIR}/rosmap_sc_pcs.npy'):
         # Saves numpy file.
@@ -761,8 +800,71 @@ if __name__ == '__main__':
         np.save(f'{KNN_DIR}/rosmap_sc_pcs.npy', pcs)
     else:
         pcs = np.load(f'{KNN_DIR}/rosmap_sc_pcs.npy')
-    num_trials = 1
 
+    return pcs
+
+
+def sample_data(pcs: np.ndarray, proportion: float) -> tuple[
+    np.ndarray, list[int], np.ndarray, np.ndarray]:
+    """
+    Retrieves proportion percent sample from pcs.
+    :param pcs: input array with rows representing data points and columns representing features / dimensions.
+    :return: tuple of arrays corresponding to sample, further split into training and test sets.
+    """
+    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_random_sample_all.npy'):
+        sample, sample_indices = random_sample(pcs, proportion, False,
+                                               f'{KNN_DIR}/rosmap_pcs_random_sample_all')
+    else:
+        sample, sample_indices = random_sample(pcs, proportion, True,
+                                               f'{KNN_DIR}/rosmap_pcs_random_sample_all')
+
+    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_random_sample_train.npy'):
+        sample_train_data, sample_test_data = split_data(pcs, 50,
+                                                         f'{KNN_DIR}/rosmap_pcs_full_train.npy',
+                                                         f'{KNN_DIR}/rosmap_pcs_full_test.npy')
+
+        np.save(f'{KNN_DIR}/rosmap_pcs_random_sample_train.npy',
+                sample_train_data)
+        np.save(f'{KNN_DIR}/rosmap_pcs_random_sample_test.npy',
+                sample_test_data)
+    else:
+        sample_train_data = np.load(
+            f'{KNN_DIR}/rosmap_pcs_random_sample_train.npy')
+        sample_test_data = np.load(
+            f'{KNN_DIR}/rosmap_pcs_random_sample_test.npy')
+
+    return sample, sample_indices, sample_train_data, sample_test_data
+
+
+def split_data(pcs: np.ndarray, proportion: float, save_train_to: str,
+               save_test_to: str) -> tuple[np.ndarray, np.ndarray]:
+    ### TEST ON NEW DATA (LABEL TRANSFER APPLICATION). ###
+    # Split dataset 50-50 for test and training.
+    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_train_full.npy'):
+        train_data, train_data_indices = random_sample(pcs,
+                                                       proportion,
+                                                       False,
+                                                       save_train_to)
+        # Make remaining test data by just removing any vector in train_data.
+        test_filter = [True] * len(pcs)
+        for train_data_index in train_data_indices:
+            test_filter[train_data_index] = False
+
+        test_data = pcs[test_filter]
+
+        np.save(save_test_to, test_data)
+        np.save(save_train_to, train_data)
+    else:
+        train_data = np.load(f'{save_train_to}.npy')
+        test_data = np.load(f'{save_test_to}.npy')
+
+    return train_data, test_data
+
+
+if __name__ == '__main__':
+    pcs = load_pcs()
+
+    # Define hyperparameters.
     faiss_pq_hyperparameters = {'vec_resolution': [5, 10, 25],
                                 'num_voronoi_cells': [15, 30, 45],
                                 'num_centroids': [750, 1500, 3000], }
@@ -777,6 +879,9 @@ if __name__ == '__main__':
 
     faiss_ivf_hyperparameters = {'num_voronoi_cells': [30],
                                  'num_centroids': [150, 300, 600, 4000, 5000], }
+
+    faiss_imi_hyperparameters = {'num_voronoi_cells': [30],
+                                 'num_centroids': [3500, 4000, 4500], }
 
     pynndescent_hyperparameters = {'index_neighbours': [5, 30, 50],
                                    'pruning_degree_multiplier': [0.5, 1.5, 3],
@@ -811,36 +916,8 @@ if __name__ == '__main__':
     annoy_hyperparameters = {'num_trees': [75, 150, 300],
                              'num_nodes_searched': [375, 750, 1500]}
 
-    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_random_sample_all.npy'):
-        sample, sample_indices = random_sample(pcs, 10, False,
-                                               f'{KNN_DIR}/rosmap_pcs_random_sample_all')
-    else:
-        sample, sample_indices = random_sample(pcs, 10, True,
-                                               f'{KNN_DIR}/rosmap_pcs_random_sample_all')
-
-    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_random_sample_train.npy'):
-        sample_train_data, sample_train_data_indices = random_sample(sample, 50,
-                                                                     False,
-                                                                     f'{KNN_DIR}/rosmap_pcs_random_sample_train')
-        # Make remaining test data by just removing any vector in train_data.
-        test_filter = [True] * len(sample_indices)
-        for train_data_index in sample_train_data_indices:
-            test_filter[train_data_index] = False
-
-        sample_test_data = sample[test_filter]
-        # Check that there are no overlaps.
-        # assert not any(
-        #     np.any(np.all(v == test_data, axis=1)) for v in train_data)
-
-        np.save(f'{KNN_DIR}/rosmap_pcs_random_sample_train.npy',
-                sample_train_data)
-        np.save(f'{KNN_DIR}/rosmap_pcs_random_sample_test.npy',
-                sample_test_data)
-    else:
-        sample_train_data = np.load(
-            f'{KNN_DIR}/rosmap_pcs_random_sample_train.npy')
-        sample_test_data = np.load(
-            f'{KNN_DIR}/rosmap_pcs_random_sample_test.npy')
+    sample, sample_indices, sample_train_data, sample_test_data = sample_data(
+        pcs, 10)
 
     # logger.debug(len(pcs))
     # logger.debug(len(pcs) // 2)
@@ -880,27 +957,27 @@ if __name__ == '__main__':
                                                               'faiss',
                                                               f'{KNN_DIR}/umap_true_nn_sample.npy',
                                                               leaf_size=50)
+        # algorithm_parameters = {
+        #     'ngt_onng': (profile_ngt_onng, ngt_onng_hyperparameters),
+        #     'ngt_panng': (profile_ngt_panng, ngt_panng_hyperparameters),
+        #     'ngt_anng_default': (profile_ngt_anng_default,
+        #                          ngt_anng_hyperparameters),
+        #     'ngt_anng_ianng': (
+        #         profile_ngt_anng_ianng, ngt_anng_hyperparameters),
+        #     'ngt_anng_ranng': (
+        #         profile_ngt_anng_ranng, ngt_anng_hyperparameters),
+        #     'ngt_anng_rianng': (
+        #         profile_ngt_anng_rianng, ngt_anng_hyperparameters),
+        #     'nndescent': (profile_nndescent, nndescent_hyperparameters),
+        #     'faiss_ivf': (profile_faiss_ivf, faiss_ivf_hyperparameters),
+        #     'faiss_ivf_pq': (profile_faiss_pq,
+        #                      faiss_pq_hyperparameters),
+        #     'pynndescent': (profile_pynn,
+        #                     pynndescent_hyperparameters),
+        #     'annoy': (profile_annoy,
+        #               annoy_hyperparameters), }
         algorithm_parameters = {
-            'ngt_onng': (profile_ngt_onng, ngt_onng_hyperparameters),
-            'ngt_panng': (profile_ngt_panng, ngt_panng_hyperparameters),
-            'ngt_anng_default': (profile_ngt_anng_default,
-                                 ngt_anng_hyperparameters),
-            'ngt_anng_ianng': (
-                profile_ngt_anng_ianng, ngt_anng_hyperparameters),
-            'ngt_anng_ranng': (
-                profile_ngt_anng_ranng, ngt_anng_hyperparameters),
-            'ngt_anng_rianng': (
-                profile_ngt_anng_rianng, ngt_anng_hyperparameters),
-            'nndescent': (profile_nndescent, nndescent_hyperparameters),
-            'faiss_ivf': (profile_faiss_ivf, faiss_ivf_hyperparameters),
-            'faiss_ivf_pq': (profile_faiss_pq,
-                             faiss_pq_hyperparameters),
-            'pynndescent': (profile_pynn,
-                            pynndescent_hyperparameters),
-            'annoy': (profile_annoy,
-                      annoy_hyperparameters), }
-        algorithm_parameters = {
-            'nndescent': (profile_nndescent, nndescent_hyperparameters)
+            'faiss_imi': (profile_faiss_imi, faiss_imi_hyperparameters)
         }
 
         ### TEST ON TRAINED DATA (UMAP APPLICATION).
@@ -969,7 +1046,6 @@ if __name__ == '__main__':
                     f'{KNN_DIR}/knn_profiles_graphed_untrained')
 
     ### TIME TRIALS ###
-    # TODO: install NNDescent again, see if its performance improves.
     if True:
         # Sampling below 6000 centroids.
         faiss_ivf_hyperparameters = {'num_voronoi_cells': [30],
@@ -1042,24 +1118,7 @@ if __name__ == '__main__':
 
         ### TEST ON NEW DATA (LABEL TRANSFER APPLICATION). ###
         # Split dataset 50-50 for test and training.
-        if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_train_full.npy'):
-            full_train_data, full_train_data_indices = random_sample(pcs, 50,
-                                                                     False,
-                                                                     f'{KNN_DIR}/rosmap_pcs_full_train')
-            # Make remaining test data by just removing any vector in train_data.
-            test_filter = [True] * len(pcs)
-            for train_data_index in full_train_data_indices:
-                test_filter[train_data_index] = False
-
-            full_test_data = pcs[test_filter]
-
-            np.save(f'{KNN_DIR}/rosmap_pcs_full_test.npy', full_test_data)
-            np.save(f'{KNN_DIR}/rosmap_pcs_full_train.npy', full_train_data)
-        else:
-            full_train_data, full_train_data_indices = random_sample(pcs, 50,
-                                                                     False,
-                                                                     f'{KNN_DIR}/rosmap_pcs_full_train')
-            full_test_data = np.load(f'{KNN_DIR}/rosmap_pcs_full_test.npy')
+        full_train_data, full_test_data = split_data(pcs, 50, f'{KNN_DIR}/rosmap_pcs_full_train', f'{KNN_DIR}/rosmap_pcs_full_test')
 
         # Get true NNs. First 5 for comparison.
         if not os.path.exists(f'{KNN_DIR}/label_transfer_true_nn_full.npy'):
