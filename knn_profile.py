@@ -119,7 +119,8 @@ def profile_pynn(cells: np.ndarray, index_neighbours: int, query: np.ndarray,
 def profile_faiss_ivf(cells: np.ndarray,
                       num_voronoi_cells: int, num_centroids: int,
                       num_neighbours: int,
-                      query: np.ndarray, search_untrained: bool, ) -> tuple[
+                      query: np.ndarray, search_untrained: bool,
+                      subsampling_factor: float | None = None) -> tuple[
     np.ndarray, float, float]:
     """
     Monitors performance of FAISS algorithm (IVF).
@@ -128,10 +129,13 @@ def profile_faiss_ivf(cells: np.ndarray,
     into. More voronoi cells => more accuracy, but less speed.
     :param num_centroids: number of centroids initialized in k-means clustering.
     More centroids => more accuracy, less speed.
+    :param subsampling_factor: factor by which cells are subsampled.
+    If none, set maximum cluster size to default.
     :return: neighbours, indexing time, searching time.
     """
     # Depth is dimensionality of space that PCs are in (number of PCs per
     # sample). Subtract one for ID column.
+    num_cells = len(cells)
     depth = len(cells[0])
 
     start = time.time()
@@ -143,6 +147,14 @@ def profile_faiss_ivf(cells: np.ndarray,
     index_time = time.time() - start
 
     ivf_index.nprobe = num_voronoi_cells
+
+    # Set maximum cluster size to force subsampling.
+    if subsampling_factor is not None:
+        ivf_index.cp.max_points_per_centroid = int(
+            np.ceil((num_cells * (1 - subsampling_factor)) / num_centroids
+                    ))
+
+    # Modify
     start = time.time()
     distances, indices = ivf_index.search(query, num_neighbours)
     search_time = time.time() - start
@@ -608,10 +620,11 @@ def profile_nndescent(cells: np.ndarray, num_neighbours: int, query: np.ndarray,
 
 
 def random_sample(cells: np.ndarray, pt_kept: float, retrieve: bool,
-                  save_to: str) -> tuple[np.ndarray, list[int]]:
+                  save_to: str | None) -> tuple[np.ndarray, list[int]]:
     """
-    Randomly samples pt_kept% of cells. Saves if retrieve is false, else loads
-    from save_to.
+    Randomly samples pt_kept% of cells. Saves if retrieve is false and save_to
+    is not None, else loads from save_to. save_to cannot be None and retrieve
+    cannot be True simultaneously.
     """
     if retrieve:
         return np.load(f'{save_to}.npy'), np.load(f'{save_to}_indices.npy')
@@ -624,29 +637,37 @@ def random_sample(cells: np.ndarray, pt_kept: float, retrieve: bool,
 
     sample = cells[sample_filter]
 
-    np.save(f'{save_to}.npy', sample)
-    np.save(f'{save_to}_indices.npy', sample_indices)
+    if save_to is not None:
+        np.save(f'{save_to}.npy', sample)
+        np.save(f'{save_to}_indices.npy', sample_indices)
     return sample, sample_indices
 
 
 def brute_force_knn(train_data: np.ndarray, test_data: np.ndarray,
                     num_neighbours: int,
-                    retrieve: bool, algorithm: str, save_to: str,
+                    retrieve: bool, algorithm: str, save_to: str | None,
                     leaf_size: int = None) -> np.ndarray:
+    """
+    :param save_to: saves to save_to if not None, else doesn't.
+    :param retrieve: if retrieve is True, save_to can't be None.
+    :param save_to: saves brute forced neighbours to the specified location iff save_to is not None
+    """
     if retrieve:
         return np.load(save_to)
 
     if algorithm == 'kdtree':
         tree = KDTree(train_data, leaf_size=leaf_size)
         _, indices = tree.query(test_data, k=num_neighbours)
-        np.save(save_to, indices)
+        if save_to is not None:
+            np.save(save_to, indices)
         return indices
     elif algorithm == 'faiss':
         depth = len(train_data[0])
         index = faiss.index_factory(depth, 'Flat')
         index.add(train_data)
         _, indices = index.search(test_data, num_neighbours)
-        np.save(save_to, indices)
+        if save_to is not None:
+            np.save(save_to, indices)
         return indices
 
 
@@ -784,7 +805,7 @@ def plot_trials(df: pl.DataFrame, save_to: str) -> None:
     plt.savefig(save_to)
 
 
-def load_pcs():
+def load_pcs_green():
     # Compute PCs.
     if not os.path.exists(f'{KNN_DIR}/rosmap_sc_pcs.npy'):
         # Saves numpy file.
@@ -836,10 +857,13 @@ def sample_data(pcs: np.ndarray, proportion: float) -> tuple[
     return sample, sample_indices, sample_train_data, sample_test_data
 
 
-def split_data(pcs: np.ndarray, proportion: float, save_train_to: str,
-               save_test_to: str) -> tuple[np.ndarray, np.ndarray]:
-    ### TEST ON NEW DATA (LABEL TRANSFER APPLICATION). ###
-    # Split dataset 50-50 for test and training.
+def split_data(pcs: np.ndarray, proportion: float, save_train_to: str | None,
+               save_test_to: str | None) -> tuple[np.ndarray, np.ndarray]:
+    """
+    :param proportion: percentage to be used as training data.
+    :param save_train_to: saves training data to the location specified iff not None.
+    :param save_test_to: saves test data to the location specified iff not None.
+    """
     if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_train_full.npy'):
         train_data, train_data_indices = random_sample(pcs,
                                                        proportion,
@@ -852,8 +876,12 @@ def split_data(pcs: np.ndarray, proportion: float, save_train_to: str,
 
         test_data = pcs[test_filter]
 
-        np.save(save_test_to, test_data)
-        np.save(save_train_to, train_data)
+        if save_train_to is not None:
+            np.save(save_train_to, train_data)
+
+        if save_test_to is not None:
+            np.save(save_test_to, test_data)
+
     else:
         train_data = np.load(f'{save_train_to}.npy')
         test_data = np.load(f'{save_test_to}.npy')
@@ -862,7 +890,7 @@ def split_data(pcs: np.ndarray, proportion: float, save_train_to: str,
 
 
 if __name__ == '__main__':
-    pcs = load_pcs()
+    pcs = load_pcs_green()
 
     # Define hyperparameters.
     faiss_pq_hyperparameters = {'vec_resolution': [5, 10, 25],
@@ -1118,7 +1146,9 @@ if __name__ == '__main__':
 
         ### TEST ON NEW DATA (LABEL TRANSFER APPLICATION). ###
         # Split dataset 50-50 for test and training.
-        full_train_data, full_test_data = split_data(pcs, 50, f'{KNN_DIR}/rosmap_pcs_full_train', f'{KNN_DIR}/rosmap_pcs_full_test')
+        full_train_data, full_test_data = split_data(pcs, 50,
+                                                     f'{KNN_DIR}/rosmap_pcs_full_train',
+                                                     f'{KNN_DIR}/rosmap_pcs_full_test')
 
         # Get true NNs. First 5 for comparison.
         if not os.path.exists(f'{KNN_DIR}/label_transfer_true_nn_full.npy'):

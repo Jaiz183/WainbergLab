@@ -1,6 +1,7 @@
 from utils import run
 from constants import *
 
+
 PROJECT_DIR = 'projects/def-wainberg'
 
 run(f'{PLINK2} '

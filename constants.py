@@ -16,6 +16,12 @@ NGT = 'NGT/build/bin/ngt/ngt'
 
 ### kNN ###
 KNN_DIR = f'{PROJECT_DIR}/jeesonja/knn'
+LABEL_TRANSFER = 'lt'
+UMAP = 'u'
+VALIDATION_DATASET = 'scratch/validation.npy'
+TRAINING_DATASET = 'scratch/training.npy'
+TRUE_NEIGHBOURS = 'scratch/true_nn.npy'
+
 
 ### Schizoprhenia ###
 SCHIZO_DIR_SINGLE_CELL = f'{PROJECT_DIR}/jeesonja/schizo/single_cell'
