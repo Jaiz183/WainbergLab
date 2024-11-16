@@ -153,6 +153,9 @@ def profile_faiss_ivf(cells: np.ndarray,
         ivf_index.cp.max_points_per_centroid = int(
             np.ceil((num_cells * (1 - subsampling_factor)) / num_centroids
                     ))
+        print(
+            f'Number of cells is {num_cells}. Max points per cluster of {ivf_index.cp.max_points_per_centroid}, but actually {np.ceil(num_cells / num_centroids
+                                                                                                                                      )}')
 
     # Modify
     start = time.time()
@@ -821,6 +824,27 @@ def load_pcs_green():
         np.save(f'{KNN_DIR}/rosmap_sc_pcs.npy', pcs)
     else:
         pcs = np.load(f'{KNN_DIR}/rosmap_sc_pcs.npy')
+
+    return pcs
+
+
+def load_pcs(sc_data: str, dataset_name: str):
+    # Compute PCs.
+    if not os.path.exists(f'{KNN_DIR}/{sc_data}_pcs.npy'):
+        # Saves numpy file.
+        if not os.path.exists(f'{KNN_DIR}/{dataset_name}.h5ad'):
+            sc = load_sc(
+                sc_data,
+                False, f'{SCRATCH_DIR}/{dataset_name}')
+        else:
+            sc = load_sc(
+                sc_data,
+                True, f'{SCRATCH_DIR}/{dataset_name}')
+
+        pcs = sc.obsm['PCs']
+        np.save(f'{KNN_DIR}/{dataset_name}_pcs.npy', pcs)
+    else:
+        pcs = np.load(f'{KNN_DIR}/{dataset_name}_pcs.npy')
 
     return pcs
 
