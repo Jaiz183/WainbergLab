@@ -8,6 +8,8 @@ from knn_profile import profile_faiss_ivf, load_pcs_green, sample_data, \
     compound_trials, split_data, random_sample, brute_force_knn, load_pcs
 import numpy as np
 from typing import Callable
+
+from single_cell import SingleCell
 from utils import run
 
 import polars as pl
@@ -111,7 +113,10 @@ def objective(trial: optuna.Trial, training_dataset, validation_dataset,
 # to take in datasets as arguments.
 def auto_optimise(cells: np.ndarray, sample_pt: float,
                   num_trials: int) -> tuple[pl.DataFrame, optuna.Study]:
-    sample, _ = random_sample(cells, sample_pt, False, None)
+    if sample_pt != 100:
+        sample, _ = random_sample(cells, sample_pt, False, None)
+    else:
+        sample = cells
     train_data, validation_data = split_data(sample, 70, None,
                                              None)
     true_nn = brute_force_knn(train_data, validation_data, 5, False, 'faiss',
@@ -168,7 +173,7 @@ if __name__ == '__main__':
     sizes = [10, 25, 50, 100]
     for size in sizes:
         # First Green.
-        results, green_study = auto_optimise(green_pcs, size, 100)
+        results, green_study = auto_optimise(green_pcs, size, 1)
         results = results.sort('accuracy', descending=True)
         results.write_csv(
             f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results',
@@ -176,7 +181,7 @@ if __name__ == '__main__':
         save_plots(green_study, 'green', size)
 
         # Now SEAAD.
-        results, seaad_study = auto_optimise(seaad_pcs, size, 100)
+        results, seaad_study = auto_optimise(seaad_pcs, size, 1)
         results = results.sort('accuracy', descending=True)
         results.write_csv(
             f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results',

@@ -13,6 +13,18 @@ from threading import Thread
 from typing import Any, Literal
 
 
+class ignore_sigint:
+    """
+    Ignore Ctrl + C when importing certain modules, to avoid errors due to
+    incomplete imports.
+    """
+    def __enter__(self):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    
+    def __exit__(self, *_):
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
 def _get_R_home() -> str:
     """
     Get R's home directory, first by checking the environment variable R_HOME,
@@ -512,7 +524,8 @@ def _convert_names(names: Any, names_type: Literal['rownames', 'colnames'],
     # than lists, but leave everything else as-is (among other things, set,
     # frozenset and dict will still convert to lists and give an error)
     if isinstance(names, (list, tuple)):
-        import pyarrow as pa
+        with ignore_sigint():
+            import pyarrow as pa
         names = pa.array(names) if names else pa.array([], type=pa.string())
     try:
         # noinspection PyNoneFunctionAssignment,PyTypeChecker
@@ -650,11 +663,13 @@ def _convert_object_to_arrow(python_object: Any,
         python_object, converted to Arrow (or to complex, if complex).
     """
     import numpy as np
-    import pyarrow as pa
+    with ignore_sigint():
+        import pyarrow as pa
     arrow = None
     try:
-        # noinspection PyUnresolvedReferences
-        import pandas as pd
+        with ignore_sigint():
+            # noinspection PyUnresolvedReferences
+            import pandas as pd
         has_pandas = True
     except ImportError:
         has_pandas = False
@@ -1378,7 +1393,8 @@ def to_r(python_object: Any, R_variable_name: str, *,
                   or a type that might contain one (list, tuple, or dict).
     """
     # Defer loading Arrow until calling to_py() or to_r() for speed
-    import pyarrow as pa
+    with ignore_sigint():
+        import pyarrow as pa
     from pyarrow.cffi import ffi as pyarrow_ffi
     r('suppressPackageStartupMessages(require(arrow))')
     # Raise errors when format is not None and we're not recursing
@@ -1427,7 +1443,8 @@ def to_r(python_object: Any, R_variable_name: str, *,
     is_sparse = type_string.startswith("<class 'scipy.sparse")
     if is_pandas:
         import numpy as np
-        import pandas as pd
+        with ignore_sigint():
+            import pandas as pd
         # noinspection PyUnboundLocalVariable
         is_df = isinstance(python_object, pd.DataFrame)
         is_series = isinstance(python_object, pd.Series)
@@ -1435,7 +1452,8 @@ def to_r(python_object: Any, R_variable_name: str, *,
         is_multiindex = isinstance(python_object, pd.MultiIndex)
     elif is_polars:
         try:
-            import polars as pl
+            with ignore_sigint():
+                import polars as pl
         except ImportError as e:
             error_message = (
                 "polars is not installed; consider setting format='numpy', "
@@ -2742,7 +2760,8 @@ def to_py(R_statement: str, *,
         The Python object that results from converting the R variable.
     """
     # Defer loading Arrow until calling to_py() or to_r() for speed
-    import pyarrow as pa
+    with ignore_sigint():
+        import pyarrow as pa
     from pyarrow.cffi import ffi as pyarrow_ffi
     r('suppressPackageStartupMessages(require(arrow))')
     # Raise errors when format/squeeze is not None and we're not recursing
@@ -3002,7 +3021,8 @@ def to_py(R_statement: str, *,
                     index = False
             if format == 'polars':
                 try:
-                    import polars as pl
+                    with ignore_sigint():
+                        import polars as pl
                 except ImportError as e:
                     error_message = (
                         "polars is not installed; consider setting "
@@ -3027,7 +3047,8 @@ def to_py(R_statement: str, *,
                     return np.empty((_rlib.INTEGER_ELT(dim, 0),
                                      _rlib.INTEGER_ELT(dim, 1)), dtype=object)
             else:
-                import pandas as pd
+                with ignore_sigint():
+                    import pandas as pd
                 if index:
                     index_object = pd.Index(result[index])
                     del result[index]
@@ -3350,7 +3371,8 @@ def to_py(R_statement: str, *,
                 # noinspection PyUnboundLocalVariable
                 result = result.reshape(shape, order='F')
             if format != 'numpy':
-                import pandas as pd
+                with ignore_sigint():
+                    import pandas as pd
                 result = pd.DataFrame(result) if multidimensional else \
                     pd.Series(result)
         # If R_object is a scalar and squeeze=True, return a Python scalar
@@ -3453,7 +3475,8 @@ def to_py(R_statement: str, *,
                     raise ValueError(error_message)
             if format == 'polars':
                 try:
-                    import polars as pl
+                    with ignore_sigint():
+                        import polars as pl
                 except ImportError as e:
                     error_message = (
                         "polars is not installed; consider setting "
@@ -3502,7 +3525,8 @@ def to_py(R_statement: str, *,
                         # 0, so manually make a DataFrame of the correct length
                         result = pl.DataFrame({index: rownames})
             else:  # output_format in ('pandas', 'pandas-pyarrow')
-                import pandas as pd
+                with ignore_sigint():
+                    import pandas as pd
                 if R_object_type != _rlib.CPLXSXP:
                     # noinspection PyArgumentList
                     result = result.to_pandas(

@@ -37,8 +37,8 @@ By convention, refer to algorithms in databases as faiss_ivf, faiss_ivf_pq, pynn
 """
 
 
-def load_sc(sc_file: str, retrieve: bool, save_to: str
-            ) -> (
+def load_green_sc(sc_file: str, retrieve: bool, save_to: str
+                  ) -> (
         SingleCell):
     """
     Loads, QCs, and computes PCs for individual cells from single cell file
@@ -48,9 +48,10 @@ def load_sc(sc_file: str, retrieve: bool, save_to: str
     with PCs.
     """
     if retrieve:
-        return SingleCell(f'{save_to}.h5ad')
+        return SingleCell(f'{save_to}.h5ad', num_threads=-1)
     else:
-        sc = SingleCell(sc_file)
+        sc = SingleCell(sc_file, num_threads=-1)
+        print(sc.obs.columns)
         sc = sc.qc(
             custom_filter=pl.col('projid').is_not_null().and_(
                 pl.col('cell.type.prob').ge(0.9).and_(
@@ -63,7 +64,7 @@ def load_sc(sc_file: str, retrieve: bool, save_to: str
         sc = sc.hvg().normalize().PCA()
 
         # Filter out non-QCed PCs.
-        sc.obsm['PCs'] = sc.obsm['PCs'][sc.obs['passed_QC']]
+        # sc.obsm['PCs'] = sc.obsm['PCs'][sc.obs['passed_QC']]
 
         sc.save(f'{save_to}.h5ad', overwrite=True)
 
@@ -813,11 +814,11 @@ def load_pcs_green():
     if not os.path.exists(f'{KNN_DIR}/rosmap_sc_pcs.npy'):
         # Saves numpy file.
         if not os.path.exists(f'{KNN_DIR}/rosmap_sc.h5ad'):
-            sc = load_sc(
+            sc = load_green_sc(
                 f'{PROJECT_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
                 False, f'{SCRATCH_DIR}/rosmap_sc')
         else:
-            sc = load_sc(
+            sc = load_green_sc(
                 f'{SCRATCH_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
                 True, f'{KNN_DIR}/rosmap_sc')
         pcs = sc.obsm['PCs']
@@ -827,19 +828,56 @@ def load_pcs_green():
 
     return pcs
 
+# TODO: quality control this.
+def load_seaad_sc(sc_file: str, retrieve: bool, save_to: str
+                  ) -> (
+        SingleCell):
+    """
+    Loads, QCs, and computes PCs for individual cells from single cell file
+    specified.
+    :param retrieve: load new and save if False, else load existing.
+    :return SingleCell object with a key in obsm corresponding to a NP array
+    with PCs.
+    """
+    if retrieve:
+        return SingleCell(f'{save_to}.h5ad', num_threads=-1)
+    else:
+        sc = SingleCell(sc_file, num_threads=-1)
+        sc = sc.with_uns(QCed=True)
+        print(sc.obs.columns)
+        sc = sc.qc()
+        sc = sc.hvg().normalize().PCA()
+
+        # Filter out non-QCed PCs.
+        # sc.obsm['PCs'] = sc.obsm['PCs'][sc.obs['passed_QC']]
+
+        sc.save(f'{save_to}.h5ad', overwrite=True)
+
+        return sc
+
 
 def load_pcs(sc_data: str, dataset_name: str):
     # Compute PCs.
     if not os.path.exists(f'{KNN_DIR}/{sc_data}_pcs.npy'):
         # Saves numpy file.
         if not os.path.exists(f'{KNN_DIR}/{dataset_name}.h5ad'):
-            sc = load_sc(
+            if dataset_name == 'seaad':
+                sc = load_green_sc(
                 sc_data,
                 False, f'{SCRATCH_DIR}/{dataset_name}')
+            elif dataset_name == 'rosmap':
+                sc = load_seaad_sc(
+                    sc_data,
+                    False, f'{SCRATCH_DIR}/{dataset_name}')
         else:
-            sc = load_sc(
-                sc_data,
-                True, f'{SCRATCH_DIR}/{dataset_name}')
+            if dataset_name == 'seaad':
+                sc = load_green_sc(
+                    sc_data,
+                    True, f'{SCRATCH_DIR}/{dataset_name}')
+            elif dataset_name == 'rosmap':
+                sc = load_seaad_sc(
+                    sc_data,
+                    True, f'{SCRATCH_DIR}/{dataset_name}')
 
         pcs = sc.obsm['PCs']
         np.save(f'{KNN_DIR}/{dataset_name}_pcs.npy', pcs)

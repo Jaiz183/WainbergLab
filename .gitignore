@@ -1,3 +1,10 @@
 knn_results/
 schizo_results/
 ad_results/
+.DS_Store
+.idea/
+faiss_results/
+resources/
+ryp.py
+single_cell.py
+__pycache__/
