@@ -4,26 +4,127 @@ import plotly.graph_objects
 
 from constants import *
 
-from knn_profile import profile_faiss_ivf, load_pcs_green, sample_data, \
-    compound_trials, split_data, random_sample, brute_force_knn, load_pcs
+from useful_functions import split_data
+import time
 import numpy as np
-from typing import Callable
+import faiss
 
 from single_cell import SingleCell
-from utils import run
 
 import polars as pl
 import pandas as pd
 import optuna
 
-NUM_PROBES_RANGE = (1, 100)
-SUBSAMPLING_FACTOR_RANGE = (0, 1)
 
-faiss_ivf_hyperparameters = {'num_voronoi_cells': [30], }
+def profile_faiss_ivf(cells: np.ndarray,
+                      num_voronoi_cells: int, num_centroids: int,
+                      num_neighbours: int,
+                      query: np.ndarray, search_untrained: bool,
+                      subsampling_factor: float | None = None) -> tuple[
+    np.ndarray, float, float]:
+    """
+    Monitors performance of FAISS algorithm (IVF).
+    :param cells: PCs corresponding to individual cells.
+    :param num_voronoi_cells: number of voronoi cells that the space is split
+    into. More voronoi cells => more accuracy, but less speed.
+    :param num_centroids: number of centroids initialized in k-means clustering.
+    More centroids => more accuracy, less speed.
+    :param subsampling_factor: factor by which cells are subsampled.
+    If none, set maximum cluster size to default.
+    :return: neighbours, indexing time, searching time.
+    """
+    # Depth is dimensionality of space that PCs are in (number of PCs per
+    # sample). Subtract one for ID column.
+    num_cells = len(cells)
+    depth = len(cells[0])
 
-algorithm_parameters = {
-    'faiss_ivf': (profile_faiss_ivf, faiss_ivf_hyperparameters),
-}
+    start = time.time()
+    index = faiss.IndexFlatL2(depth)  # the other index
+    ivf_index = faiss.IndexIVFFlat(index, depth, num_centroids)
+    ivf_index.train(cells)
+
+    ivf_index.add(cells)
+    index_time = time.time() - start
+
+    ivf_index.nprobe = num_voronoi_cells
+
+    # Set maximum cluster size to force subsampling.
+    if subsampling_factor is not None:
+        ivf_index.cp.max_points_per_centroid = int(
+            np.ceil((num_cells * (1 - subsampling_factor)) / num_centroids
+                    ))
+        print(
+            f'Number of cells is {num_cells}. Max points per cluster of {ivf_index.cp.max_points_per_centroid}, but actually {np.ceil(num_cells / num_centroids
+                                                                                                                                      )}')
+
+    # Modify
+    start = time.time()
+    distances, indices = ivf_index.search(query, num_neighbours)
+    search_time = time.time() - start
+
+    return indices, index_time, search_time
+
+
+def brute_force_knn(train_data: np.ndarray, test_data: np.ndarray,
+                    num_neighbours: int,
+                    retrieve: bool, algorithm: str, save_to: str | None,
+                    leaf_size: int = None) -> np.ndarray:
+    """
+    :param save_to: saves to save_to if not None, else doesn't.
+    :param retrieve: if retrieve is True, save_to can't be None.
+    :param save_to: saves brute forced neighbours to the specified location iff save_to is not None
+    """
+    if retrieve:
+        return np.load(save_to)
+
+    if algorithm == 'kdtree':
+        tree = KDTree(train_data, leaf_size=leaf_size)
+        _, indices = tree.query(test_data, k=num_neighbours)
+        if save_to is not None:
+            np.save(save_to, indices)
+        return indices
+    elif algorithm == 'faiss':
+        depth = len(train_data[0])
+        index = faiss.index_factory(depth, 'Flat')
+        index.add(train_data)
+        _, indices = index.search(test_data, num_neighbours)
+        if save_to is not None:
+            np.save(save_to, indices)
+        return indices
+
+
+def load_green_sc(sc_file: str, retrieve: bool, save_to: str
+                  ) -> (
+        SingleCell):
+    """
+    Loads, QCs, and computes PCs for individual cells from single cell file
+    specified.
+    :param retrieve: load new and save if False, else load existing.
+    :return SingleCell object with a key in obsm corresponding to a NP array
+    with PCs.
+    """
+    if retrieve:
+        return SingleCell(f'{save_to}.h5ad', num_threads=-1)
+    else:
+        sc = SingleCell(sc_file, num_threads=-1)
+        print(sc.obs.columns)
+        sc = sc.qc(
+            custom_filter=pl.col('projid').is_not_null().and_(
+                pl.col('cell.type.prob').ge(0.9).and_(
+                    pl.col('is.doublet.df').not_())))
+        sc.obs = sc.obs.with_columns(
+            subset=pl.col('subset').cast(pl.String).replace({'CUX2+':
+                                                                 'Excitatory'}))
+
+        sc = sc.with_uns(QCed=True)
+        sc = sc.hvg().normalize().PCA()
+
+        # Filter out non-QCed PCs.
+        # sc.obsm['PCs'] = sc.obsm['PCs'][sc.obs['passed_QC']]
+
+        sc.save(f'{save_to}.h5ad', overwrite=True)
+
+        return sc
 
 
 def get_num_centroids_michael(num_cells: int, centroid_scale_factor: float,
@@ -110,21 +211,22 @@ def objective(trial: optuna.Trial, training_dataset, validation_dataset,
 
 
 # Try to prevent saving files and reloading. Would require redefining objective
-# to take in datasets as arguments.
-def auto_optimise(cells: np.ndarray, sample_pt: float,
-                  num_trials: int) -> tuple[pl.DataFrame, optuna.Study]:
-    if sample_pt != 100:
-        sample, _ = random_sample(cells, sample_pt, False, None)
+# to take in datasets as arguments
+def auto_optimise(pcs: np.ndarray,
+                  num_trials: int, application: str) -> tuple[
+    pl.DataFrame, optuna.Study]:
+    if application == 'umap':
+        train_data, query = pcs, pcs
     else:
-        sample = cells
-    train_data, validation_data = split_data(sample, 70, None,
-                                             None)
-    true_nn = brute_force_knn(train_data, validation_data, 5, False, 'faiss',
+        train_data, query = split_data(pcs, 70, None,
+                                       None)
+
+    true_nn = brute_force_knn(train_data, query, 5, False, 'faiss',
                               None, None)
     # Minimize runtime and maximize accuracy.
     study = optuna.create_study(directions=['minimize', 'maximize'])
     study.optimize(
-        lambda trial: objective(trial, train_data, validation_data, true_nn),
+        lambda trial: objective(trial, train_data, query, true_nn),
         n_trials=num_trials)
 
     results: pd.DataFrame = study.trials_dataframe()
@@ -160,20 +262,58 @@ def save_plots(study, dataset_name: str, size: int):
 
 
 if __name__ == '__main__':
-    green_pcs = load_pcs(
-        sc_data=f'{PROJECT_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
-        dataset_name='rosmap')
+    NUM_PROBES_RANGE = (1, 100)
+    SUBSAMPLING_FACTOR_RANGE = (0, 1)
 
-    seaad_pcs = load_pcs(
-        sc_data=f'{PROJECT_DIR}/single-cell/SEAAD/SEAAD_DLPFC_RNAseq_all-nuclei.2024-02-13.h5ad',
-        dataset_name='seaad')
+    faiss_ivf_hyperparameters = {'num_voronoi_cells': [30], }
+
+    algorithm_parameters = {
+        'faiss_ivf': (profile_faiss_ivf, faiss_ivf_hyperparameters),
+    }
+
+    green_sc: SingleCell = load_green_sc(
+        sc_file=f'{PROJECT_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
+        retrieve=True, save_to=f'{SCRATCH_DIR}/rosmap')
 
     ### Auto-optimisation. ###
-    # Try a couple of dataset sizes...
-    sizes = [10, 25, 50, 100]
-    for size in sizes:
+    # Try a couple of dataset sizes (for Green)...
+    # Sample data points.
+    sizes = [1, 10, 100]
+    sampled_green_pcs = []
+    sampled_seadd_pcs = []
+
+    for i in range(len(sizes)):
+        size = sizes[i]
+        # First Green...
+        if not os.path.exists(f'{KNN_DIR}/data/pcs/green_pcs_{size}.npy'):
+            sampled_cells = SingleCell(
+                f'{PROJECT_DIR}/single-cell/Subsampled/Green_{size}.h5ad',
+                X=False)
+            sampled_pcs = sampled_cells.obsm['PCs']
+            np.save(f'{KNN_DIR}/data/pcs/green_pcs_{size}', sampled_pcs)
+            sampled_seadd_pcs.append(sampled_pcs)
+        else:
+            sampled_pcs = np.load(f'{KNN_DIR}/data/pcs/green_pcs_{size}.npy')
+            sampled_seadd_pcs.append(sampled_pcs)
+
+        # Now SEADD.
+        if not os.path.exists(f'{KNN_DIR}/data/pcs/seaad_pcs_{size}.npy'):
+            sampled_cells = SingleCell(
+                f'{PROJECT_DIR}/single-cell/Subsampled/SEAAD_{size}.h5ad', X=False)
+            sampled_pcs = sampled_cells.obsm['PCs']
+            np.save(f'{KNN_DIR}/data/pcs/seaad_pcs_{size}', sampled_pcs)
+            sampled_seadd_pcs.append(sampled_pcs)
+        else:
+            sampled_pcs = np.load(f'{KNN_DIR}/data/pcs/seaad_pcs_{size}.npy')
+            sampled_seadd_pcs.append(sampled_pcs)
+
+    for i in range(len(sizes)):
+        size = sizes[i]
+
         # First Green.
-        results, green_study = auto_optimise(green_pcs, size, 1)
+        current_sampled_green_pcs = sampled_green_pcs[i]
+        results, green_study = auto_optimise(current_sampled_green_pcs, 100,
+                                             'umap')
         results = results.sort('accuracy', descending=True)
         results.write_csv(
             f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results',
@@ -181,7 +321,9 @@ if __name__ == '__main__':
         save_plots(green_study, 'green', size)
 
         # Now SEAAD.
-        results, seaad_study = auto_optimise(seaad_pcs, size, 1)
+        current_sampled_seadd_pcs = sampled_seadd_pcs[i]
+        results, seaad_study = auto_optimise(current_sampled_seadd_pcs, size,
+                                             'umap')
         results = results.sort('accuracy', descending=True)
         results.write_csv(
             f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results',

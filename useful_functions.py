@@ -6,10 +6,65 @@ import os, sys
 from constants import *
 import logging
 import seaborn as sns
+import numpy as np
+import random
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
+def random_sample(cells: np.ndarray, pt_kept: float, retrieve: bool,
+                  save_to: str | None) -> tuple[np.ndarray, list[int]]:
+    """
+    Randomly samples pt_kept% of cells. Saves if retrieve is false and save_to
+    is not None, else loads from save_to. save_to cannot be None and retrieve
+    cannot be True simultaneously.
+    """
+    if retrieve:
+        return np.load(f'{save_to}.npy'), np.load(f'{save_to}_indices.npy')
+
+    sample_indices = random.sample(list(range(len(cells))),
+                                   int((pt_kept / 100) * len(cells)))
+    sample_filter = [False] * len(cells)
+    for index in sample_indices:
+        sample_filter[index] = True
+
+    sample = cells[sample_filter]
+
+    if save_to is not None:
+        np.save(f'{save_to}.npy', sample)
+        np.save(f'{save_to}_indices.npy', sample_indices)
+    return sample, sample_indices
+
+def split_data(pcs: np.ndarray, proportion: float, save_train_to: str | None,
+               save_test_to: str | None) -> tuple[np.ndarray, np.ndarray]:
+    """
+    :param proportion: percentage to be used as training data.
+    :param save_train_to: saves training data to the location specified iff not None.
+    :param save_test_to: saves test data to the location specified iff not None.
+    """
+    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_train_full.npy'):
+        train_data, train_data_indices = random_sample(pcs,
+                                                       proportion,
+                                                       False,
+                                                       save_train_to)
+        # Make remaining test data by just removing any vector in train_data.
+        test_filter = [True] * len(pcs)
+        for train_data_index in train_data_indices:
+            test_filter[train_data_index] = False
+
+        test_data = pcs[test_filter]
+
+        if save_train_to is not None:
+            np.save(save_train_to, train_data)
+
+        if save_test_to is not None:
+            np.save(save_test_to, test_data)
+
+    else:
+        train_data = np.load(f'{save_train_to}.npy')
+        test_data = np.load(f'{save_test_to}.npy')
+
+    return train_data, test_data
 
 def read_columns(lf: str, columns: list[str] = None, delimiter: str = ',',
                  header: bool = True, data_types: dict[str, type] | None = None,

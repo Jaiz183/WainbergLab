@@ -1,29 +1,22 @@
 import os.path
-import sys
 import time
 import random
 from typing import Callable
 import faiss
 import numpy as np
-from scanpy import read_h5ad, AnnData
-from constants import *
 import logging
-from functools import cache
 import polars as pl
-import matplotlib as mpl
-from useful_functions import report_lost_entries
 from pynndescent import NNDescent
 from single_cell import SingleCell
-import scann
 from sklearn.neighbors import KDTree
 from annoy import AnnoyIndex
 import ngtpy
 import nndescent
-import seaborn as sns
 import matplotlib.pyplot as plt
 import seaborn.objects as so
 from utils import run
 from constants import *
+from useful_functions import split_data, random_sample
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -302,38 +295,38 @@ def profile_faiss_imi(cells: np.ndarray,
     return indices, index_time, search_time
 
 
-def profile_scann(cells: np.ndarray, num_leaves: int,
-                  prop_leaves_searched: float,
-                  index_neighbours: int,
-                  query: np.ndarray, num_neighbours: int,
-                  search_untrained: bool) -> tuple[
-    np.ndarray, float, float]:
-    """
-    Monitors performance of SCANN algorithm.
-    :param index_neighbours: number of neighbours considered when constructing index (NOT how many are queried). More neighbours => more accuracy, less speed.
-    :param num_leaves: more leaves => more precision, but less speed.
-    :param prop_leaves_searched: higher proportion of leaves searched => more precision but less speed. Must be less than or equal to num_leaves.
-    :param num_neighbours: must be less than prop_leaves_searched * num_leaves
-    """
-    # anistropic_quant_threshold of 0.2 is used to tailor a loss function to the one in
-    # paper that inspired scann, NaN uses standard reconstruction loss.
-    num_leaves_to_search = int(prop_leaves_searched * num_leaves)
-    # https://github.com/erikbern/ann-benchmarks/blob/3bb0474ebad6c64f4ef5317db3a3797eb1b58a36/ann_benchmarks/algorithms/scann/config.yml#L12 for config.
-    start = time.time()
-    builder = scann.scann_ops_pybind.builder(cells, index_neighbours,
-                                             "squared_l2").tree(
-        num_leaves=num_leaves, num_leaves_to_search=num_leaves_to_search,
-        training_sample_size=len(cells)).score_ah(
-        2, anisotropic_quantization_threshold=0.2).reorder(100)
-
-    searcher = builder.build()
-    index_time = time.time() - start
-
-    start = time.time()
-    indices, distances = searcher.search_batched(query)
-    search_time = time.time() - start
-
-    return indices[:, 0:num_neighbours], index_time, search_time
+# def profile_scann(cells: np.ndarray, num_leaves: int,
+#                   prop_leaves_searched: float,
+#                   index_neighbours: int,
+#                   query: np.ndarray, num_neighbours: int,
+#                   search_untrained: bool) -> tuple[
+#     np.ndarray, float, float]:
+#     """
+#     Monitors performance of SCANN algorithm.
+#     :param index_neighbours: number of neighbours considered when constructing index (NOT how many are queried). More neighbours => more accuracy, less speed.
+#     :param num_leaves: more leaves => more precision, but less speed.
+#     :param prop_leaves_searched: higher proportion of leaves searched => more precision but less speed. Must be less than or equal to num_leaves.
+#     :param num_neighbours: must be less than prop_leaves_searched * num_leaves
+#     """
+#     # anistropic_quant_threshold of 0.2 is used to tailor a loss function to the one in
+#     # paper that inspired scann, NaN uses standard reconstruction loss.
+#     num_leaves_to_search = int(prop_leaves_searched * num_leaves)
+#     # https://github.com/erikbern/ann-benchmarks/blob/3bb0474ebad6c64f4ef5317db3a3797eb1b58a36/ann_benchmarks/algorithms/scann/config.yml#L12 for config.
+#     start = time.time()
+#     builder = scann.scann_ops_pybind.builder(cells, index_neighbours,
+#                                              "squared_l2").tree(
+#         num_leaves=num_leaves, num_leaves_to_search=num_leaves_to_search,
+#         training_sample_size=len(cells)).score_ah(
+#         2, anisotropic_quantization_threshold=0.2).reorder(100)
+#
+#     searcher = builder.build()
+#     index_time = time.time() - start
+#
+#     start = time.time()
+#     indices, distances = searcher.search_batched(query)
+#     search_time = time.time() - start
+#
+#     return indices[:, 0:num_neighbours], index_time, search_time
 
 
 def profile_annoy(cells: np.ndarray, query: np.ndarray, num_trees: int,
@@ -623,30 +616,6 @@ def profile_nndescent(cells: np.ndarray, num_neighbours: int, query: np.ndarray,
         return indices, index_time, search_time
 
 
-def random_sample(cells: np.ndarray, pt_kept: float, retrieve: bool,
-                  save_to: str | None) -> tuple[np.ndarray, list[int]]:
-    """
-    Randomly samples pt_kept% of cells. Saves if retrieve is false and save_to
-    is not None, else loads from save_to. save_to cannot be None and retrieve
-    cannot be True simultaneously.
-    """
-    if retrieve:
-        return np.load(f'{save_to}.npy'), np.load(f'{save_to}_indices.npy')
-
-    sample_indices = random.sample(list(range(len(cells))),
-                                   int((pt_kept / 100) * len(cells)))
-    sample_filter = [False] * len(cells)
-    for index in sample_indices:
-        sample_filter[index] = True
-
-    sample = cells[sample_filter]
-
-    if save_to is not None:
-        np.save(f'{save_to}.npy', sample)
-        np.save(f'{save_to}_indices.npy', sample_indices)
-    return sample, sample_indices
-
-
 def brute_force_knn(train_data: np.ndarray, test_data: np.ndarray,
                     num_neighbours: int,
                     retrieve: bool, algorithm: str, save_to: str | None,
@@ -828,7 +797,6 @@ def load_pcs_green():
 
     return pcs
 
-# TODO: quality control this.
 def load_seaad_sc(sc_file: str, retrieve: bool, save_to: str
                   ) -> (
         SingleCell):
@@ -917,38 +885,6 @@ def sample_data(pcs: np.ndarray, proportion: float) -> tuple[
             f'{KNN_DIR}/rosmap_pcs_random_sample_test.npy')
 
     return sample, sample_indices, sample_train_data, sample_test_data
-
-
-def split_data(pcs: np.ndarray, proportion: float, save_train_to: str | None,
-               save_test_to: str | None) -> tuple[np.ndarray, np.ndarray]:
-    """
-    :param proportion: percentage to be used as training data.
-    :param save_train_to: saves training data to the location specified iff not None.
-    :param save_test_to: saves test data to the location specified iff not None.
-    """
-    if not os.path.exists(f'{KNN_DIR}/rosmap_pcs_train_full.npy'):
-        train_data, train_data_indices = random_sample(pcs,
-                                                       proportion,
-                                                       False,
-                                                       save_train_to)
-        # Make remaining test data by just removing any vector in train_data.
-        test_filter = [True] * len(pcs)
-        for train_data_index in train_data_indices:
-            test_filter[train_data_index] = False
-
-        test_data = pcs[test_filter]
-
-        if save_train_to is not None:
-            np.save(save_train_to, train_data)
-
-        if save_test_to is not None:
-            np.save(save_test_to, test_data)
-
-    else:
-        train_data = np.load(f'{save_train_to}.npy')
-        test_data = np.load(f'{save_test_to}.npy')
-
-    return train_data, test_data
 
 
 if __name__ == '__main__':
