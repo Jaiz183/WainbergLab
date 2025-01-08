@@ -107,7 +107,7 @@ def load_green_sc(sc_file: str, retrieve: bool, save_to: str
         return SingleCell(f'{save_to}.h5ad', num_threads=-1)
     else:
         sc = SingleCell(sc_file, num_threads=-1)
-        print(sc.obs.columns)
+        # print(sc.obs.columns)
         sc = sc.qc(
             custom_filter=pl.col('projid').is_not_null().and_(
                 pl.col('cell.type.prob').ge(0.9).and_(
@@ -174,7 +174,7 @@ def objective(trial: optuna.Trial, training_dataset, validation_dataset,
     num_probes_range = (1, 100)
     # We'll use the default maximum number of clusters as the upper bound for now.
     num_centroids_range = (1, len(training_dataset) / 39)
-    # Shouldn't more than double cluster size beyond default so lower bound is -1...
+    # Shouldn't increase cluster size beyond default...
     subsampling_factor_range = (0, 1)
     num_probes, num_centroids, subsampling_factor = (
         trial.suggest_int('num_probes', num_probes_range[0],
@@ -247,7 +247,8 @@ def save_plots(study, dataset_name: str, size: int):
         f'{KNN_DIR}/faiss/{dataset_name}_auto_tuning_{size}_sample_pareto.png')
 
     # Plot params corresponding to highest accuracy trials.
-    parallel_accuracy: plotly.graph_objects.Figure = optuna.visualization.parallel_coordinates(
+    parallel_accuracy: plotly.graph_objects.Figure = optuna.visualization.plot_parallel_coordinate(
+        study,
         target=lambda targets: targets.values[1])
 
     parallel_accuracy.write_image(
@@ -264,16 +265,11 @@ def save_plots(study, dataset_name: str, size: int):
 if __name__ == '__main__':
     NUM_PROBES_RANGE = (1, 100)
     SUBSAMPLING_FACTOR_RANGE = (0, 1)
+    NUM_TRIALS = 20
 
-    faiss_ivf_hyperparameters = {'num_voronoi_cells': [30], }
-
-    algorithm_parameters = {
-        'faiss_ivf': (profile_faiss_ivf, faiss_ivf_hyperparameters),
-    }
-
-    green_sc: SingleCell = load_green_sc(
-        sc_file=f'{PROJECT_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
-        retrieve=True, save_to=f'{SCRATCH_DIR}/rosmap')
+    # green_sc: SingleCell = load_green_sc(
+    #     sc_file=f'{PROJECT_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
+    #     retrieve=True, save_to=f'{SCRATCH_DIR}/rosmap')
 
     ### Auto-optimisation. ###
     # Try a couple of dataset sizes (for Green)...
@@ -284,6 +280,7 @@ if __name__ == '__main__':
 
     for i in range(len(sizes)):
         size = sizes[i]
+        # print(f'{KNN_DIR}/data/pcs/green_pcs_{size}.npy')
         # First Green...
         if not os.path.exists(f'{KNN_DIR}/data/pcs/green_pcs_{size}.npy'):
             sampled_cells = SingleCell(
@@ -291,15 +288,16 @@ if __name__ == '__main__':
                 X=False)
             sampled_pcs = sampled_cells.obsm['PCs']
             np.save(f'{KNN_DIR}/data/pcs/green_pcs_{size}', sampled_pcs)
-            sampled_seadd_pcs.append(sampled_pcs)
+            sampled_green_pcs.append(sampled_pcs)
         else:
             sampled_pcs = np.load(f'{KNN_DIR}/data/pcs/green_pcs_{size}.npy')
-            sampled_seadd_pcs.append(sampled_pcs)
+            sampled_green_pcs.append(sampled_pcs)
 
-        # Now SEADD.
+        # Now SEAAD.
         if not os.path.exists(f'{KNN_DIR}/data/pcs/seaad_pcs_{size}.npy'):
             sampled_cells = SingleCell(
-                f'{PROJECT_DIR}/single-cell/Subsampled/SEAAD_{size}.h5ad', X=False)
+                f'{PROJECT_DIR}/single-cell/Subsampled/SEAAD_{size}.h5ad',
+                X=False)
             sampled_pcs = sampled_cells.obsm['PCs']
             np.save(f'{KNN_DIR}/data/pcs/seaad_pcs_{size}', sampled_pcs)
             sampled_seadd_pcs.append(sampled_pcs)
@@ -311,24 +309,28 @@ if __name__ == '__main__':
         size = sizes[i]
 
         # First Green.
-        current_sampled_green_pcs = sampled_green_pcs[i]
-        results, green_study = auto_optimise(current_sampled_green_pcs, 100,
-                                             'umap')
-        results = results.sort('accuracy', descending=True)
-        results.write_csv(
-            f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results',
-            separator='\t')
-        save_plots(green_study, 'green', size)
+        if not os.path.exists(f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results'):
+            current_sampled_green_pcs = sampled_green_pcs[i]
+            results, green_study = auto_optimise(current_sampled_green_pcs,
+                                                 NUM_TRIALS,
+                                                 'umap')
+            results = results.sort('accuracy', descending=True)
+            results.write_csv(
+                f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results',
+                separator='\t')
+            save_plots(green_study, 'green', size)
 
         # Now SEAAD.
-        current_sampled_seadd_pcs = sampled_seadd_pcs[i]
-        results, seaad_study = auto_optimise(current_sampled_seadd_pcs, size,
-                                             'umap')
-        results = results.sort('accuracy', descending=True)
-        results.write_csv(
-            f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results',
-            separator='\t')
-        save_plots(seaad_study, 'seaad', size)
+        if not os.path.exists(f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results'):
+            current_sampled_seadd_pcs = sampled_seadd_pcs[i]
+            results, seaad_study = auto_optimise(current_sampled_seadd_pcs,
+                                                 NUM_TRIALS,
+                                                 'umap')
+            results = results.sort('accuracy', descending=True)
+            results.write_csv(
+                f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results',
+                separator='\t')
+            save_plots(seaad_study, 'seaad', size)
 
     # ### Manual optimisation. ###
     # sample, sample_indices, sample_train_data, sample_test_data = sample_data(

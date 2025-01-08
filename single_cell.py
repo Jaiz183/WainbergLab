@@ -15,6 +15,7 @@ from packaging import version
 from pathlib import Path
 from subprocess import run
 from textwrap import fill
+from threadpoolctl import threadpool_limits
 from timeit import default_timer
 from typing import Any, Callable, Dict, ItemsView, KeysView, Literal, \
     Mapping, Sequence, ValuesView, Union
@@ -170,6 +171,7 @@ def bincount(x: np.ndarray[1, np.dtype[np.uint32]],
                 # aggregate at the end. As an optimization, put the counts for
                 # the last thread (`thread_index == num_threads - 1`) directly
                 # into the final `counts` array.
+                
                 thread_counts.resize(num_threads - 1)
                 num_bins = counts.shape[0]
                 chunk_size = num_elements / num_threads
@@ -187,7 +189,9 @@ def bincount(x: np.ndarray[1, np.dtype[np.uint32]],
                         end = start + chunk_size
                         for i in range(start, end):
                             thread_counts[thread_index][arr[i]] += 1
+                
                 # Aggregate counts from all threads except the last
+                
                 for thread_index in range(num_threads - 1):
                     for i in range(num_bins):
                         counts[i] += thread_counts[thread_index][i]
@@ -488,7 +492,7 @@ def cython_inline(code,
     code = ''.join(f'#cython: {setting_name}={setting}\n'
                    for setting_name, setting in settings.items()) + \
                    f'#distutils: define_macros=NPY_NO_DEPRECATED_API=' \
-                   f'NPY_1_7_API_VERSION ' + dedent(code)
+                   f'NPY_1_7_API_VERSION\n' + dedent(code)
     # Make a short alphabetic module name by taking the code string's MD5 hash
     # and converting the hexadegimal digits to letters (0 -> a, 1 -> b, ...,
     # 9 --> j, a --> k, ..., f --> p)
@@ -519,11 +523,9 @@ def cython_inline(code,
                 libraries = \
                     f'[' + ', '.join(f'{library!r}'
                                      for library in libraries) + ']'
-            # Quote from the Narval docs: "On Narval, the options -xHOST and
-            # -march=native are equivalent to -march=pentium (the old 1993
-            # Pentium) and should not be used"
             narval = os.environ.get('CLUSTER') == 'narval'
-            march = 'core-avx2' if narval else 'native'
+            niagara = os.environ.get('CLUSTER') == 'niagara'
+            march = 'znver2' if narval else 'skylake' if niagara else 'native'
             # noinspection PyTypeChecker
             print(dedent(f'''
                 from setuptools import Extension, setup
@@ -533,13 +535,19 @@ def cython_inline(code,
                               language='c++',
                               include_dirs={include_dirs},
                               libraries={libraries},
-                              extra_compile_args=['-Ofast', '-march={march}',
-                                                  '-funroll-loops',
-                                                  '-fopenmp', '-Werror']
-                                  if {debug} else ['-g', '-march={march}',
-                                                   '-fopenmp', '-Werror'],
-                              extra_link_args=['-Ofast', '-fopenmp']
-                                  if {debug} else ['-fopenmp'])],
+                              extra_compile_args=['-g', '-march={march}',
+                                                  '-fopenmp', '-Werror',
+                                                  '-Wextra',
+                                                  '-Wno-maybe-uninitialized',
+                                                  '-Wno-ignored-qualifiers']
+                                  if {debug} else ['-Ofast', '-march={march}',
+                                                   '-funroll-loops',
+                                                   '-fopenmp', '-Werror',
+                                                   '-Wextra',
+                                                   '-Wno-maybe-uninitialized',
+                                                   '-Wno-ignored-qualifiers'],
+                              extra_link_args=['-fopenmp'] if {debug} else
+                                              ['-Ofast', '-fopenmp'])],
                     build_dir='{cython_cache_dir}'))'''), file=f)
         # Build the code (note: `sys.executable` is the location of Python)
         run(f'cd {cython_cache_dir} && {"CFLAGS=-g " if debug else ""}'
@@ -1376,11 +1384,13 @@ cython_functions = cython_inline(r'''
         cdef I i, jj, j, new_nnz
         
         # bincount(col_idxs)
+        
         for jj in range(n_idx):
             j = col_idxs[jj]
             col_offsets[j] += 1
     
         # Compute new indptr
+        
         Bp[0] = 0
         if num_threads == 1:
             new_nnz = 0
@@ -1398,6 +1408,7 @@ cython_functions = cython_inline(r'''
                 Bp[i + 1] += Bp[i]
         
         # cumsum in-place
+        
         for j in range(1, n_col):
             col_offsets[j] += col_offsets[j - 1]
     
@@ -9415,6 +9426,7 @@ class SingleCell:
                             # thread (`thread_index == num_threads - 1`)
                             # directly into the final `row_sums` and `mt_sums`
                             # arrays.
+                            
                             chunk_size = num_genes // num_threads
                             thread_row_sums.resize(num_threads - 1)
                             thread_mt_sums.resize(num_threads - 1)
@@ -9456,12 +9468,14 @@ class SingleCell:
                                                         <unsigned> data[cell]
                                 
                                 # Aggregate counts from all threads except the last
+                                
                                 for thread_index in range(num_threads - 1):
                                     for cell in range(num_cells):
                                         row_sums[cell] += thread_row_sums[thread_index][cell]
                                         mt_sums[cell] += thread_mt_sums[thread_index][cell]
                             
                                 # Populate the mask
+                                
                                 for cell in prange(num_cells,
                                                    num_threads=num_threads):
                                     mito_mask[cell] = \
@@ -9988,6 +10002,7 @@ class SingleCell:
                 
                 if num_threads == 1:
                     # Initialize the upper diagonal of obs to (1) + (2)
+                    
                     for i in range(num_genes):
                         for j in range(i + 1, num_genes):
                             obs[i, j] = detection_count[i] + detection_count[j]
@@ -9995,6 +10010,7 @@ class SingleCell:
                     # Now subtract off 2 * (3) for the upper diagonal: iterate
                     # over all pairs of genes i and j within each cell, and
                     # subtract 2 from `obs[i, j]` for each pair
+                    
                     for cell in range(num_cells):
                         for i in range(<unsigned long> indptr[cell],
                                        <unsigned long> indptr[cell + 1]):
@@ -10048,6 +10064,7 @@ class SingleCell:
                 
                 # Iterate over all pairs of genes i and j within each cell, and
                 # subtract `S[i, j]` from the cell's cxds score for each pair
+                
                 if num_threads == 1:
                     for cell in range(num_cells):
                         for gene_i in range(<unsigned long> indptr[cell],
@@ -10116,6 +10133,7 @@ class SingleCell:
                         elif indices[i] < indices[j]:
                             # `rand(&state) & 1` gives a random Boolean; only
                             # coin-flip if `data[i] == 1`
+                            
                             if data[i] > 1 or rand(&state) & 1:
                                 sim_indices[nnz] = indices[i]
                                 nnz = nnz + 1
@@ -11349,6 +11367,7 @@ class SingleCell:
                         if cell_indices.shape[0] == 0:
                             # Iterate over all elements of the count
                             # matrix, ignoring which cell they're from
+                            
                             num_elements = indices.shape[0]
                             for i in range(num_elements):
                                 gene = indices[i]
@@ -11360,6 +11379,7 @@ class SingleCell:
                             # Only iterate over the elements from cells
                             # in `cell_indices` (i.e. cells in this
                             # batch, and/or passing QC)
+                            
                             for j in range(num_cells):
                                 cell = cell_indices[j]
                                 for i in range(<unsigned long> indptr[cell],
@@ -11374,6 +11394,7 @@ class SingleCell:
                         # Calculate means and variances from the sums
                         # and squared sums, including the contribution
                         # from zero elements
+                        
                         for gene in range(num_dataset_genes):
                             mean[gene] = sum[gene] * inv_num_cells
                             var[gene] = inv_num_pairs_of_cells * (
@@ -11387,6 +11408,7 @@ class SingleCell:
                                 # cells, for better load-balancing in
                                 # case cells have substantially
                                 # different library sizes
+                                
                                 num_elements = indices.shape[0]
                                 chunk_size = \
                                     num_elements // num_threads
@@ -11411,6 +11433,7 @@ class SingleCell:
                                         thread_nonzero_counts[thread_index][gene] += 1
                             else:
                                 # Partition the work by cells
+                                
                                 chunk_size = num_cells // num_threads
                                 for thread_index in prange(num_threads,
                                                            num_threads=num_threads,
@@ -11438,6 +11461,7 @@ class SingleCell:
                             # Calculate means and variances by
                             # aggregating the sums and squared sums
                             # across threads
+                            
                             for gene in prange(num_dataset_genes,
                                                num_threads=num_threads):
                                 total_sum = 0
@@ -11505,6 +11529,7 @@ class SingleCell:
                                     # Calculate the sum and squared sum for
                                     # this gene, across cells with non-zero
                                     # counts for the gene
+                                    
                                     sum = 0
                                     sum_of_squares = 0
                                     nonzero_count[gene] = 0
@@ -11516,12 +11541,14 @@ class SingleCell:
                                     # Calculate the mean and variance from the
                                     # sum and squared sum, including the
                                     # contribution from zero elements
+                                    
                                     mean[gene] = sum * inv_num_cells
                                     var[gene] = inv_num_pairs_of_cells * (
                                         num_cells * sum_of_squares - sum * sum)
                             else:
                                 # As above, but only include cells where
                                 # `cell_mask` is `True`
+                                
                                 for gene in range(num_dataset_genes):
                                     sum = 0
                                     sum_of_squares = 0
@@ -12074,25 +12101,21 @@ class SingleCell:
                                           inplace=False,
                                           num_threads=num_threads)
         # Step 2
-        if num_threads == 1:
-            np.log1p(X.data, X.data)
-        else:
-            cython_inline('''
-                from cython.parallel cimport prange
-                from libc.math cimport log1p
+        cython_inline('''
+            from cython.parallel cimport prange
+            from libc.math cimport log1p
+            
+            def log1p_inplace(double[::1] data, const unsigned num_threads):
+                cdef unsigned long i
                 
-                def log1p_parallel(double[::1] data,
-                                   const unsigned num_threads):
-                    cdef unsigned long i
-                    
-                    if num_threads == 1:
-                        for i in range(<unsigned long> data.shape[0]):
-                            data[i] = log1p(data[i])
-                    else:
-                        for i in prange(<unsigned long> data.shape[0],
-                                        nogil=True, num_threads=num_threads):
-                            data[i] = log1p(data[i])
-                ''')['log1p_parallel'](X.data, num_threads)
+                if num_threads == 1:
+                    for i in range(<unsigned long> data.shape[0]):
+                        data[i] = log1p(data[i])
+                else:
+                    for i in prange(<unsigned long> data.shape[0],
+                                    nogil=True, num_threads=num_threads):
+                        data[i] = log1p(data[i])
+            ''')['log1p_inplace'](X.data, num_threads)
         # Step 3
         if method == 'PFlog1pPF':
             rowsums = X.sum(axis=1)
@@ -12628,14 +12651,19 @@ class SingleCell:
                 if num_threads == 1:
                     for i in range(num_cells):
                         # If the cell is its own nearest neighbor (almost always), skip
+                        
                         if <unsigned> neighbors[i, 0] == i:
                             continue
+                        
                         # Find the position where the cell is listed as its own
                         # self-neighbor
+                        
                         for j in range(1, num_neighbors):
                             if <unsigned> neighbors[i, j] == i:
                                 break
+                        
                         # Shift all neighbors before it to the right, overwriting it
+                        
                         while j > 0:
                             neighbors[i, j] = neighbors[i, j - 1]
                             j = j - 1
@@ -12679,6 +12707,7 @@ class SingleCell:
                   num_probes: int | np.integer | None = None,
                   num_clustering_iterations: int | np.integer = 10,
                   seed: int | np.integer | None = None,
+                  random_init: bool = False,  # TODO
                   overwrite: bool = False,
                   verbose: bool = True,
                   num_threads: int | np.integer | None = None) -> SingleCell:
@@ -12763,8 +12792,6 @@ class SingleCell:
             `np.array([4, 6])`. Note that if `QC_column` is not `None`, these
             integer indices are with respect to QCed cells, not all cells.
         """
-        with ignore_sigint():
-            import faiss
         # Get the QC column, if not None
         if QC_column is not None:
             QC_column = self._get_column(
@@ -12850,56 +12877,909 @@ class SingleCell:
         # `None`, set to `single_cell.options()['num_threads']`, and if -1, set
         # to `os.cpu_count()`. Set this as the number of threads for faiss.
         num_threads = SingleCell._process_num_threads(num_threads)
-        faiss.omp_set_num_threads(num_threads)
-        # Calculate each cell's `num_neighbors + 1`-nearest neighbors with
-        # faiss, where the `+ 1` is for the cell itself
-        dim = PCs.shape[1]
-        quantizer = faiss.IndexFlatL2(dim)
-        quantizer.verbose = verbose
-        index = faiss.IndexIVFFlat(quantizer, dim, num_clusters)
-        index.cp.seed = seed
-        index.verbose = verbose
-        index.cp.verbose = verbose
-        index.cp.niter = num_clustering_iterations
-        # noinspection PyArgumentList
-        index.train(PCs)
-        # noinspection PyArgumentList
-        index.add(PCs)
-        index.nprobe = num_probes
-        # noinspection PyArgumentList
-        nearest_neighbor_indices = index.search(PCs, num_neighbors + 1)[1]
-        # Sometimes there aren't enough nearest neighbors for certain cells
-        # with `num_probes` probes; if so, double `num_probes` (and threshold
-        # to at most `num_clusters`), then re-run nearest-neighbor finding for
-        # those cells
-        needs_update = nearest_neighbor_indices[:, -1] == -1
-        # noinspection PyUnresolvedReferences
-        if needs_update.any():
-            needs_update_X = PCs[needs_update]
+        cython_functions = cython_inline(r'''
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport prange
+        from libcpp.algorithm cimport fill
+        from libcpp.vector cimport vector
+        
+        # TODO
+        from cython.parallel import parallel
+        from libc.stdlib cimport malloc, calloc, free
+        from libc.string cimport memset
+        from scipy.linalg.cython_blas cimport dgemm
+        
+        cdef extern from "omp.h":
+            ctypedef struct omp_lock_t:
+                pass
+            void omp_init_lock(omp_lock_t *) noexcept nogil
+            void omp_destroy_lock(omp_lock_t *) noexcept nogil
+            void omp_set_lock(omp_lock_t *) noexcept nogil
+            void omp_unset_lock(omp_lock_t *) noexcept nogil
+            int omp_get_thread_num() noexcept nogil
+            int omp_get_max_threads() noexcept nogil
+
+        cdef extern from "float.h":
+            cdef double DBL_MAX
+
+        cdef extern from "limits.h":
+            cdef unsigned UINT_MAX
+
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+
+        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+            cdef unsigned r, threshold = -bound % bound
             while True:
-                num_probes = min(num_probes * 2, num_clusters)
-                if verbose:
-                    print(f'{len(needs_update_X):,} cells '
-                          f'({len(needs_update_X) / len(self._obs):.2f}%) did '
-                          f'not have enough neighbors with {index.nprobe:,} '
-                          f'probes; re-running nearest-neighbors finding for '
-                          f'these cells with {num_probes:,} probes')
-                index.nprobe = num_probes
-                # noinspection PyArgumentList
-                new_indices = \
-                    index.search(needs_update_X, num_neighbors + 1)[1]
-                nearest_neighbor_indices[needs_update] = new_indices
-                still_needs_update = new_indices[:, -1] == -1
-                # noinspection PyUnresolvedReferences
-                if not still_needs_update.any():
+                r = rand(state)
+                if r >= threshold:
+                    return r % bound
+        
+        cdef inline double random_probability(unsigned long* state) noexcept nogil:
+            # Returns a random probability, i.e. a random number in U(0, 1)
+            return <double> rand(state) / UINT_MAX
+        
+        cdef inline void kmeans_random_init(const double[:, ::1] X,
+                                            double[:, ::1] centroids,
+                                            const unsigned num_cells,
+                                            const unsigned num_clusters,
+                                            const unsigned long seed):
+            # Initialize centroids with random cells. Use a bitmap to efficiently keep
+            # track of which cells have been sampled already, to avoid sampling the
+            # same cell twice.
+            
+            cdef unsigned i, j
+            cdef unsigned long word_index, bit_index, state = srand(seed)
+            cdef vector[unsigned long] bitmap
+            bitmap.resize((num_cells + 63) // 64)
+            for i in range(num_clusters):
+                while True:
+                    j = randint(num_cells, &state)
+                    word_index = j >> 6
+                    bit_index = j & 63
+                    if not bitmap[word_index] & (1 << bit_index):
+                        bitmap[word_index] |= 1 << bit_index
+                        centroids[i] = X[j]
+                        break
+        
+        cdef inline void kmeans_barbar(const double[:, ::1] X,
+                                       double[:, ::1] centroids,
+                                       const unsigned num_init_iterations,
+                                       const double oversampling_factor,
+                                       const unsigned num_cells,
+                                       const unsigned num_clusters,
+                                       const unsigned num_dimensions,
+                                       const unsigned long seed):
+            cdef unsigned random_cell, iteration, i, j, k, c0, c1, \
+                selected_cell, best_selected_cell, num_selected_cells, cluster_index, \
+                selected_centroid
+            cdef unsigned long state
+            cdef double l = oversampling_factor * num_clusters, cost, difference, \
+                distance, l_over_cost, min_distance, inverse_cost, probability
+            cdef vector[double] min_distances
+            cdef vector[unsigned] selected_cells, selected_cell_weights, \
+                centroid_indices
+            min_distances.resize(num_cells)
+            # reserve 25% more than the expected number to be safe
+            selected_cells.reserve(<unsigned> (1.25 * num_init_iterations * l))
+        
+            # Sample a random cell from `X`, and add it to our list of selected cells.
+            # These will constitute a shortlist from which we will select the final
+            # centroids to start off k-means with.
+        
+            state = srand(seed)
+            random_cell = randint(num_cells, &state)
+            selected_cells.push_back(random_cell)
+        
+            # For the first iteration, calculate the (squared Euclidean) distance from
+            # each cell to this random cell, storing it in `min_distances`. Also
+            # calculate the sum of the `min_distances`, i.e. the `cost`.
+    
+            cost = 0
+            for i in range(num_cells):
+                distance = 0
+                for j in range(num_dimensions):
+                    difference = X[i, j] - X[random_cell, j]
+                    distance += difference * difference
+                min_distances[i] = distance
+                cost += distance
+    
+            # Sample each cell with probability `l * min_distances[i] / cost`
+            
+            l_over_cost = l / cost
+            for i in range(num_cells):
+                state = srand(seed + i)
+                if l_over_cost * min_distances[i] >= random_probability(&state):
+                    selected_cells.push_back(i)
+            
+            PyErr_CheckSignals()
+        
+            # For each remaining iteration...
+        
+            for iteration in range(1, num_init_iterations):
+                # Find each cell's distance to its nearest candidate centroid
+                # (selected cell), storing it in `min_distances`. Also calculate
+                # the sum of the `min_distances`, i.e. the `cost`.
+    
+                cost = 0
+                for i in range(num_cells):
+                    min_distance = DBL_MAX
+                    for selected_cell in selected_cells:
+                        distance = 0
+                        for j in range(num_dimensions):
+                            difference = X[i, j] - X[selected_cell, j]
+                            distance = distance + difference * difference
+                        if distance < min_distance:
+                            min_distance = distance
+                    min_distances[i] = min_distance
+                    cost += min_distance
+    
+                # Sample each cell `i` with probability `l * min_distances[i] / cost`.
+                # Note that `min_distances` will be 0 for cells that have already been
+                # sampled, so we will automatically avoid sampling them twice.
+    
+                l_over_cost = l / cost
+                for i in range(num_cells):
+                    state = srand(seed + i)
+                    if l_over_cost * min_distances[i] >= random_probability(&state):
+                        selected_cells.push_back(i)
+                    
+                PyErr_CheckSignals()
+        
+            # Get the weight for each selected cell: the number of cells that are
+            # closer to the selected cell than to any other selected cell
+        
+            num_selected_cells = selected_cells.size()
+            selected_cell_weights.resize(num_selected_cells)
+            for i in range(num_cells):
+                min_distance = DBL_MAX
+                for j in range(num_selected_cells):
+                    selected_cell = selected_cells[j]
+                    distance = 0
+                    for k in range(num_dimensions):
+                        difference = X[i, k] - X[selected_cell, k]
+                        distance = distance + difference * difference
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_selected_cell = j
+                selected_cell_weights[best_selected_cell] += 1
+        
+            PyErr_CheckSignals()
+            
+            # Run k-means++ to select `num_clusters` of the selected cells as the
+            # centroids, using `selected_cell_weights` as weights. Start by selecting a
+            # random cell from our selected cells as the first centroid.
+        
+            state = srand(seed + 1)
+            random_cell = selected_cells[randint(num_selected_cells, &state)]
+            centroid_indices.resize(num_clusters)
+            centroid_indices[0] = random_cell
+            centroids[0] = X[random_cell]
+        
+            # Iteratively select the remaining centroids
+        
+            for cluster_index in range(1, num_clusters):
+    
+                # Find each selected cell's distance to its nearest centroid. Multiply
+                # this distance by the selected cell's weight (from
+                # `selected_cell_weights`), and store it in `min_distances`. Also
+                # calculate the sum of the weighted `min_distances`, i.e. the `cost`.
+    
+                cost = 0
+                for i in range(num_selected_cells):
+                    selected_cell = selected_cells[i]
+                    min_distance = DBL_MAX
+                    for j in range(cluster_index):
+                        selected_centroid = centroid_indices[j]
+                        distance = 0
+                        for k in range(num_dimensions):
+                            difference = X[selected_cell, k] - X[selected_centroid, k]
+                            distance = distance + difference * difference
+                        if distance < min_distance:
+                            min_distance = distance
+                    min_distance = min_distance * selected_cell_weights[i]
+                    min_distances[i] = min_distance
+                    cost += min_distance
+    
+                # Sample a single cell `i` with probability
+                # `min_distances[i] / cost`. Note that `min_distances` will be 0
+                # for cells that have already been sampled, so we will
+                # automatically avoid sampling them twice.
+    
+                inverse_cost = 1 / cost
+                probability = random_probability(&state)
+                i = 0
+                while True:
+                    probability -= min_distances[i] * inverse_cost
+                    if probability < 0:
+                        break
+                    i += 1
+                centroid_indices[cluster_index] = selected_cells[i]
+                centroids[cluster_index] = X[selected_cells[i]]
+        
+            PyErr_CheckSignals()
+        
+        cdef inline void kmeans_barbar_parallel(const double[:, ::1] X,
+                                                double[:, ::1] centroids,
+                                                const unsigned num_init_iterations,
+                                                const double oversampling_factor,
+                                                const unsigned num_cells,
+                                                const unsigned num_clusters,
+                                                const unsigned num_dimensions,
+                                                const unsigned long seed,
+                                                const unsigned num_threads):
+            cdef unsigned random_cell, iteration, i, j, k, thread_index, c0, c1, \
+                selected_cell, best_selected_cell, num_selected_cells, cluster_index, \
+                selected_centroid
+            cdef unsigned long state
+            cdef double l = oversampling_factor * num_clusters, cost, difference, \
+                distance, l_over_cost, min_distance, inverse_cost, probability
+            cdef vector[double] min_distances
+            cdef vector[unsigned] selected_cells, selected_cell_weights, \
+                centroid_indices
+            cdef vector[vector[unsigned]] thread_selected_cells
+            min_distances.resize(num_cells)
+            # reserve 25% more than the expected number to be safe
+            selected_cells.reserve(<unsigned> (1.25 * num_init_iterations * l))
+        
+            # Sample a random cell from `X`, and add it to our list of selected cells.
+            # These will constitute a shortlist from which we will select the final
+            # centroids to start off k-means with.
+        
+            state = srand(seed)
+            random_cell = randint(num_cells, &state)
+            selected_cells.push_back(random_cell)
+        
+            with nogil:
+                # For the first iteration, calculate the (squared Euclidean) distance from
+                # each cell to this random cell, storing it in `min_distances`. Also
+                # calculate the sum of the `min_distances`, i.e. the `cost`.
+        
+                cost = 0
+                for i in prange(num_cells, num_threads=num_threads):
+                    distance = 0
+                    for j in range(num_dimensions):
+                        difference = X[i, j] - X[random_cell, j]
+                        distance = distance + difference * difference
+                    min_distances[i] = distance
+                    cost += distance
+        
+                # Sample each cell with probability `l * min_distances[i] / cost`
+        
+                thread_selected_cells.resize(num_threads)
+                l_over_cost = l / cost
+                for thread_index in prange(num_threads, num_threads=num_threads,
+                                           chunksize=1, schedule='static'):
+                    thread_selected_cells[thread_index].reserve(
+                        <unsigned> (1.25 * l / num_threads))
+                    c0 = num_cells * thread_index / num_threads
+                    c1 = num_cells * (thread_index + 1) / num_threads
+                    for i in range(c0, c1):
+                        state = srand(seed + i)
+                        if l_over_cost * min_distances[i] >= random_probability(&state):
+                            thread_selected_cells[thread_index].push_back(i)
+        
+                # Aggregate each thread's selected cells into a single vector
+        
+                for thread_index in range(num_threads):
+                    selected_cells.insert(
+                        selected_cells.end(),
+                        thread_selected_cells[thread_index].begin(),
+                        thread_selected_cells[thread_index].end())
+        
+            PyErr_CheckSignals()
+        
+            # For each remaining iteration...
+        
+            for iteration in range(1, num_init_iterations):
+                with nogil:
+                    # Find each cell's distance to its nearest candidate centroid
+                    # (selected cell), storing it in `min_distances`. Also calculate
+                    # the sum of the `min_distances`, i.e. the `cost`.
+        
+                    cost = 0
+                    for i in prange(num_cells, num_threads=num_threads):
+                        min_distance = DBL_MAX
+                        for selected_cell in selected_cells:
+                            distance = 0
+                            for j in range(num_dimensions):
+                                difference = X[i, j] - X[selected_cell, j]
+                                distance = distance + difference * difference
+                            if distance < min_distance:
+                                min_distance = distance
+                        min_distances[i] = min_distance
+                        cost += min_distance
+        
+                    # Sample each cell `i` with probability `l * min_distances[i] / cost`.
+                    # Note that `min_distances` will be 0 for cells that have already been
+                    # sampled, so we will automatically avoid sampling them twice.
+        
+                    l_over_cost = l / cost
+                    for thread_index in prange(num_threads, num_threads=num_threads,
+                                               chunksize=1, schedule='static'):
+                        thread_selected_cells[thread_index].clear()
+                        c0 = num_cells * thread_index / num_threads
+                        c1 = num_cells * (thread_index + 1) / num_threads
+                        for i in range(c0, c1):
+                            state = srand(seed + i)
+                            if l_over_cost * min_distances[i] >= random_probability(&state):
+                                thread_selected_cells[thread_index].push_back(i)
+        
+                    # Aggregate each thread's selected cells into a single vector
+        
+                    for thread_index in range(num_threads):
+                        selected_cells.insert(
+                            selected_cells.end(),
+                            thread_selected_cells[thread_index].begin(),
+                            thread_selected_cells[thread_index].end())
+        
+                PyErr_CheckSignals()
+        
+            # Get the weight for each selected cell: the number of cells that are
+            # closer to the selected cell than to any other selected cell
+        
+            num_selected_cells = selected_cells.size()
+            selected_cell_weights.resize(num_selected_cells)
+            for i in prange(num_cells, nogil=True, num_threads=num_threads):
+                min_distance = DBL_MAX
+                for j in range(num_selected_cells):
+                    selected_cell = selected_cells[j]
+                    distance = 0
+                    for k in range(num_dimensions):
+                        difference = X[i, k] - X[selected_cell, k]
+                        distance = distance + difference * difference
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_selected_cell = j
+                selected_cell_weights[best_selected_cell] += 1
+        
+            PyErr_CheckSignals()
+            
+            # Run k-means++ to select `num_clusters` of the selected cells as the
+            # centroids, using `selected_cell_weights` as weights. Start by selecting a
+            # random cell from our selected cells as the first centroid.
+        
+            state = srand(seed + 1)
+            random_cell = selected_cells[randint(num_selected_cells, &state)]
+            centroid_indices.resize(num_clusters)
+            centroid_indices[0] = random_cell
+            centroids[0] = X[random_cell]
+        
+            # Iteratively select the remaining centroids
+        
+            with nogil:
+                for cluster_index in range(1, num_clusters):
+        
+                    # Find each selected cell's distance to its nearest centroid. Multiply
+                    # this distance by the selected cell's weight (from
+                    # `selected_cell_weights`), and store it in `min_distances`. Also
+                    # calculate the sum of the weighted `min_distances`, i.e. the `cost`.
+        
+                    cost = 0
+                    for i in prange(num_selected_cells, num_threads=num_threads):
+                        selected_cell = selected_cells[i]
+                        min_distance = DBL_MAX
+                        for j in range(cluster_index):
+                            selected_centroid = centroid_indices[j]
+                            distance = 0
+                            for k in range(num_dimensions):
+                                difference = X[selected_cell, k] - X[selected_centroid, k]
+                                distance = distance + difference * difference
+                            if distance < min_distance:
+                                min_distance = distance
+                        min_distance = min_distance * selected_cell_weights[i]
+                        min_distances[i] = min_distance
+                        cost += min_distance
+        
+                    # Sample a single cell `i` with probability
+                    # `min_distances[i] / cost`. Note that `min_distances` will be 0
+                    # for cells that have already been sampled, so we will
+                    # automatically avoid sampling them twice.
+        
+                    inverse_cost = 1 / cost
+                    probability = random_probability(&state)
+                    i = 0
+                    while True:
+                        probability -= min_distances[i] * inverse_cost
+                        if probability < 0:
+                            break
+                        i += 1
+                    centroid_indices[cluster_index] = selected_cells[i]
+                    centroids[cluster_index] = X[selected_cells[i]]
+        
+            PyErr_CheckSignals()
+        
+        def kmeans(const double[:, ::1] X,
+                   unsigned[::1] cluster_labels,
+                   double[:, ::1] centroids,
+                   double[:, ::1] centroids_new,  # TODO
+                   double[::1] centroid_norms,  # TODO
+                   unsigned[::1] num_cells_per_cluster,
+                   const bint random_init,
+                   const unsigned num_init_iterations,
+                   const double oversampling_factor,
+                   const unsigned num_kmeans_iterations,
+                   const unsigned long seed,
+                   const unsigned num_threads):
+            cdef unsigned i, j, k, l, random_cell, best_cluster, thread_index, \
+                c0, c1, num_cells = X.shape[0], \
+                num_clusters = centroids.shape[0], num_dimensions = centroids.shape[1]
+            cdef double difference, distance, min_distance, norm, \
+                inv_cells_minus_clusters = 1.0 / (num_cells - num_clusters), \
+                one_plus_eps = 1025.0 / 1024, one_minus_eps = 1023.0 / 1024
+            cdef unsigned long state = srand(seed)
+            
+            # TODO
+            cdef omp_lock_t lock
+            cdef unsigned i_, j_, chunk_index, start, end, chunk_num_cells, \
+                num_chunks = (num_cells + 255) / 256
+            cdef double alpha = -2, beta = 1
+            cdef char transA = b'T', transB = b'N'
+            cdef double* centroids_new_chunk
+            cdef unsigned* num_cells_per_cluster_chunk
+            cdef double* distances
+            cdef double[:, ::1] temp
+            
+            if num_threads == 1:
+                if random_init:
+                    # Initialize centroids with random points
+                    kmeans_random_init(X, centroids, num_cells, num_clusters, seed)
+                else:
+                    # Initialize centroids with k-means|| (Bahmani et al. 2012)
+                    kmeans_barbar(X, centroids, num_init_iterations,
+                                  oversampling_factor, num_cells, num_clusters,
+                                  num_dimensions, seed)
+                
+                # Run k-means for `num_kmeans_iterations` iterations
+                
+                for iteration in range(num_kmeans_iterations):
+                    # Find each cell's nearest centroid, stored in `cluster_labels`
+        
+                    for i in range(num_cells):
+                        min_distance = DBL_MAX
+                        for j in range(num_clusters):
+                            distance = 0
+                            for k in range(num_dimensions):
+                                difference = X[i, k] - centroids[j, k]
+                                distance += difference * difference
+                            if distance < min_distance:
+                                min_distance = distance
+                                best_cluster = j
+                        cluster_labels[i] = best_cluster
+        
+                    PyErr_CheckSignals()
+        
+                    # Find the new centroids, based on these cluster assignments
+        
+                    centroids[:] = 0
+                    num_cells_per_cluster[:] = 0
+                    for i in range(num_cells):
+                        ci = cluster_labels[i]
+                        num_cells_per_cluster[ci] += 1
+                        for j in range(num_dimensions):
+                            centroids[ci, j] += X[i, j]
+                    for ci in range(num_clusters):
+                        if num_cells_per_cluster[ci] > 0:
+                            norm = 1.0 / num_cells_per_cluster[ci]
+                            for j in range(num_dimensions):
+                                centroids[ci, j] *= norm
+        
+                    # Handle empty clusters by randomly picking a larger cluster, with
+                    # probability proportional to its size, and splitting it in two. Set
+                    # the centroids of these two clusters by taking the original cluster's
+                    # centroid and applying small, opposite perturbations. Update
+                    # `num_cells_per_cluster` (used to make future splits) by heuristically
+                    # assuming the cells split evenly between the two clusters; it's not
+                    # important enough to bother recalculating the exact split.
+        
+                    for i in range(num_clusters):
+                        if num_cells_per_cluster[i] == 0:
+                            j = 0
+                            while inv_cells_minus_clusters * \
+                                    (num_cells_per_cluster[j] - 1) <= \
+                                    random_probability(&state):
+                                j = (j + 1) % num_clusters
+                            centroids[i, :] = centroids[j, :]
+                            for k in range(0, num_dimensions, 2):
+                                centroids[i, k] *= one_plus_eps
+                                centroids[j, k] *= one_minus_eps
+                                centroids[i, k + 1] *= one_minus_eps
+                                centroids[j, k + 1] *= one_plus_eps
+                            num_cells_per_cluster[i] = num_cells_per_cluster[j] / 2
+                            num_cells_per_cluster[j] -= num_cells_per_cluster[i]
+        
+                    PyErr_CheckSignals()
+            else:
+                # Same as the single-threaded case, but the centroid-finding step needs
+                # each thread to scan through every cell and only process the cells
+                # that match a particular cluster, to avoid expensive synchronization.
+                # The k-means|| has similar additional complexity.
+                
+                if random_init:
+                    # Initialize centroids with random points
+                    kmeans_random_init(X, centroids, num_cells, num_clusters, seed)
+                else:
+                    # Initialize centroids with k-means|| (Bahmani et al. 2012)
+                    kmeans_barbar_parallel(X, centroids, num_init_iterations,
+                                           oversampling_factor, num_cells,
+                                           num_clusters, num_dimensions, seed,
+                                           num_threads)
+                
+                # Swap `centroids` and `centroids_new` if doing an odd number
+                # of k-means iterations, so the array passed in as `centroids`
+                # always ends up with the final centroids
+                
+                if num_kmeans_iterations & 1:
+                    temp = centroids
+                    centroids = centroids_new
+                    centroids_new = temp
+                
+                for iteration in range(num_kmeans_iterations):
+                    # # Find each cell's nearest centroid, stored in `cluster_labels`
+                    #
+                    # for i in prange(num_cells, nogil=True, num_threads=num_threads):
+                    #     min_distance = DBL_MAX
+                    #     for j in range(num_clusters):
+                    #         distance = 0
+                    #         for k in range(num_dimensions):
+                    #             difference = X[i, k] - centroids[j, k]
+                    #             distance = distance + difference * difference
+                    #         if distance < min_distance:
+                    #             min_distance = distance
+                    #             best_cluster = j
+                    #     cluster_labels[i] = best_cluster
+                    #
+                    # PyErr_CheckSignals()
+                    #
+                    # # Find the new centroids, based on these cluster assignments
+                    #
+                    # centroids[:] = 0
+                    # num_cells_per_cluster[:] = 0
+                    # with nogil:
+                    #     for thread_index in prange(num_threads, num_threads=num_threads,
+                    #                                schedule='static', chunksize=1):
+                    #         # Each thread calculates centroids `c0` to `c1 - 1`
+                    #         c0 = num_clusters * thread_index / num_threads
+                    #         c1 = num_clusters * (thread_index + 1) / num_threads
+                    #         for i in range(num_cells):
+                    #             ci = cluster_labels[i]
+                    #             if c0 <= ci < c1:
+                    #                 num_cells_per_cluster[ci] += 1
+                    #                 for j in range(num_dimensions):
+                    #                     centroids[ci, j] += X[i, j]
+                    #     for ci in prange(num_clusters, num_threads=num_threads):
+                    #         if num_cells_per_cluster[ci] > 0:
+                    #             norm = 1.0 / num_cells_per_cluster[ci]
+                    #             for j in range(num_dimensions):
+                    #                 centroids[ci, j] *= norm
+                    centroids_new[:] = 0
+                    num_cells_per_cluster[:] = 0
+                    omp_init_lock(&lock)
+                    
+                    for i in prange(num_clusters, nogil=True, num_threads=num_threads):
+                        norm = 0
+                        for j in range(num_dimensions):
+                            norm = norm + centroids[i, j] * centroids[i, j]
+                        centroid_norms[i] = norm
+                
+                    with nogil, parallel(num_threads=min(num_threads, num_chunks)):
+                        # thread-local buffers
+                        centroids_new_chunk = <double*> calloc(num_clusters * num_dimensions, sizeof(double))
+                        num_cells_per_cluster_chunk = <unsigned*> calloc(num_clusters, sizeof(unsigned))
+                        distances = <double*> malloc(256 * num_clusters * sizeof(double))
+                
+                        for chunk_index in prange(num_chunks):
+                            start = chunk_index * 256
+                            end = num_cells if chunk_index == num_chunks - 1 else start + 256
+                            chunk_num_cells = end - start
+                            
+                            # Use the identity ||X - C||² = ||X||² - 2 * X.dot(C.T) + ||C||²,
+                            # but skip calculating the ||X||² term since the best cluster for a
+                            # given cell only depends on the centroids
+                            for i in range(chunk_num_cells):
+                                for j in range(num_clusters):
+                                    # distances = ||C||²
+                                    distances[i * num_clusters + j] = centroid_norms[j]
+                            # distances -= 2 * X.dot(C.T)
+                            dgemm(&transA, &transB, <int*> &num_clusters, <int*> &chunk_num_cells,
+                                  <int*> &num_dimensions, <double*> &alpha, <double*> &X[start, 0],
+                                  <int*> &num_dimensions, <double*> &centroids[0, 0],
+                                  <int*> &num_dimensions, <double*> &beta, &distances[0],
+                                  <int*> &num_clusters)
+                            for i in range(chunk_num_cells):
+                                min_distance = distances[i * num_clusters]
+                                best_cluster = 0
+                                for j in range(1, num_clusters):
+                                    distance = distances[i * num_clusters + j]
+                                    if distance < min_distance:
+                                        min_distance = distance
+                                        best_cluster = j
+                                cluster_labels[start + i] = best_cluster
+                                num_cells_per_cluster_chunk[best_cluster] += 1
+                                for k in range(num_dimensions):
+                                    centroids_new_chunk[best_cluster * num_dimensions + k] += X[start + i, k]
+                
+                        omp_set_lock(&lock)
+                        for i_ in range(num_clusters):
+                            num_cells_per_cluster[i_] += num_cells_per_cluster_chunk[i_]
+                            for j_ in range(num_dimensions):
+                                centroids_new[i_, j_] += centroids_new_chunk[i_ * num_dimensions + j_]
+                        omp_unset_lock(&lock)
+                
+                        free(centroids_new_chunk)
+                        free(num_cells_per_cluster_chunk)
+                        free(distances)
+                    
+                        for i in prange(num_clusters):
+                            if num_cells_per_cluster[i] > 0:
+                                norm = 1.0 / num_cells_per_cluster[i]
+                                for j in range(num_dimensions):
+                                    centroids_new[i, j] *= norm
+                    
+                    # Handle empty clusters, as described in the single-threaded case
+        
+                    for i in range(num_clusters):
+                        if num_cells_per_cluster[i] == 0:
+                            j = 0
+                            while inv_cells_minus_clusters * \
+                                    (num_cells_per_cluster[j] - 1) <= \
+                                    random_probability(&state):
+                                j = (j + 1) % num_clusters
+                            centroids[i, :] = centroids[j, :]
+                            for k in range(0, num_dimensions, 2):
+                                centroids[i, k] *= one_plus_eps
+                                centroids[j, k] *= one_minus_eps
+                                centroids[i, k + 1] *= one_minus_eps
+                                centroids[j, k + 1] *= one_plus_eps
+                            num_cells_per_cluster[i] = num_cells_per_cluster[j] / 2
+                            num_cells_per_cluster[j] -= num_cells_per_cluster[i]
+        
+                    PyErr_CheckSignals()
+                    
+                    # Swap `centroids` and `centroids_new` after each k-means
+                    # iteration
+                    
+                    temp = centroids
+                    centroids = centroids_new
+                    centroids_new = temp
+                
+        cdef inline void heap_replace_top(unsigned* neighbors_i,
+                                          double* distances_i,
+                                          const unsigned label,
+                                          const double distance,
+                                          const unsigned k) noexcept nogil:
+            # Replaces the top element from the heap defined by `distances_i[0..k-1]`
+            # and `neighbors_i[0..k-1]`. Equivalent to `std::pop_heap` followed by
+            # `std::push_heap`, but done more efficiently as a single operation.
+
+            cdef unsigned j = 1, child
+            distances_i -= 1  # use 1-based indexing for easier node->child translation
+            neighbors_i -= 1
+            while True:
+                child = j << 1
+                if child > k:
                     break
-                # noinspection PyUnresolvedReferences
-                needs_update[needs_update] = still_needs_update
-                needs_update_X = needs_update_X[still_needs_update]
+                child += child < k and distances_i[child] <= distances_i[child + 1]
+                if distance > distances_i[child]:
+                    break
+                distances_i[j] = distances_i[child]
+                neighbors_i[j] = neighbors_i[child]
+                j = child
+            distances_i[j] = distance
+            neighbors_i[j] = label
+
+        cdef inline void heap_pop(unsigned* neighbors_i,
+                                  double* distances_i,
+                                  const unsigned k) noexcept nogil:
+            # Pops the top element from the heap defined by `distances_i[0..k-1]` and
+            # `neighbors_i[0..k-1]`. On output the `k-1`th element is undefined.
+
+            cdef unsigned label, j = 1, child
+            cdef double distance
+            distances_i -= 1  # use 1-based indexing for easier node->child translation
+            neighbors_i -= 1
+            distance = distances_i[k]
+            label = neighbors_i[k]
+            while True:
+                child = j << 1
+                if child > k:
+                    break
+                child += child < k and distances_i[child] <= distances_i[child + 1]
+                if distance > distances_i[child]:
+                    break
+                distances_i[j] = distances_i[child]
+                neighbors_i[j] = neighbors_i[child]
+                j = child
+            distances_i[j] = distance
+            neighbors_i[j] = label
+
+        cdef inline void heap_sort(unsigned* neighbors_i,
+                                   double* distances_i,
+                                   const unsigned k) noexcept nogil:
+            cdef unsigned j, label
+            cdef double distance
+            for j in range(k):
+                # Save the root (maximum element)
+                distance = distances_i[0]
+                label = neighbors_i[0]
+                # Restore the heap property with reduced size `k - i`
+                heap_pop(neighbors_i, distances_i, k - j)
+                # Place the maximum element after the end of the heap
+                distances_i[k - j - 1] = distance
+                neighbors_i[k - j - 1] = label
+
+        def knn(const double[:, ::1] Y,
+                const double[:, ::1] X,
+                const unsigned[::1] cluster_labels,
+                const double[:, ::1] centroids,
+                const unsigned[::1] num_cells_per_cluster,
+                unsigned[:, ::1] neighbors,
+                double[:, ::1] distances,
+                unsigned[:, ::1] nearest_clusters,
+                double[:, ::1] centroid_distances,
+                const unsigned num_neighbors,
+                const unsigned num_probes,
+                const unsigned num_candidates_per_neighbor,
+                const unsigned num_threads):
+            # Find the `num_neighbors`-nearest neighbors of each cell in `Y` among the
+            # cells in `X`, which have k-means cluster labels `cluster_labels`. Store
+            # the nearest-neighbor indices in `neighbors` and distances in `distances`.
+
+            cdef unsigned i, j, k, thread_index, cluster_label, num_searched, iprobe, \
+                cluster_num_cells, neighbor, num_Y = Y.shape[0], num_X = X.shape[0], \
+                num_dimensions = X.shape[1], num_clusters = centroids.shape[0], \
+                num_candidates = num_neighbors * num_candidates_per_neighbor
+            cdef double difference, distance
+            cdef vector[vector[unsigned]] index
+
+            # Create the inverted file index: a mapping from cluster labels to the
+            # cells from `X` in the cluster. This is just an inversion of
+            # `cluster_labels`.
+
+            index.resize(num_clusters)
+            for cluster_label in range(num_clusters):
+                index[cluster_label].reserve(num_cells_per_cluster[cluster_label])
+            for thread_index in prange(num_threads, nogil=True, num_threads=num_threads,
+                                       chunksize=1, schedule='static'):
+                for i in range(num_X):
+                    cluster_label = cluster_labels[i]
+                    if cluster_label % num_threads == thread_index:
+                        index[cluster_label].push_back(i)
+            
+            PyErr_CheckSignals()
+
+            # Find the `num_probes` nearest centroids of each cell in `Y`,
+            # storing their indices in `nearest_clusters`
+
+            for i in prange(num_Y, nogil=True, num_threads=num_threads):
+                for j in range(num_probes):
+                    nearest_clusters[i, j] = -1
+                    centroid_distances[i, j] = DBL_MAX
+                for cluster_label in range(num_clusters):
+                    distance = 0
+                    for j in range(num_dimensions):
+                        difference = Y[i, j] - centroids[cluster_label, j]
+                        distance = distance + difference * difference
+                    # If this centroid is one of the `num_probes` closest centroids
+                    # found so far, add it to the heap, and remove the formerly
+                    # `num_probes`th-closest centroid (which is now not in the top
+                    # `num_probes` centroids anymore)
+                    if distance < centroid_distances[i, 0]:
+                        heap_replace_top(&nearest_clusters[i, 0], &centroid_distances[i, 0],
+                                         cluster_label, distance, num_probes)
+                heap_sort(&nearest_clusters[i, 0], &centroid_distances[i, 0], num_neighbors)
+
+            PyErr_CheckSignals()
+
+            # Search each cell's `num_probes` nearest clusters for nearest-neighbor
+            # candidates, stopping early (at the end of fully searching a cluster) if
+            # more than `num_candidates` cells have been considered.
+
+            for i in prange(num_Y, nogil=True, num_threads=num_threads):
+                for j in range(num_neighbors):
+                    neighbors[i, j] = -1
+                    distances[i, j] = DBL_MAX
+                num_searched = 0
+                for iprobe in range(num_probes):
+                    cluster_label = nearest_clusters[i, iprobe]
+                    cluster_num_cells = num_cells_per_cluster[cluster_label]
+                    for j in range(cluster_num_cells):
+                        neighbor = index[cluster_label][j]
+                        distance = 0
+                        for k in range(num_dimensions):
+                            difference = X[neighbor, k] - Y[i, k]
+                            distance = distance + difference * difference
+                        if distance < distances[i, 0]:
+                            heap_replace_top(&neighbors[i, 0], &distances[i, 0],
+                                             neighbor, distance, num_neighbors)
+                    num_searched = num_searched + cluster_num_cells
+                    if num_searched >= num_candidates:
+                        break
+                heap_sort(&neighbors[i, 0], &distances[i, 0], num_neighbors)
+        ''')
+        kmeans = cython_functions['kmeans']
+        knn = cython_functions['knn']
+        
+        # faiss.omp_set_num_threads(num_threads)
+        # # Calculate each cell's `num_neighbors + 1`-nearest neighbors with
+        # # faiss, where the `+ 1` is for the cell itself
+        # dim = PCs.shape[1]
+        # quantizer = faiss.IndexFlatL2(dim)
+        # quantizer.verbose = verbose
+        # index = faiss.IndexIVFFlat(quantizer, dim, num_clusters)
+        # index.cp.seed = seed
+        # index.verbose = verbose
+        # index.cp.verbose = verbose
+        # index.cp.niter = num_clustering_iterations
+        # # noinspection PyArgumentList
+        # index.train(PCs)
+        # # noinspection PyArgumentList
+        # index.add(PCs)
+        # index.nprobe = num_probes
+        # # noinspection PyArgumentList
+        # neighbors = index.search(PCs, num_neighbors + 1)[1]
+        # # Sometimes there aren't enough nearest neighbors for certain cells
+        # # with `num_probes` probes; if so, double `num_probes` (and threshold
+        # # to at most `num_clusters`), then re-run nearest-neighbor finding for
+        # # those cells
+        # needs_update = neighbors[:, -1] == -1
+        # # noinspection PyUnresolvedReferences
+        # if needs_update.any():
+        #     needs_update_X = PCs[needs_update]
+        #     while True:
+        #         num_probes = min(num_probes * 2, num_clusters)
+        #         if verbose:
+        #             print(f'{len(needs_update_X):,} cells '
+        #                   f'({len(needs_update_X) / len(self._obs):.2f}%) did '
+        #                   f'not have enough neighbors with {index.nprobe:,} '
+        #                   f'probes; re-running nearest-neighbors finding for '
+        #                   f'these cells with {num_probes:,} probes')
+        #         index.nprobe = num_probes
+        #         # noinspection PyArgumentList
+        #         new_indices = \
+        #             index.search(needs_update_X, num_neighbors + 1)[1]
+        #         neighbors[needs_update] = new_indices
+        #         still_needs_update = new_indices[:, -1] == -1
+        #         # noinspection PyUnresolvedReferences
+        #         if not still_needs_update.any():
+        #             break
+        #         # noinspection PyUnresolvedReferences
+        #         needs_update[needs_update] = still_needs_update
+        #         needs_update_X = needs_update_X[still_needs_update]
+        
+        num_PCs = PCs.shape[1]
+        cluster_labels = np.empty(num_cells, dtype=np.uint32)
+        centroids = np.empty((num_clusters, num_PCs), dtype=float)
+        num_cells_per_cluster = np.empty(num_clusters, dtype=np.uint32)
+        kmeans(X=PCs, cluster_labels=cluster_labels, centroids=centroids,
+               centroids_new=np.empty((num_clusters, num_PCs), dtype=float),  # TODO
+               centroid_norms=np.empty(num_clusters, dtype=float),  # TODO
+               num_cells_per_cluster=num_cells_per_cluster,
+               random_init=random_init, num_init_iterations=5, oversampling_factor=1,
+               num_kmeans_iterations=25, seed=seed, num_threads=num_threads)
+        neighbors = np.empty((num_cells, num_neighbors), dtype=np.uint32)
+        distances = np.empty((num_cells, num_neighbors), dtype=float)
+        num_probes = num_neighbors  # TODO
+        knn(Y=PCs, X=PCs, cluster_labels=cluster_labels, centroids=centroids,
+            num_cells_per_cluster=num_cells_per_cluster, neighbors=neighbors,
+            distances=distances,
+            nearest_clusters=np.empty((num_cells, num_probes),
+                                      dtype=np.uint32),
+            centroid_distances=np.empty((num_cells, num_probes), dtype=float),
+            num_neighbors=num_neighbors, num_probes=num_probes,
+            num_candidates_per_neighbor=10, num_threads=num_threads)
         if verbose:
             # noinspection PyUnresolvedReferences
-            percent = \
-                (nearest_neighbor_indices[:, 0] == range(num_cells)).mean()
+            percent = (neighbors[:, 0] == range(num_cells)).mean()
             print(f'{100 * percent:.3f}% of cells are correctly detected as '
                   f'their own nearest neighbors (a measure of the quality of '
                   f'the k-nearest neighbors search)')
@@ -12917,15 +13797,21 @@ class SingleCell:
                 
                 if num_threads == 1:
                     for i in range(num_cells):
+                    
                         # If the cell is its own nearest neighbor (almost always), skip
+                        
                         if <unsigned> neighbors[i, 0] == i:
                             continue
+                            
                         # Find the position where the cell is listed as its own
                         # self-neighbor
+                        
                         for j in range(1, num_neighbors):
                             if <unsigned> neighbors[i, j] == i:
                                 break
+                                
                         # Shift all neighbors before it to the right, overwriting it
+                        
                         while j > 0:
                             neighbors[i, j] = neighbors[i, j - 1]
                             j = j - 1
@@ -12941,21 +13827,18 @@ class SingleCell:
                             neighbors[i, j] = neighbors[i, j - 1]
                             j = j - 1
                 ''')['remove_self_neighbors']
-        remove_self_neighbors(nearest_neighbor_indices, num_threads)
-        nearest_neighbor_indices = nearest_neighbor_indices[:, 1:]
+        remove_self_neighbors(neighbors, num_threads)
+        neighbors = neighbors[:, 1:]
         # If `QC_column` is not `None`, back-project from QCed cells to all
         # cells, filling with -1
         if QC_column is not None:
-            nearest_neighbor_indices_QCed = nearest_neighbor_indices
-            nearest_neighbor_indices = np.full(
-                (len(self), nearest_neighbor_indices_QCed.shape[1]), -1)
+            neighbors_QCed = neighbors
+            neighbors = np.full((len(self), neighbors_QCed.shape[1]), -1)
             # noinspection PyUnboundLocalVariable
-            nearest_neighbor_indices[QCed_NumPy] = \
-                nearest_neighbor_indices_QCed
+            neighbors[QCed_NumPy] = neighbors_QCed
         # noinspection PyTypeChecker
         return SingleCell(X=self._X, obs=self._obs, var=self._var,
-                          obsm=self._obsm |
-                               {neighbors_key: nearest_neighbor_indices},
+                          obsm=self._obsm | {neighbors_key: neighbors},
                           varm=self._varm, obsp=self._obsp, varp=self._varp,
                           uns=self._uns)
     
@@ -13129,11 +14012,13 @@ class SingleCell:
                 cdef double[::1] data_view
                 
                 # Allocate space for shared nearest neighbors and weights
+                
                 shared_neighbors.resize(num_cells)
                 shared_neighbor_weights.resize(num_cells)
                 
                 # Build the "reverse" mapping: which cells have each cell as a neighbor.
                 # Also check that all neighbor indices are in range.
+                
                 reverse_neighbors.resize(num_cells)
                 for i in range(num_cells):
                     for j in range(num_neighbors):
@@ -13158,6 +14043,7 @@ class SingleCell:
                 PyErr_CheckSignals()
                 
                 # Calculate the number of shared neigbors for each pair of cells
+                
                 if not has_QC_column:
                     if num_threads == 1:
                         thread_index = 0
@@ -13188,6 +14074,7 @@ class SingleCell:
                             # Preallocate enough space for all `num_unique_ks` to avoid the
                             # need for dynamic resizing, even though the true required size
                             # (which we call `num_unique_pruned_ks`) is less due to the pruning.
+                            
                             num_unique_ks = shared_neighbors[i].size()
                             shared_neighbor_weights[i].reserve(num_unique_ks)
                             num_unique_pruned_ks = 0
@@ -13203,11 +14090,13 @@ class SingleCell:
                             
                             # Store the number of unique `k`s after pruning in
                             # `indptr` (we will take the cumsum later)
+                            
                             indptr[i + 1] = num_unique_pruned_ks
                     else:
                         # Same code as the serial version aside from the
                         # `prange()`; note that each thread has its own
                         # independent workspace within `num_shared_neighbors`
+                        
                         for i in prange(num_cells, num_threads=num_threads,
                                         nogil=True):
                             thread_index = threadid()
@@ -13284,12 +14173,14 @@ class SingleCell:
                 
                 # Take the cumulative sum of the values in `indptr`; initialize the
                 # first element to 0
+                
                 indptr[0] = 0
                 for i in range(2, indptr.shape[0]):
                     indptr[i] += indptr[i - 1]
                 
                 # Allocate `indices` and `data`: their length is the sum of the
                 # numbers of unique `k`s across all cells
+                
                 nnz = indptr[indptr.shape[0] - 1]
                 indices = np.empty(nnz, dtype=np.uint32)
                 data = np.empty(nnz, dtype=np.float64)
@@ -13301,6 +14192,7 @@ class SingleCell:
                 # is necessary). If `QC_column` is not `None`, map each element
                 # of `indices` through `QCed_to_full_map` so the indices are
                 # with respect to all cells, not just QCed cells.
+                
                 indices_view = indices
                 data_view = data
                 if not has_QC_column:
@@ -14743,26 +15635,6 @@ class SingleCell:
                 size_t size() noexcept nogil const
                 size_t find_first_slot(size_t next_bucket) noexcept nogil const
                 double& operator[](const unsigned& key) noexcept nogil
-            
-            cdef cppclass UnsignedHashMapIterator "HashMap<unsigned, unsigned>::iterator":
-                UnsignedHashMapIterator() noexcept nogil
-                pair[unsigned, unsigned]& operator*() noexcept nogil const
-                UnsignedHashMapIterator operator++() noexcept nogil
-                UnsignedHashMapIterator operator++(int) noexcept nogil
-                bint operator==(const UnsignedHashMapIterator&) noexcept nogil const
-                bint operator!=(const UnsignedHashMapIterator&) noexcept nogil const
-        
-            cdef cppclass UnsignedHashMap "HashMap<unsigned, unsigned>":
-                UnsignedHashMap() noexcept nogil
-                UnsignedHashMap(size_t n) noexcept nogil
-                UnsignedHashMapIterator begin() noexcept nogil const
-                UnsignedHashMapIterator end() noexcept nogil const
-                size_t erase(const unsigned& key) noexcept nogil
-                void clear() noexcept nogil
-                bint empty() noexcept nogil const
-                size_t size() noexcept nogil const
-                size_t find_first_slot(size_t next_bucket) noexcept nogil const
-                unsigned& operator[](const unsigned& key) noexcept nogil
         
         def paris(const numeric[::1] data,
                   const signed_integer[::1] indices,
@@ -14792,6 +15664,7 @@ class SingleCell:
             cdef vector[unsigned] cc
             
             # Build graph and calculate weights
+            
             w.resize(num_dendrogram_nodes)
             node_map.resize(num_nodes)
             if num_threads == 1:
@@ -14820,21 +15693,28 @@ class SingleCell:
             inv_wtot = 1 / wtot
             
             # Cluster
+            
             u = num_nodes
             chain.reserve(64)
             start_node = 0
             while n > 0:
                 PyErr_CheckSignals()
+                
                 # Pick an arbitrary (non-empty) node, and add it to the chain
+                
                 while True:
                     if node_map[start_node] != UINT_MAX:
                         chain.push_back(start_node)
                         break
                     start_node += 1
                 while not chain.empty():
+                    # Pop the last node, `a`, from the chain
+                    
                     a = chain.back()
                     chain.pop_back()
-                    # nearest neighbor
+                    
+                    # Find `a`'s nearest neighbor, `b`
+                    
                     dmin = INFINITY
                     for neighbor in graph[a]:
                         v = neighbor.first
@@ -14845,17 +15725,28 @@ class SingleCell:
                             dmin = d
                         elif d == dmin and v < b:
                             b = v
+                    
+                    # If the chain is still not empty after popping `a`...
+                    
                     if not chain.empty():
+                        # Pop the second-last node, `c`, from the chain
+                        
                         c = chain.back()
                         chain.pop_back()
                         if b == c:
-                            # Merge `a` and `b` (or more specifically,
-                            # `node_map[a]` and `node_map[b]`)
+                            # `a`'s nearest neighbor `b` was the second-last
+                            # node in the chain, meaning that `a` and `b` are
+                            # mutual nearest neighbors. Merge `a` and `b` (or
+                            # more specifically, `node_map[a]` and
+                            # `node_map[b]`).
+                            
                             left_nodes[num_merges] = node_map[a]
                             right_nodes[num_merges] = node_map[b]
                             distances[num_merges] = dmin * w[a] * inv_wtot
                             num_merges += 1
+                            
                             # Update graph
+                            
                             if graph[a].size() < graph[b].size():
                                 # Merge `a` into `b`, since `a` has fewer
                                 # neighbors than `b` so this should be faster
@@ -14868,28 +15759,33 @@ class SingleCell:
                                 # `graph[v][a]`. To avoid creating self-loops,
                                 # delete `graph[a][b]` and `graph[b][a]` at the
                                 # start.
+                                
                                 graph[a].erase(b)
                                 graph[b].erase(a)
                                 for neighbor in graph[a]:
-                                    # num_edges_merged += 1
                                     v = neighbor.first
                                     weight = neighbor.second
                                     graph[b][v] += weight
                                     graph[v][b] += weight
                                     graph[v].erase(a)
                                 graph[a].clear()
+                                
                                 # Set `node_map[a]` to an invalid value (`a`
                                 # will never be used again), and update
                                 # `node_map[b]` to `u`, the index of the merged
                                 # node we just created
+                                
                                 node_map[a] = UINT_MAX
                                 node_map[b] = u
+                                
                                 # Update the weight of `b` to include the
                                 # contribution from `a`
+                                
                                 w[b] += w[a]
                             else:
                                 # Merge `b` into `a`: the reverse of the code
                                 # above
+                                
                                 graph[b].erase(a)
                                 graph[a].erase(b)
                                 for neighbor in graph[b]:
@@ -14903,17 +15799,30 @@ class SingleCell:
                                 node_map[a] = u
                                 w[a] += w[b]
                             n -= 1
-                            # Increment the cluster index
                             u += 1
                         else:
+                            # `a`'s nearest neighbor is `b`, but `b`'s nearest
+                            # neighbor is another node that's not `a`. Put
+                            # `c` and `a` back into the chain, and also add
+                            # `b` so we can find which node is its nearest
+                            # neighbor, and continue the chain until we find a
+                            # pair of nodes that are mutual nearest neighbors.
+                            
                             chain.push_back(c)
                             chain.push_back(a)
                             chain.push_back(b)
                     elif not isinf(dmin):
+                        # `a` was the first node we added to the chain. Add it
+                        # and its nearest neighbor `b` to the chain, and keep
+                        # going.
+                        
                         chain.push_back(a)
                         chain.push_back(b)
                     else:
-                        # Remove the connected component
+                        # `a` has no neighbors, meaning that it comprises an
+                        # entire connected component. Remove this connected
+                        # component from the graph and store it in `cc`.
+                        
                         cc.push_back(node_map[a])
                         for neighbor in graph[a]:
                             graph[neighbor.first].erase(a)
@@ -14921,7 +15830,9 @@ class SingleCell:
                         node_map[a] = UINT_MAX
                         n -= 1
 
-            # Add connected components to the dendrogram
+            # Add connected components to the dendrogram, with a distance of
+            # infinity from each other
+            
             if not cc.empty():
                 a = cc.back()
                 cc.pop_back()
@@ -14959,8 +15870,8 @@ class SingleCell:
                   PC_key: str = 'PCs',
                   Harmony_key: str = 'Harmony_PCs',
                   num_clusters: int | np.integer | None = None,
-                  max_iter_harmony: int | np.integer = 10,
-                  max_iter_clustering: int | np.integer | None = 20,
+                  max_harmony_iterations: int | np.integer = 10,
+                  max_clustering_iterations: int | np.integer | None = 20,
                   block_proportion: int | float | np.integer |
                                     np.floating = 0.05,
                   tol_harmony: int | float | np.integer | np.floating = 1e-4,
@@ -15020,13 +15931,13 @@ class SingleCell:
             num_clusters: the number of clusters used in the Harmony algorithm.
                           If not specified, take the minimum of 100 and
                           floor(number of cells / 30).
-            max_iter_harmony: the maximum number of iterations to run Harmony
+            max_harmony_iterations: the maximum number of iterations to run Harmony
                               for, if convergence is not achieved. Defaults to
                               10, like the original harmony package,
                               harmony-pytorch, and harmonypy. Set to `None` to
                               use as many iterations as necessary to achieve
                               convergence.
-            max_iter_clustering: the maximum number of iterations to run the
+            max_clustering_iterations: the maximum number of iterations to run the
                                  clustering step within each Harmony iteration
                                  for, if convergence is not achieved. Defaults
                                  to 20 iterations, like the original harmony
@@ -15039,10 +15950,10 @@ class SingleCell:
                               update in the clustering step; must be greater
                               than zero and less than or equal to 1
             tol_harmony: the relative tolerance used to determine whether to
-                         stop Harmony before `max_iter_harmony` iterations;
+                         stop Harmony before `max_harmony_iterations` iterations;
                          must be positive
             tol_clustering: the relative tolerance used to determine whether to
-                            stop clustering before `max_iter_clustering`
+                            stop clustering before `max_clustering_iterations`
                             iterations; must be positive
             ridge_lambda: the ridge regression penalty used in the Harmony
                           correction step; must be non-negative
@@ -15100,21 +16011,21 @@ class SingleCell:
                 f'least one dataset; did you already run harmonize()? Set '
                 f'overwrite=True to overwrite.')
             raise ValueError(error_message)
-        # Check that `num_clusters`, `max_iter_harmony`, and
-        # `max_iter_clustering` are `None` or a positive integer; if either max
+        # Check that `num_clusters`, `max_harmony_iterations`, and
+        # `max_clustering_iterations` are `None` or a positive integer; if either max
         # iter argument is `None`, set it to `INT32_MAX`
         for parameter, parameter_name in (
                 (num_clusters, 'num_clusters'),
-                (max_iter_harmony, 'max_iter_harmony'),
-                (max_iter_clustering, 'max_iter_clustering')):
+                (max_harmony_iterations, 'max_harmony_iterations'),
+                (max_clustering_iterations, 'max_clustering_iterations')):
             if parameter is not None:
                 check_type(parameter, parameter_name, int,
                            'a positive integer')
                 check_bounds(parameter, parameter_name, 1)
-        if max_iter_harmony is None:
-            max_iter_harmony = 2147483647
-        if max_iter_clustering is None:
-            max_iter_clustering = 2147483647
+        if max_harmony_iterations is None:
+            max_harmony_iterations = 2147483647
+        if max_clustering_iterations is None:
+            max_clustering_iterations = 2147483647
         # Check that `block_proportion` is a number and that
         # `0 < block_proportion <= 1`
         check_type(block_proportion, 'block_proportion', (int, float),
@@ -15212,8 +16123,9 @@ class SingleCell:
                                              const bint transpose_B,
                                              const double alpha,
                                              const double beta) noexcept nogil:
-                # Flip A <-> B and shape[0] <-> shape[1] since our matrices are
-                # C-major
+                # Flip `A` <-> `B` and `shape[0]` <-> `shape[1]` since our
+                # matrices are C-major, whereas BLAS expects Fortran-major
+                
                 cdef int m, n, k, lda, ldb
                 cdef char transA, transB
                 if transpose_B:
@@ -15245,7 +16157,9 @@ class SingleCell:
                     const bint transpose,
                     const double alpha,
                     const double beta) noexcept nogil:
-                # Flip trans since our matrix is C-major
+                # Flip `trans` since our matrix is C-major, whereas BLAS
+                # expects Fortran-major
+                
                 cdef int m = A.shape[1], n = A.shape[0], incx = 1, incy = 1
                 cdef char trans = b'N' if transpose else b'T'
                 dgemv(&trans, &m, &n, <double*> &alpha, <double*> &A[0,0],
@@ -15331,11 +16245,13 @@ class SingleCell:
                     num_batches = E.shape[0], num_clusters = E.shape[1]
                 cdef double norm, objective, base, two_over_sigma = 2 / sigma
                 
-                # Initialize Pr_b
+                # Initialize `Pr_b`
+                
                 for i in range(num_batches):
                     Pr_b[i] = <double> N_b[i] / num_cells
                 
-                # Initialize R (and R_sum) and O
+                # Initialize `R` (and `R_sum`) and `O`
+                
                 matrix_multiply(Z_norm, Y_norm, Z_norm_times_Y_norm,
                                 transpose_A=False, transpose_B=True, alpha=1,
                                 beta=0)
@@ -15352,12 +16268,14 @@ class SingleCell:
                         O[batch_label, j] += R[i, j]
                         R_sum[j] += R[i, j]
                 
-                # Initialize E
+                # Initialize `E`
+                
                 for i in range(num_batches):
                     for j in range(num_clusters):
                         E[i, j] = Pr_b[i] * R_sum[j]
                 
-                # Apply discounting to theta, if specified
+                # Apply discounting to `theta`, if specified
+                
                 if tau > 0:
                     for i in range(num_batches):
                         base = exp(-N_b[i] / (num_clusters * tau))
@@ -15365,6 +16283,7 @@ class SingleCell:
                 
                 # Compute and return the initial value of the objective
                 # function
+                
                 objective = compute_objective(
                     Z_norm_times_Y_norm, R, E, O, ratio, theta,
                     theta_times_ratio, sigma, num_cells, num_clusters,
@@ -15395,14 +16314,15 @@ class SingleCell:
                     num_cells = Z_norm.shape[0], num_PCs = Z_norm.shape[1], \
                     num_batches = E.shape[0], num_clusters = E.shape[1]
                 cdef unsigned long state
-                cdef double norm, old, new, objective = -1, \
+                cdef double norm, old, new, objective, \
                     two_over_sigma = 2 / sigma
                 cdef double exp_neg_two_over_sigma = exp(-two_over_sigma)
                 cdef double[:, ::1] Z_norm_block, R_block
                 cdef double past_clustering_objectives[3]
                 
                 for iter in range(max_iter):
-                    # Compute Cluster Centroids
+                    # Compute cluster centroids
+                    
                     matrix_multiply(R, Z_norm, Y_norm, transpose_A=True,
                                     transpose_B=False, alpha=1, beta=0)
                     for i in range(num_clusters):
@@ -15418,6 +16338,7 @@ class SingleCell:
                     shuffle_array(idx_list, &state)
                     
                     # Update cells blockwise
+                    
                     pos = 0
                     Z_norm_block = Z_norm_in
                     R_block = R_in
@@ -15429,7 +16350,8 @@ class SingleCell:
                         else:
                             num_cells_in_block = block_size
                         
-                        # Remove the cells in this block from E and O
+                        # Remove the cells in this block from `E` and `O`
+                        
                         R_in_sum[:] = 0
                         for i in range(num_cells_in_block):
                             k = idx_list[pos + i]
@@ -15443,13 +16365,14 @@ class SingleCell:
                             for j in range(num_clusters):
                                 E[i, j] -= Pr_b[i] * R_in_sum[j]
                         
-                        # Recompute R for the removed cells
+                        # Recompute `R` for the removed cells
                         # Note: the original formula is
-                        # exp(-2 / sigma * (1 - Z_norm_block @ Y_norm.T)),
-                        # which expands to exp(-2 / sigma) *
-                        # exp(2 / sigma * Z_norm_block @ Y_norm.T)). Since
-                        # exp(-2 / sigma) is a constant, we fold it into
+                        # `exp(-2 / sigma * (1 - Z_norm_block @ Y_norm.T))`,
+                        # which expands to `exp(-2 / sigma) *
+                        # exp(2 / sigma * Z_norm_block @ Y_norm.T))`. Since
+                        # `exp(-2 / sigma)` is a constant, we fold it into
                         # `ratio`.
+                        
                         matrix_multiply(Z_norm_block, Y_norm, R_block,
                                         transpose_A=False, transpose_B=True,
                                         alpha=two_over_sigma, beta=0)
@@ -15471,18 +16394,23 @@ class SingleCell:
                             for j in range(num_clusters):
                                 R[k, j] *= norm
                                 R_in_sum[j] += R[k, j]
-                                # Add the removed cells back into O
+                                
+                                # Add the removed cells back into `O`
+                                
                                 O[batch_label, j] += R[k, j]
                         
-                        # Add the removed cells back into E
+                        # Add the removed cells back into `E`
+                        
                         for i in range(num_batches):
                             for j in range(num_clusters):
                                 E[i, j] += Pr_b[i] * R_in_sum[j]
                         
                         # Move to the next block
+                        
                         pos += block_size
                     
                     # Compute the objective and decide whether we've converged
+                    
                     matrix_multiply(Z_norm, Y_norm, Z_norm_times_Y_norm,
                                     transpose_A=False, transpose_B=True,
                                     alpha=1, beta=0)
@@ -15528,13 +16456,15 @@ class SingleCell:
                 
                 Z_hat[:] = Z[:]
                 
-                # Initialize P to the identity matrix
+                # Initialize `P` to the identity matrix
+                
                 P[:] = 0
                 for i in range(num_batches + 1):
                     P[i, i] = 1
             
                 for k in range(num_clusters):
-                    # Compute factor, c_inv and P
+                    # Compute `factor`, `c_inv` and `P`
+                    
                     c = 0
                     for i in range(num_batches):
                         factor[i] = 1 / (O[i, k] + ridge_lambda)
@@ -15542,18 +16472,21 @@ class SingleCell:
                         P[0, i + 1] = -factor[i] * O[i, k]
                     c_inv = 1 / c
                     
-                    # Compute P_t_B_inv
+                    # Compute `P_t_B_inv`
+                    
                     P_t_B_inv[:] = 0
                     P_t_B_inv[0, 0] = c_inv
                     for i in range(1, num_batches + 1):
                         P_t_B_inv[i, i] = factor[i - 1]
                         P_t_B_inv[i, 0] = P[0, i] * c_inv
                     
-                    # Compute inv_mat
+                    # Compute `inv_mat`
+                    
                     matrix_multiply(P_t_B_inv, P, inv_mat, transpose_A=False,
                                     transpose_B=False, alpha=1, beta=0)
                     
-                    # Compute Phi_t_diag_R @ X
+                    # Compute `Phi_t_diag_R @ X`
+                    
                     Phi_t_diag_R_by_X[:] = 0
                     for i in range(num_cells):
                         batch_label = batch_labels[i]
@@ -15562,12 +16495,14 @@ class SingleCell:
                             Phi_t_diag_R_by_X[batch_label + 1, j] += \
                                 Z[i, j] * R[i, k]
                             
-                    # Compute W
+                    # Compute `W`
+                    
                     matrix_multiply(inv_mat, Phi_t_diag_R_by_X, W,
                                     transpose_A=False, transpose_B=False,
                                     alpha=1, beta=0)
                     
-                    # Update Z_hat
+                    # Update `Z_hat`
+                    
                     for i in range(num_cells):
                         batch_label = batch_labels[i]
                         for j in range(num_PCs):
@@ -15650,9 +16585,9 @@ class SingleCell:
         if verbose:
             print(f'Initialization is complete: objective = {objective:.2f}')
         
-        iteration_string = plural('iteration', max_iter_harmony)
+        iteration_string = plural('iteration', max_harmony_iterations)
         
-        for i in range(1, max_iter_harmony + 1):
+        for i in range(1, max_harmony_iterations + 1):
             prev_objective = objective
             objective = clustering(
                 Z_norm=Z_norm, Z_norm_in=Z_norm_in, Y_norm=Y_norm,
@@ -15660,7 +16595,7 @@ class SingleCell:
                 batch_labels=batch_labels, R=R, R_in=R_in, R_in_sum=R_in_sum,
                 E=E, O=O, ratio=ratio, theta=theta,
                 theta_times_ratio=theta_times_ratio, idx_list=idx_list,
-                tol=tol_clustering, max_iter=max_iter_clustering, sigma=sigma,
+                tol=tol_clustering, max_iter=max_clustering_iterations, sigma=sigma,
                 block_size=block_size)
             correction(Z=Z, Z_hat=Z_norm, R=R, O=O, ridge_lambda=ridge_lambda,
                        batch_labels=batch_labels, factor=factor, P=P,
@@ -15668,7 +16603,7 @@ class SingleCell:
                        Phi_t_diag_R_by_X=Phi_t_diag_R_by_X, W=W)
             
             if verbose:
-                print(f'Completed {i} of {max_iter_harmony} '
+                print(f'Completed {i} of {max_harmony_iterations} '
                       f'{iteration_string}: objective = {objective:.2f}')
             
             if prev_objective - objective < tol_harmony * abs(prev_objective):
@@ -15676,12 +16611,1271 @@ class SingleCell:
                     print(f'Reached convergence after {i} {iteration_string}')
                 break
             
-            if i == max_iter_harmony:
+            if i == max_harmony_iterations:
                 if verbose:
                     print(f'Failed to converge after {i} {iteration_string}')
                 break
             
             normalize_rows_inplace(Z_norm)
+        
+        del batch_labels, Z, Pr_b, theta, R, E, O, Z_norm_in, Y_norm, \
+            Z_norm_times_Y_norm, R_in, R_in_sum, ratio, theta_times_ratio, \
+            idx_list, factor, P, P_t_B_inv, inv_mat, Phi_t_diag_R_by_X, W
+        
+        # Store each dataset's Harmony embedding in its obsm
+        for dataset_index, (dataset, QC_col, num_cells, end_index) in \
+                enumerate(zip(datasets, QC_columns_NumPy,
+                              num_cells_per_dataset,
+                              num_cells_per_dataset.cumsum())):
+            start_index = end_index - num_cells
+            dataset_Harmony_embedding = Z_norm[start_index:end_index]
+            # If `QC_col` is not `None` for this dataset, back-project from
+            # QCed cells to all cells, filling with `NaN`
+            if QC_col is not None:
+                dataset_Harmony_embedding_QCed = dataset_Harmony_embedding
+                dataset_Harmony_embedding = np.full(
+                    (len(dataset), dataset_Harmony_embedding_QCed.shape[1]),
+                    np.nan)
+                # noinspection PyUnboundLocalVariable
+                dataset_Harmony_embedding[QC_col] = \
+                    dataset_Harmony_embedding_QCed
+            datasets[dataset_index] = SingleCell(
+                X=dataset._X, obs=dataset._obs, var=dataset._var,
+                obsm=dataset._obsm | {Harmony_key: dataset_Harmony_embedding},
+                varm=self._varm, uns=self._uns)
+        return tuple(datasets) if others else datasets[0]
+    
+    def harmonize_new(self,
+                  *others: SingleCell,
+                  QC_column: SingleCellColumn | None |
+                             Sequence[SingleCellColumn | None] = 'passed_QC',
+                  batch_column: SingleCellColumn | None |
+                                Sequence[SingleCellColumn | None] = None,
+                  PC_key: str = 'PCs',
+                  Harmony_key: str = 'Harmony_PCs',
+                  num_clusters: int | np.integer | None = None,
+                  num_init_iterations: int | np.integer = 5,
+                  oversampling_factor: int | np.integer | float |
+                                       np.floating = 1,
+                  num_kmeans_iterations: int | np.integer = 25,
+                  max_harmony_iterations: int | np.integer = 10,
+                  max_clustering_iterations: int | np.integer | None = 20,
+                  block_proportion: int | float | np.integer |
+                                    np.floating = 0.05,
+                  tol_harmony: int | float | np.integer | np.floating = 1e-4,
+                  tol_clustering: int | float | np.integer |
+                                  np.floating = 1e-5,
+                  ridge_lambda: int | float | np.integer | np.floating = 1,
+                  sigma: int | float | np.integer | np.floating = 0.1,
+                  theta: int | float | np.integer | np.floating = 2,
+                  tau: int | float | np.integer | np.floating = 0,
+                  seed: int | np.integer | None = None,
+                  random_init: bool = False,  # TODO
+                  overwrite: bool = False,
+                  verbose: bool = True,
+                  num_threads: int | np.integer | None = None) -> \
+            SingleCell | tuple[SingleCell, ...]:
+        """
+        Harmonize this SingleCell dataset with other datasets, using Harmony
+        (nature.com/articles/s41592-019-0619-0). Harmony was originally written
+        in R (github.com/immunogenomics/harmony) but has two Python ports,
+        harmony-pytorch (github.com/lilab-bcb/harmony-pytorch), which our
+        implementation is based on, and harmonypy
+        (github.com/slowkow/harmonypy).
+        
+        Args:
+            others: the other SingleCell datasets to harmonize this one with
+            QC_column: an optional Boolean column of `obs` indicating which
+                       cells passed QC. Can be a column name, a polars
+                       expression, a polars Series, a 1D NumPy array, or a
+                       function that takes in this SingleCell dataset and
+                       returns a polars Series or 1D NumPy array. Set to `None`
+                       to include all cells. Cells failing QC will be ignored
+                       and have their Harmony embeddings set to `NaN`. When
+                       `others` is specified, `QC_column` can be a
+                       length-`1 + len(others)` sequence of columns,
+                       expressions, Series, functions, or `None` for each
+                       dataset (for `self`, followed by each dataset in
+                       `others`).
+            batch_column: an optional String, Enum, Categorical, or integer
+                          column of `obs` indicating which batch each cell is
+                          from. Can be a column name, a polars expression, a
+                          polars Series, a 1D NumPy array, or a function that
+                          takes in this SingleCell dataset and returns a polars
+                          Series or 1D NumPy array. Each batch will be treated
+                          as if it were a distinct dataset; this is exactly
+                          equivalent to splitting the dataset with
+                          `split_by(batch_column)` and then passing each of the
+                          resulting datasets to `harmonize()`. Set to `None` to
+                          treat each dataset as having a single batch. When
+                          `others` is specified, `batch_column` may be a
+                          length-`1 + len(others)` sequence of columns,
+                          expressions, Series, functions, or `None` for each
+                          dataset (for `self`, followed by each dataset in
+                          `others`).
+            PC_key: the key of `obsm` containing the principal components
+                    calculated with `PCA()`, to use as the input to Harmony
+            Harmony_key: the key of `obsm` where the Harmony embeddings will be
+                         stored; will be added in-place to both `self` and each
+                         of the datasets in `others`!
+            num_clusters: the number of clusters used in the Harmony algorithm,
+                          including in the initial k-means clustering. If not
+                          specified, take the minimum of 100 and
+                          floor(number of cells / 30).
+            num_init_iterations: the number of k-means|| iterations used to
+                                 initialize the k-means clustering that
+                                 constitutes the first step of Harmony.
+                                 k-means|| is a parallel version of the
+                                 widely used k-means++ initialization scheme
+                                 for k-means clustering. The default value of 5
+                                 is recommended by the k-means|| paper
+                                 (arxiv.org/abs/1203.6402).
+            oversampling_factor: the number of candidate centroids selected, on
+                                 average, at each of the `num_init_iterations`
+                                 iterations of k-means||, as a multiple of
+                                 `num_clusters`. The default value of 1 is the
+                                 midpoint (in log space) of the values explored
+                                 by the k-means|| paper
+                                 (arxiv.org/abs/1203.6402), namely 0.1 to 10.
+                                 The total number of candidate centroids
+                                 selected, on average, will be
+                                 `oversampling_factor * num_clusters + 1`, from
+                                 which the final `num_clusters` centroids will
+                                 then be selected via k-means++.
+            num_kmeans_iterations: the number of iterations of k-means
+                                   clustering to run, as the first step of
+                                   Harmony. Defaults to 25, like the original
+                                   Harmony R package, harmony-pytorch, and
+                                   harmonypy. However, unlike these packages,
+                                   only one initialization is tried rather than
+                                   10 to reduce runtime.
+            max_harmony_iterations: the maximum number of iterations to run
+                                    Harmony for, if convergence is not
+                                    achieved. Defaults to 10, like the original
+                                    Harmony R package, harmony-pytorch, and
+                                    harmonypy. Set to `None` to use as many
+                                    iterations as necessary to achieve
+                                    convergence.
+            max_clustering_iterations: the maximum number of iterations to run
+                                       the clustering step within each Harmony
+                                       iteration for, if convergence is not
+                                       achieved. Defaults to 20 iterations,
+                                       like the original harmony R package and
+                                       harmonypy; this differs from the default
+                                       of 200 iterations used by
+                                       harmony-pytorch. Set to `None` to use as
+                                       many iterations as necessary to achieve
+                                       convergence.
+            block_proportion: the proportion of cells to use in each batch
+                              update in the clustering step; must be greater
+                              than zero and less than or equal to 1
+            tol_harmony: the relative tolerance used to determine whether to
+                         stop Harmony before `max_harmony_iterations`
+                         iterations; must be positive
+            tol_clustering: the relative tolerance used to determine whether to
+                            stop clustering before `max_clustering_iterations`
+                            iterations; must be positive
+            ridge_lambda: the ridge regression penalty used in the Harmony
+                          correction step; must be non-negative
+            sigma: the weight of the entropy term in the Harmony objective
+                   function; must be non-negative
+            theta: the weight of the diversity penalty term in the Harmony
+                   objective function; must be non-negative
+            tau: the discounting factor on theta; must be non-negative. By
+                 default, `tau = 0`, so there is no discounting.
+            seed: the random seed to use for the initial k-means clustering, or
+                  leave unset to use `single_cell.options()['seed']` as the
+                  seed (0 by default)
+            overwrite: if `True`, overwrite `Harmony_key` if already present in
+                       obsm, instead of raising an error
+            verbose: whether to print details of the harmonization process
+            num_threads: the number of threads to use for the initial k-means
+                         clustering and for the matrix and matrix-vector
+                         multiplications within Harmony. Set `num_threads=-1`
+                         to use all available cores (as determined by
+                         `os.cpu_count()`), or leave unset to use
+                         `single_cell.options()['num_threads']` cores (1 by
+                         default).
+        
+        Returns:
+            A length-`1 + len(others)` tuple of SingleCell datasets with the
+            Harmony embeddings stored in `obsm[Harmony_key]`: `self`, followed
+            by each dataset in `others`.
+        """
+        # Check `others`
+        if not others:
+            error_message = 'others cannot be empty'
+            raise ValueError(error_message)
+        check_types(others, 'others', SingleCell, 'SingleCell datasets')
+        datasets = [self] + list(others)
+        # Get `QC_column` and `batch_column` from every dataset, if not None
+        QC_columns = SingleCell._get_columns(
+            'obs', datasets, QC_column, 'QC_column', pl.Boolean,
+            allow_missing=True)
+        QC_columns_NumPy = [QC_col.to_numpy() if QC_col is not None else None
+                            for QC_col in QC_columns]
+        batch_columns = SingleCell._get_columns(
+            'obs', datasets, batch_column, 'batch_column',
+            (pl.String, pl.Categorical, pl.Enum, 'integer'),
+            QC_columns=QC_columns)
+        # Check that `PC_key` is a key of `obsm` for every dataset
+        check_type(PC_key, 'PC_key', str, 'a string')
+        if not all(PC_key in dataset._obsm for dataset in datasets):
+            error_message = (
+                f'PC_key {PC_key!r} is not a column of obs for at least one '
+                f'dataset; did you forget to run PCA() before harmonize()?')
+            raise ValueError(error_message)
+        # Check that `overwrite` is Boolean
+        check_type(overwrite, 'overwrite', bool, 'Boolean')
+        # Check that `Harmony_key` is a string and, unless `overwrite=True`,
+        # not already in `obsm` for any dataset
+        check_type(Harmony_key, 'Harmony_key', str, 'a string')
+        if not overwrite and \
+                any(Harmony_key in dataset._obsm for dataset in datasets):
+            error_message = (
+                f'Harmony_key {Harmony_key!r} is already a key of obsm for at '
+                f'least one dataset; did you already run harmonize()? Set '
+                f'overwrite=True to overwrite.')
+            raise ValueError(error_message)
+        # Check that `num_clusters`, `max_harmony_iterations`, and
+        # `max_clustering_iterations` are `None` or a positive integer; if
+        # either of the latter two arguments is `None`, set it to `INT32_MAX`
+        for parameter, parameter_name in (
+                (num_clusters, 'num_clusters'),
+                (max_harmony_iterations, 'max_harmony_iterations'),
+                (max_clustering_iterations, 'max_clustering_iterations')):
+            if parameter is not None:
+                check_type(parameter, parameter_name, int,
+                           'a positive integer')
+                check_bounds(parameter, parameter_name, 1)
+        if max_harmony_iterations is None:
+            max_harmony_iterations = 2147483647
+        if max_clustering_iterations is None:
+            max_clustering_iterations = 2147483647
+        # Check that `num_init_iterations` and `num_kmeans_iterations` are
+        # positive integers
+        for parameter, parameter_name in (
+                (num_init_iterations, 'num_init_iterations'),
+                (num_kmeans_iterations, 'num_kmeans_iterations')):
+            check_type(parameter, parameter_name, int, 'a positive integer')
+            check_bounds(parameter, parameter_name, 1)
+        # Check that `oversampling_factor` is a positive number
+        check_type(oversampling_factor, 'oversampling_factor', (int, float),
+                   'a positive number')
+        check_bounds(oversampling_factor, 'oversampling_factor', 0,
+                     left_open=True)
+        # Check that `block_proportion` is a number and that
+        # `0 < block_proportion <= 1`
+        check_type(block_proportion, 'block_proportion', (int, float),
+                   'a number greater than zero and less than or equal to 1')
+        check_bounds(block_proportion, 'block_proportion', 0, 1,
+                     left_open=True)
+        # Check that `tol_harmony` and `tol_clustering` are positive numbers,
+        # and that `ridge_lambda`, `sigma`, `theta`, and `tau` are non-negative
+        # numbers. If any is an integer, cast it to a float.
+        for parameter, parameter_name in (
+                (tol_harmony, 'tol_harmony'),
+                (tol_clustering, 'tol_clustering')):
+            check_type(parameter, parameter_name, (int, float),
+                       'a positive number')
+            check_bounds(parameter, parameter_name, 0, left_open=True)
+        for parameter, parameter_name in (
+                (ridge_lambda, 'ridge_lambda'), (sigma, 'sigma'),
+                (theta, 'theta'), (tau, 'tau')):
+            check_type(parameter, parameter_name, (int, float),
+                       'a non-negative number')
+            check_bounds(parameter, parameter_name, 0)
+        tol_harmony = float(tol_harmony)
+        tol_clustering = float(tol_clustering)
+        ridge_lambda = float(ridge_lambda)
+        sigma = float(sigma)
+        theta = float(theta)
+        tau = float(tau)
+        # Check that `seed` is an integer, if specified; otherwise, use the
+        # default seed
+        if seed is None:
+            seed = _seed
+        else:
+            check_type(seed, 'seed', int, 'an integer')
+        # Check that `verbose` is Boolean
+        check_type(verbose, 'verbose', bool, 'Boolean')
+        # Check that `num_threads` is a positive integer, -1 or `None`; if
+        # `None`, set to `single_cell.options()['num_threads']`, and if -1, set
+        # to `os.cpu_count()`
+        num_threads = SingleCell._process_num_threads(num_threads)
+        # Concatenate PCs (`Z`) across datasets; get labels indicating which
+        # rows of these concatenated PCs come from each dataset or batch.
+        # Check that the PCs are float64 and C-contiguous.
+        Z = [dataset._obsm[PC_key] for dataset in datasets]
+        for PCs in Z:
+            dtype = PCs.dtype
+            if dtype != float:
+                error_message = (
+                    f'obsm[{PC_key!r}].dtype is {dtype!r} for at least one '
+                    f'dataset, but must be float64')
+                raise TypeError(error_message)
+            if not PCs.flags['C_CONTIGUOUS']:
+                error_message = (
+                    f'obsm[{PC_key!r}].dtype is not C-contiguous for at least '
+                    f'one dataset; make it C-contiguous with '
+                    f'np.ascontiguousarray(dataset.obsm[{PC_key!r}])')
+                raise ValueError(error_message)
+        if QC_column is not None:
+            Z = [PCs[QCed] if QCed is not None else PCs
+                 for PCs, QCed in zip(Z, QC_columns_NumPy)]
+        num_cells_per_dataset = np.array(list(map(len, Z)))
+        if batch_column is None:
+            batch_labels = np.repeat(np.arange(len(num_cells_per_dataset),
+                                               dtype=np.uint32),
+                                     num_cells_per_dataset)
+        else:
+            batch_labels = []
+            batch_index = 0
+            for dataset, QC_col, batch_col in \
+                    zip(datasets, QC_columns, batch_columns):
+                if batch_col is not None:
+                    if QC_col is not None:
+                        batch_col = batch_col.filter(QC_col)
+                    if batch_col.dtype in (pl.String, pl.Categorical, pl.Enum):
+                        if batch_col.dtype != pl.Enum:
+                            batch_col = batch_col\
+                                .cast(pl.Enum(batch_col.unique().drop_nulls()))
+                        batch_col = batch_col.to_physical()
+                    batch_labels.append(batch_col.to_numpy() + batch_index)
+                    batch_index += batch_col.n_unique()
+                else:
+                    batch_labels.append(np.full(batch_index,
+                                                len(dataset) if QC_col is None
+                                                else QC_col.sum()))
+                    batch_index += 1
+            batch_labels = np.concatenate(batch_labels)
+        Z = np.concatenate(Z)
+        
+        # Run Harmony
+        
+        cython_functions = cython_inline(r'''
+            from cpython.exc cimport PyErr_CheckSignals
+            from libcpp.cmath cimport abs, exp, pow, log, sqrt
+            from scipy.linalg.cython_blas cimport dgemm, dgemv
+            
+            cdef inline void matrix_multiply(const double[:, ::1] A,
+                                             const double[:, ::1] B,
+                                             double[:, ::1] C,
+                                             const bint transpose_A,
+                                             const bint transpose_B,
+                                             const double alpha,
+                                             const double beta) noexcept nogil:
+                # Flip `A` <-> `B` and `shape[0]` <-> `shape[1]` since our
+                # matrices are C-major, whereas BLAS expects Fortran-major
+                
+                cdef int m, n, k, lda, ldb
+                cdef char transA, transB
+                if transpose_B:
+                    m = B.shape[0]
+                    k = B.shape[1]
+                    lda = k
+                    transA = b'T'
+                else:
+                    m = B.shape[1]
+                    k = B.shape[0]
+                    lda = m
+                    transA = b'N'
+                if transpose_A:
+                    n = A.shape[1]
+                    ldb = n
+                    transB = b'T'
+                else:
+                    n = A.shape[0]
+                    ldb = k
+                    transB = b'N'
+                dgemm(&transA, &transB, &m, &n, &k, <double*> &alpha,
+                      <double*> &B[0, 0], &lda, <double*> &A[0, 0], &ldb,
+                      <double*> &beta, &C[0, 0], &m)
+            
+            cdef inline void matrix_vector_multiply(
+                    const double[:, ::1] A,
+                    const double[::1] X,
+                    double[::1] Y,
+                    const bint transpose,
+                    const double alpha,
+                    const double beta) noexcept nogil:
+                # Flip `trans` since our matrix is C-major, whereas BLAS
+                # expects Fortran-major
+                
+                cdef int m = A.shape[1], n = A.shape[0], incx = 1, incy = 1
+                cdef char trans = b'N' if transpose else b'T'
+                dgemv(&trans, &m, &n, <double*> &alpha, <double*> &A[0,0],
+                      &m, <double*> &X[0], &incx, <double*> &beta, &Y[0],
+                      &incy)
+            
+            cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+                cdef unsigned long x = state[0]
+                state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+                cdef unsigned s = (x ^ (x >> 18)) >> 27
+                cdef unsigned rot = x >> 59
+                return (s >> rot) | (s << ((-rot) & 31))
+            
+            cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+                cdef unsigned long state = seed + 1442695040888963407UL
+                rand(&state)
+                return state
+            
+            cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+                cdef unsigned r, threshold = -bound % bound
+                while True:
+                    r = rand(state)
+                    if r >= threshold:
+                        return r % bound
+            
+            cdef inline void shuffle_array(unsigned[::1] arr, unsigned long* state) noexcept nogil:
+                cdef unsigned i, j, temp
+                for i in range(arr.shape[0] - 1, 0, -1):
+                    j = randint(i + 1, state)
+                    temp = arr[i]
+                    arr[i] = arr[j]
+                    arr[j] = temp
+            
+            cdef inline double compute_objective(
+                    double[:, ::1] Z_norm_times_Y_norm,
+                    const double[:, ::1] R,
+                    const double[:, ::1] E,
+                    const double[:, ::1] O,
+                    double[:, ::1] ratio,
+                    const double[::1] theta,
+                    double[::1] theta_times_ratio,
+                    const double sigma,
+                    const unsigned num_cells,
+                    const unsigned num_clusters,
+                    const unsigned num_batches) noexcept nogil:
+                cdef unsigned i, j
+                cdef double kmeans_error, entropy_term, diversity_penalty
+                kmeans_error = entropy_term = diversity_penalty = 0
+                for i in range(num_cells):
+                    for j in range(num_clusters):
+                        kmeans_error += \
+                            R[i, j] * (1 - Z_norm_times_Y_norm[i, j])
+                        entropy_term += R[i, j] * log(R[i, j])
+                kmeans_error *= 2
+                entropy_term *= sigma
+                for i in range(num_batches):
+                    for j in range(num_clusters):
+                        ratio[i, j] = O[i, j] * log(
+                            (O[i, j] + 1) / (E[i, j] + 1))
+                matrix_vector_multiply(ratio, theta, theta_times_ratio,
+                                       transpose=True, alpha=1, beta=0)
+                for i in range(num_clusters):
+                    diversity_penalty += theta_times_ratio[i]
+                diversity_penalty *= sigma
+                return kmeans_error + entropy_term + diversity_penalty
+            
+            def initialize(const double[:, ::1] Z_norm,
+                           double[:, ::1] Y_norm,
+                           double[:, ::1] Z_norm_times_Y_norm,
+                           const unsigned[::1] N_b,
+                           double[::1] Pr_b,
+                           const unsigned[::1] batch_labels,
+                           double[:, ::1] R,
+                           double[::1] R_sum,
+                           double[:, ::1] E,
+                           double[:, ::1] O,
+                           const double sigma,
+                           double[:, ::1] ratio,
+                           double[::1] theta,
+                           double[::1] theta_times_ratio,
+                           const double tau):
+                cdef unsigned i, j, batch_label, num_cells = Z_norm.shape[0], \
+                    num_batches = E.shape[0], num_clusters = E.shape[1]
+                cdef double norm, objective, base, two_over_sigma = 2 / sigma
+                
+                # Initialize `Pr_b`
+                
+                for i in range(num_batches):
+                    Pr_b[i] = <double> N_b[i] / num_cells
+                
+                # Initialize `R` (and `R_sum`) and `O`
+                
+                matrix_multiply(Z_norm, Y_norm, Z_norm_times_Y_norm,
+                                transpose_A=False, transpose_B=True, alpha=1,
+                                beta=0)
+                for i in range(num_cells):
+                    batch_label = batch_labels[i]
+                    norm = 0
+                    for j in range(num_clusters):
+                        R[i, j] = exp(two_over_sigma *
+                                      (Z_norm_times_Y_norm[i, j] - 1))
+                        norm += R[i, j]
+                    norm = 1 / norm
+                    for j in range(num_clusters):
+                        R[i, j] *= norm
+                        O[batch_label, j] += R[i, j]
+                        R_sum[j] += R[i, j]
+                
+                # Initialize `E`
+                
+                for i in range(num_batches):
+                    for j in range(num_clusters):
+                        E[i, j] = Pr_b[i] * R_sum[j]
+                
+                # Apply discounting to `theta`, if specified
+                
+                if tau > 0:
+                    for i in range(num_batches):
+                        base = exp(-N_b[i] / (num_clusters * tau))
+                        theta[i] = theta[i] * (1 - base * base)
+                
+                # Compute and return the initial value of the objective
+                # function
+                
+                objective = compute_objective(
+                    Z_norm_times_Y_norm, R, E, O, ratio, theta,
+                    theta_times_ratio, sigma, num_cells, num_clusters,
+                    num_batches)
+                
+                return objective
+            
+            def clustering(const double[:, ::1] Z_norm,
+                           double[:, ::1] Z_norm_in,
+                           double[:, ::1] Y_norm,
+                           double[:, ::1] Z_norm_times_Y_norm,
+                           const double[::1] Pr_b,
+                           const unsigned[::1] batch_labels,
+                           double[:, ::1] R,
+                           double[:, ::1] R_in,
+                           double[::1] R_in_sum,
+                           double[:, ::1] E,
+                           double[:, ::1] O,
+                           double[:, ::1] ratio,
+                           const double[::1] theta,
+                           double[::1] theta_times_ratio,
+                           unsigned[::1] idx_list,
+                           const double tol,
+                           const unsigned max_iter,
+                           const double sigma,
+                           const unsigned block_size):
+                cdef unsigned i, j, k, iter, num_cells_in_block, pos, batch_label, \
+                    num_cells = Z_norm.shape[0], num_PCs = Z_norm.shape[1], \
+                    num_batches = E.shape[0], num_clusters = E.shape[1]
+                cdef unsigned long state
+                cdef double norm, old, new, objective, \
+                    two_over_sigma = 2 / sigma
+                cdef double exp_neg_two_over_sigma = exp(-two_over_sigma)
+                cdef double[:, ::1] Z_norm_block, R_block
+                cdef double past_clustering_objectives[3]
+                
+                for iter in range(max_iter):
+                    # Compute cluster centroids
+                    
+                    matrix_multiply(R, Z_norm, Y_norm, transpose_A=True,
+                                    transpose_B=False, alpha=1, beta=0)
+                    for i in range(num_clusters):
+                        norm = 0
+                        for j in range(num_PCs):
+                            norm = norm + Y_norm[i, j] * Y_norm[i, j]
+                        norm = 1 / sqrt(norm)
+                        for j in range(num_PCs):
+                            Y_norm[i, j] = Y_norm[i, j] * norm
+                    for i in range(num_cells):
+                        idx_list[i] = i
+                    state = srand(iter)
+                    shuffle_array(idx_list, &state)
+                    
+                    # Update cells blockwise
+                    
+                    pos = 0
+                    Z_norm_block = Z_norm_in
+                    R_block = R_in
+                    while pos < num_cells:
+                        if pos + block_size > num_cells:
+                            num_cells_in_block = num_cells - pos
+                            Z_norm_block = Z_norm_block[:num_cells_in_block]
+                            R_block = R_block[:num_cells_in_block]
+                        else:
+                            num_cells_in_block = block_size
+                        
+                        # Remove the cells in this block from `E` and `O`
+                        
+                        R_in_sum[:] = 0
+                        for i in range(num_cells_in_block):
+                            k = idx_list[pos + i]
+                            batch_label = batch_labels[k]
+                            for j in range(num_clusters):
+                                O[batch_label, j] -= R[k, j]
+                                R_in_sum[j] += R[k, j]
+                            for j in range(num_PCs):
+                                Z_norm_block[i, j] = Z_norm[k, j]
+                        for i in range(num_batches):
+                            for j in range(num_clusters):
+                                E[i, j] -= Pr_b[i] * R_in_sum[j]
+                        
+                        # Recompute `R` for the removed cells
+                        # Note: the original formula is
+                        # `exp(-2 / sigma * (1 - Z_norm_block @ Y_norm.T))`,
+                        # which expands to `exp(-2 / sigma) *
+                        # exp(2 / sigma * Z_norm_block @ Y_norm.T))`. Since
+                        # `exp(-2 / sigma)` is a constant, we fold it into
+                        # `ratio`.
+                        
+                        matrix_multiply(Z_norm_block, Y_norm, R_block,
+                                        transpose_A=False, transpose_B=True,
+                                        alpha=two_over_sigma, beta=0)
+                        for i in range(num_batches):
+                            for j in range(num_clusters):
+                                ratio[i, j] = exp_neg_two_over_sigma * \
+                                    pow((E[i, j] + 1) / (O[i, j] + 1),
+                                        theta[i])
+                        R_in_sum[:] = 0
+                        for i in range(num_cells_in_block):
+                            k = idx_list[i + pos]
+                            batch_label = batch_labels[k]
+                            norm = 0
+                            for j in range(num_clusters):
+                                R[k, j] = exp(R_block[i, j]) * \
+                                          ratio[batch_label, j]
+                                norm += R[k, j]
+                            norm = 1 / norm
+                            for j in range(num_clusters):
+                                R[k, j] *= norm
+                                R_in_sum[j] += R[k, j]
+                                
+                                # Add the removed cells back into `O`
+                                
+                                O[batch_label, j] += R[k, j]
+                        
+                        # Add the removed cells back into `E`
+                        
+                        for i in range(num_batches):
+                            for j in range(num_clusters):
+                                E[i, j] += Pr_b[i] * R_in_sum[j]
+                        
+                        # Move to the next block
+                        
+                        pos += block_size
+                    
+                    # Compute the objective and decide whether we've converged
+                    
+                    matrix_multiply(Z_norm, Y_norm, Z_norm_times_Y_norm,
+                                    transpose_A=False, transpose_B=True,
+                                    alpha=1, beta=0)
+                    objective = compute_objective(
+                        Z_norm_times_Y_norm, R, E, O, ratio, theta,
+                        theta_times_ratio, sigma, num_cells, num_clusters,
+                        num_batches)
+                    if iter < 3:
+                        past_clustering_objectives[iter] = objective
+                    else:
+                        old = past_clustering_objectives[0] + \
+                            past_clustering_objectives[1] + \
+                            past_clustering_objectives[2]
+                        new = past_clustering_objectives[1] + \
+                            past_clustering_objectives[2] + objective
+                        if old - new < tol * abs(old):
+                            break
+                        else:
+                            past_clustering_objectives[0] = \
+                                past_clustering_objectives[1]
+                            past_clustering_objectives[1] = \
+                                past_clustering_objectives[2]
+                            past_clustering_objectives[2] = objective
+                    PyErr_CheckSignals()
+                return objective
+            
+            def correction(const double[:, ::1] Z,
+                           double[:, ::1] Z_hat,
+                           const double[:, ::1] R,
+                           const double[:, ::1] O,
+                           const double ridge_lambda,
+                           const unsigned[::1] batch_labels,
+                           double[::1] factor,
+                           double[:, ::1] P,
+                           double[:, ::1] P_t_B_inv,
+                           double[:, ::1] inv_mat,
+                           double[:, ::1] Phi_t_diag_R_by_X,
+                           double[:, ::1] W):
+                cdef unsigned i, j, k, batch_label, num_cells = Z.shape[0], \
+                    num_PCs = Z.shape[1], num_batches = O.shape[0], \
+                    num_clusters = O.shape[1]
+                cdef double c, c_inv
+                
+                Z_hat[:] = Z[:]
+                
+                # Initialize `P` to the identity matrix
+                
+                P[:] = 0
+                for i in range(num_batches + 1):
+                    P[i, i] = 1
+            
+                for k in range(num_clusters):
+                    # Compute `factor`, `c_inv` and `P`
+                    
+                    c = 0
+                    for i in range(num_batches):
+                        factor[i] = 1 / (O[i, k] + ridge_lambda)
+                        c += O[i, k] * (1 - factor[i] * O[i, k])
+                        P[0, i + 1] = -factor[i] * O[i, k]
+                    c_inv = 1 / c
+                    
+                    # Compute `P_t_B_inv`
+                    
+                    P_t_B_inv[:] = 0
+                    P_t_B_inv[0, 0] = c_inv
+                    for i in range(1, num_batches + 1):
+                        P_t_B_inv[i, i] = factor[i - 1]
+                        P_t_B_inv[i, 0] = P[0, i] * c_inv
+                    
+                    # Compute `inv_mat`
+                    
+                    matrix_multiply(P_t_B_inv, P, inv_mat, transpose_A=False,
+                                    transpose_B=False, alpha=1, beta=0)
+                    
+                    # Compute `Phi_t_diag_R @ X`
+                    
+                    Phi_t_diag_R_by_X[:] = 0
+                    for i in range(num_cells):
+                        batch_label = batch_labels[i]
+                        for j in range(num_PCs):
+                            Phi_t_diag_R_by_X[0, j] += Z[i, j] * R[i, k]
+                            Phi_t_diag_R_by_X[batch_label + 1, j] += \
+                                Z[i, j] * R[i, k]
+                            
+                    # Compute `W`
+                    
+                    matrix_multiply(inv_mat, Phi_t_diag_R_by_X, W,
+                                    transpose_A=False, transpose_B=False,
+                                    alpha=1, beta=0)
+                    
+                    # Update `Z_hat`
+                    
+                    for i in range(num_cells):
+                        batch_label = batch_labels[i]
+                        for j in range(num_PCs):
+                            Z_hat[i, j] = Z_hat[i, j] - \
+                                W[batch_label + 1, j] * R[i, k]
+                        
+            def normalize_rows(const double[:, ::1] arr, double[:, ::1] out):
+                cdef unsigned i, j
+                cdef double norm
+                for i in range(arr.shape[0]):
+                    norm = 0
+                    for j in range(arr.shape[1]):
+                        norm = norm + arr[i, j] * arr[i, j]
+                    norm = 1 / sqrt(norm)
+                    for j in range(arr.shape[1]):
+                        out[i, j] = arr[i, j] * norm
+
+            def normalize_rows_inplace(double[:, ::1] arr):
+                cdef unsigned i, j
+                cdef double norm
+                for i in range(arr.shape[0]):
+                    norm = 0
+                    for j in range(arr.shape[1]):
+                        norm = norm + arr[i, j] * arr[i, j]
+                    norm = 1 / sqrt(norm)
+                    for j in range(arr.shape[1]):
+                        arr[i, j] = arr[i, j] * norm
+        ''')
+        initialize = cython_functions['initialize']
+        clustering = cython_functions['clustering']
+        correction = cython_functions['correction']
+        normalize_rows = cython_functions['normalize_rows']
+        normalize_rows_inplace = cython_functions['normalize_rows_inplace']
+        
+        # Get dimensions of everything
+        num_cells, num_PCs = Z.shape
+        block_size = int(num_cells * block_proportion)
+        if num_clusters is None:
+            num_clusters = min(100, int(num_cells / 30))
+        N_b = bincount(batch_labels, num_bins=batch_labels[-1] + 1,
+                       num_threads=num_threads)
+        num_batches = len(N_b)
+        
+        # Allocate arrays
+        Z_norm = np.empty((num_cells, num_PCs))
+        Z_norm_in = np.empty((block_size, num_PCs))
+        Z_norm_times_Y_norm = np.empty((num_cells, num_clusters))
+        Pr_b = np.empty(num_batches)
+        R = np.empty((num_cells, num_clusters))
+        R_in = np.empty((block_size, num_clusters))
+        R_in_sum = np.zeros(num_clusters)
+        E = np.empty((num_batches, num_clusters))
+        O = np.zeros((num_batches, num_clusters))
+        ratio = np.empty((num_batches, num_clusters))
+        theta = np.repeat(theta, num_batches)
+        theta_times_ratio = np.empty(num_clusters)
+        idx_list = np.empty(num_cells, dtype=np.uint32)
+        factor = np.empty(num_cells)
+        P = np.empty((num_batches + 1, num_batches + 1))
+        P_t_B_inv = np.empty((num_batches + 1, num_batches + 1))
+        inv_mat = np.empty((num_batches + 1, num_batches + 1))
+        Phi_t_diag_R_by_X = np.empty((num_batches + 1, num_PCs))
+        W = np.empty((num_batches + 1, num_PCs))
+        
+        # Run k-means
+        kmeans = cython_inline(r'''
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport prange
+        from libcpp.algorithm cimport fill
+        from libcpp.vector cimport vector
+        
+        cdef extern from "float.h":
+            cdef double DBL_MAX
+        
+        cdef extern from "limits.h":
+            cdef unsigned UINT_MAX
+        
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+        
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+        
+        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+            cdef unsigned r, threshold = -bound % bound
+            while True:
+                r = rand(state)
+                if r >= threshold:
+                    return r % bound
+        
+        cdef inline double random_probability(unsigned long* state) noexcept nogil:
+            # Returns a random probability, i.e. a random number in U(0, 1)
+            return <double> rand(state) / UINT_MAX
+        
+        cdef inline void kmeans_random_init(const double[:, ::1] X,
+                                            double[:, ::1] centroids,
+                                            const unsigned num_cells,
+                                            const unsigned num_clusters, 
+                                            const unsigned long seed):
+            # Initialize centroids with random cells. Use a bitmap to efficiently keep
+            # track of which cells have been sampled already, to avoid sampling the
+            # same cell twice.
+            
+            cdef unsigned i, j
+            cdef unsigned long word_index, bit_index, state = srand(seed)
+            cdef vector[unsigned long] bitmap
+            bitmap.resize((num_cells + 63) // 64)
+            for i in range(num_clusters):
+                while True:
+                    j = randint(num_cells, &state)
+                    word_index = j >> 6
+                    bit_index = j & 63
+                    if not bitmap[word_index] & (1 << bit_index):
+                        bitmap[word_index] |= 1 << bit_index
+                        centroids[i] = X[j]
+                        break
+        
+        cdef inline void kmeans_barbar(const double[:, ::1] X,
+                                       double[:, ::1] centroids,
+                                       const unsigned num_init_iterations,
+                                       const double oversampling_factor,
+                                       const unsigned num_cells,
+                                       const unsigned num_clusters,
+                                       const unsigned num_dimensions,
+                                       const unsigned long seed):
+            cdef unsigned random_cell, iteration, i, j, k, c0, c1, \
+                selected_cell, best_selected_cell, num_selected_cells, cluster_index, \
+                selected_centroid
+            cdef unsigned long state
+            cdef double l = oversampling_factor * num_clusters, cost, difference, \
+                distance, l_over_cost, min_distance, inverse_cost, probability
+            cdef vector[double] min_distances
+            cdef vector[unsigned] selected_cells, selected_cell_weights, \
+                centroid_indices
+            min_distances.resize(num_cells)
+            # reserve 25% more than the expected number to be safe
+            selected_cells.reserve(<unsigned> (1.25 * num_init_iterations * l))
+        
+            # Sample a random cell from `X`, and add it to our list of selected cells.
+            # These will constitute a shortlist from which we will select the final
+            # centroids to start off k-means with.
+        
+            state = srand(seed)
+            random_cell = randint(num_cells, &state)
+            selected_cells.push_back(random_cell)
+        
+            # For the first iteration, calculate the (squared Euclidean) distance from
+            # each cell to this random cell, storing it in `min_distances`. Also
+            # calculate the sum of the `min_distances`, i.e. the `cost`.
+    
+            cost = 0
+            for i in range(num_cells):
+                distance = 0
+                for j in range(num_dimensions):
+                    difference = X[i, j] - X[random_cell, j]
+                    distance += difference * difference
+                min_distances[i] = distance
+                cost += distance
+    
+            # Sample each cell with probability `l * min_distances[i] / cost`
+            
+            l_over_cost = l / cost
+            for i in range(num_cells):
+                state = srand(seed + i)
+                if l_over_cost * min_distances[i] >= random_probability(&state):
+                    selected_cells.push_back(i)
+            
+            PyErr_CheckSignals()
+        
+            # For each remaining iteration...
+        
+            for iteration in range(1, num_init_iterations):
+                # Find each cell's distance to its nearest candidate centroid
+                # (selected cell), storing it in `min_distances`. Also calculate
+                # the sum of the `min_distances`, i.e. the `cost`.
+    
+                cost = 0
+                for i in range(num_cells):
+                    min_distance = DBL_MAX
+                    for selected_cell in selected_cells:
+                        distance = 0
+                        for j in range(num_dimensions):
+                            difference = X[i, j] - X[selected_cell, j]
+                            distance = distance + difference * difference
+                        if distance < min_distance:
+                            min_distance = distance
+                    min_distances[i] = min_distance
+                    cost += min_distance
+    
+                # Sample each cell `i` with probability `l * min_distances[i] / cost`.
+                # Note that `min_distances` will be 0 for cells that have already been
+                # sampled, so we will automatically avoid sampling them twice.
+    
+                l_over_cost = l / cost
+                for i in range(num_cells):
+                    state = srand(seed + i)
+                    if l_over_cost * min_distances[i] >= random_probability(&state):
+                        selected_cells.push_back(i)
+                    
+                PyErr_CheckSignals()
+        
+            # Get the weight for each selected cell: the number of cells that are
+            # closer to the selected cell than to any other selected cell
+        
+            num_selected_cells = selected_cells.size()
+            selected_cell_weights.resize(num_selected_cells)
+            for i in range(num_cells):
+                min_distance = DBL_MAX
+                for j in range(num_selected_cells):
+                    selected_cell = selected_cells[j]
+                    distance = 0
+                    for k in range(num_dimensions):
+                        difference = X[i, k] - X[selected_cell, k]
+                        distance = distance + difference * difference
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_selected_cell = j
+                selected_cell_weights[best_selected_cell] += 1
+        
+            PyErr_CheckSignals()
+            
+            # Run k-means++ to select `num_clusters` of the selected cells as the
+            # centroids, using `selected_cell_weights` as weights. Start by selecting a
+            # random cell from our selected cells as the first centroid.
+        
+            state = srand(seed + 1)
+            random_cell = selected_cells[randint(num_selected_cells, &state)]
+            centroid_indices.resize(num_clusters)
+            centroid_indices[0] = random_cell
+            centroids[0] = X[random_cell]
+        
+            # Iteratively select the remaining centroids
+        
+            for cluster_index in range(1, num_clusters):
+    
+                # Find each selected cell's distance to its nearest centroid. Multiply
+                # this distance by the selected cell's weight (from
+                # `selected_cell_weights`), and store it in `min_distances`. Also
+                # calculate the sum of the weighted `min_distances`, i.e. the `cost`.
+    
+                cost = 0
+                for i in range(num_selected_cells):
+                    selected_cell = selected_cells[i]
+                    min_distance = DBL_MAX
+                    for j in range(cluster_index):
+                        selected_centroid = centroid_indices[j]
+                        distance = 0
+                        for k in range(num_dimensions):
+                            difference = X[selected_cell, k] - X[selected_centroid, k]
+                            distance = distance + difference * difference
+                        if distance < min_distance:
+                            min_distance = distance
+                    min_distance = min_distance * selected_cell_weights[i]
+                    min_distances[i] = min_distance
+                    cost += min_distance
+    
+                # Sample a single cell `i` with probability
+                # `min_distances[i] / cost`. Note that `min_distances` will be 0
+                # for cells that have already been sampled, so we will
+                # automatically avoid sampling them twice.
+    
+                inverse_cost = 1 / cost
+                probability = random_probability(&state)
+                i = 0
+                while True:
+                    probability -= min_distances[i] * inverse_cost
+                    if probability < 0:
+                        break
+                    i += 1
+                centroid_indices[cluster_index] = selected_cells[i]
+                centroids[cluster_index] = X[selected_cells[i]]
+        
+            PyErr_CheckSignals()
+        
+        cdef inline void kmeans_barbar_parallel(const double[:, ::1] X,
+                                                double[:, ::1] centroids,
+                                                const unsigned num_init_iterations,
+                                                const double oversampling_factor,
+                                                const unsigned num_cells,
+                                                const unsigned num_clusters,
+                                                const unsigned num_dimensions,
+                                                const unsigned long seed,
+                                                const unsigned num_threads):
+            cdef unsigned random_cell, iteration, i, j, k, thread_index, c0, c1, \
+                selected_cell, best_selected_cell, num_selected_cells, cluster_index, \
+                selected_centroid
+            cdef unsigned long state
+            cdef double l = oversampling_factor * num_clusters, cost, difference, \
+                distance, l_over_cost, min_distance, inverse_cost, probability
+            cdef vector[double] min_distances
+            cdef vector[unsigned] selected_cells, selected_cell_weights, \
+                centroid_indices
+            cdef vector[vector[unsigned]] thread_selected_cells
+            min_distances.resize(num_cells)
+            # reserve 25% more than the expected number to be safe
+            selected_cells.reserve(<unsigned> (1.25 * num_init_iterations * l))
+        
+            # Sample a random cell from `X`, and add it to our list of selected cells.
+            # These will constitute a shortlist from which we will select the final
+            # centroids to start off k-means with.
+        
+            state = srand(seed)
+            random_cell = randint(num_cells, &state)
+            selected_cells.push_back(random_cell)
+        
+            with nogil:
+                # For the first iteration, calculate the (squared Euclidean) distance from
+                # each cell to this random cell, storing it in `min_distances`. Also
+                # calculate the sum of the `min_distances`, i.e. the `cost`.
+        
+                cost = 0
+                for i in prange(num_cells, num_threads=num_threads):
+                    distance = 0
+                    for j in range(num_dimensions):
+                        difference = X[i, j] - X[random_cell, j]
+                        distance = distance + difference * difference
+                    min_distances[i] = distance
+                    cost += distance
+        
+                # Sample each cell with probability `l * min_distances[i] / cost`
+        
+                thread_selected_cells.resize(num_threads)
+                l_over_cost = l / cost
+                for thread_index in prange(num_threads, num_threads=num_threads,
+                                           chunksize=1, schedule='static'):
+                    thread_selected_cells[thread_index].reserve(
+                        <unsigned> (1.25 * l / num_threads))
+                    c0 = num_cells * thread_index / num_threads
+                    c1 = num_cells * (thread_index + 1) / num_threads
+                    for i in range(c0, c1):
+                        state = srand(seed + i)
+                        if l_over_cost * min_distances[i] >= random_probability(&state):
+                            thread_selected_cells[thread_index].push_back(i)
+        
+                # Aggregate each thread's selected cells into a single vector
+        
+                for thread_index in range(num_threads):
+                    selected_cells.insert(
+                        selected_cells.end(),
+                        thread_selected_cells[thread_index].begin(),
+                        thread_selected_cells[thread_index].end())
+        
+            PyErr_CheckSignals()
+        
+            # For each remaining iteration...
+        
+            for iteration in range(1, num_init_iterations):
+                with nogil:
+                    # Find each cell's distance to its nearest candidate centroid
+                    # (selected cell), storing it in `min_distances`. Also calculate
+                    # the sum of the `min_distances`, i.e. the `cost`.
+        
+                    cost = 0
+                    for i in prange(num_cells, num_threads=num_threads):
+                        min_distance = DBL_MAX
+                        for selected_cell in selected_cells:
+                            distance = 0
+                            for j in range(num_dimensions):
+                                difference = X[i, j] - X[selected_cell, j]
+                                distance = distance + difference * difference
+                            if distance < min_distance:
+                                min_distance = distance
+                        min_distances[i] = min_distance
+                        cost += min_distance
+        
+                    # Sample each cell `i` with probability `l * min_distances[i] / cost`.
+                    # Note that `min_distances` will be 0 for cells that have already been
+                    # sampled, so we will automatically avoid sampling them twice.
+        
+                    l_over_cost = l / cost
+                    for thread_index in prange(num_threads, num_threads=num_threads,
+                                               chunksize=1, schedule='static'):
+                        thread_selected_cells[thread_index].clear()
+                        c0 = num_cells * thread_index / num_threads
+                        c1 = num_cells * (thread_index + 1) / num_threads
+                        for i in range(c0, c1):
+                            state = srand(seed + i)
+                            if l_over_cost * min_distances[i] >= random_probability(&state):
+                                thread_selected_cells[thread_index].push_back(i)
+        
+                    # Aggregate each thread's selected cells into a single vector
+        
+                    for thread_index in range(num_threads):
+                        selected_cells.insert(
+                            selected_cells.end(),
+                            thread_selected_cells[thread_index].begin(),
+                            thread_selected_cells[thread_index].end())
+        
+                PyErr_CheckSignals()
+        
+            # Get the weight for each selected cell: the number of cells that are
+            # closer to the selected cell than to any other selected cell
+        
+            num_selected_cells = selected_cells.size()
+            selected_cell_weights.resize(num_selected_cells)
+            for i in prange(num_cells, nogil=True, num_threads=num_threads):
+                min_distance = DBL_MAX
+                for j in range(num_selected_cells):
+                    selected_cell = selected_cells[j]
+                    distance = 0
+                    for k in range(num_dimensions):
+                        difference = X[i, k] - X[selected_cell, k]
+                        distance = distance + difference * difference
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_selected_cell = j
+                selected_cell_weights[best_selected_cell] += 1
+        
+            PyErr_CheckSignals()
+            
+            # Run k-means++ to select `num_clusters` of the selected cells as the
+            # centroids, using `selected_cell_weights` as weights. Start by selecting a
+            # random cell from our selected cells as the first centroid.
+        
+            state = srand(seed + 1)
+            random_cell = selected_cells[randint(num_selected_cells, &state)]
+            centroid_indices.resize(num_clusters)
+            centroid_indices[0] = random_cell
+            centroids[0] = X[random_cell]
+        
+            # Iteratively select the remaining centroids
+        
+            with nogil:
+                for cluster_index in range(1, num_clusters):
+        
+                    # Find each selected cell's distance to its nearest centroid. Multiply
+                    # this distance by the selected cell's weight (from
+                    # `selected_cell_weights`), and store it in `min_distances`. Also
+                    # calculate the sum of the weighted `min_distances`, i.e. the `cost`.
+        
+                    cost = 0
+                    for i in prange(num_selected_cells, num_threads=num_threads):
+                        selected_cell = selected_cells[i]
+                        min_distance = DBL_MAX
+                        for j in range(cluster_index):
+                            selected_centroid = centroid_indices[j]
+                            distance = 0
+                            for k in range(num_dimensions):
+                                difference = X[selected_cell, k] - X[selected_centroid, k]
+                                distance = distance + difference * difference
+                            if distance < min_distance:
+                                min_distance = distance
+                        min_distance = min_distance * selected_cell_weights[i]
+                        min_distances[i] = min_distance
+                        cost += min_distance
+        
+                    # Sample a single cell `i` with probability
+                    # `min_distances[i] / cost`. Note that `min_distances` will be 0
+                    # for cells that have already been sampled, so we will
+                    # automatically avoid sampling them twice.
+        
+                    inverse_cost = 1 / cost
+                    probability = random_probability(&state)
+                    i = 0
+                    while True:
+                        probability -= min_distances[i] * inverse_cost
+                        if probability < 0:
+                            break
+                        i += 1
+                    centroid_indices[cluster_index] = selected_cells[i]
+                    centroids[cluster_index] = X[selected_cells[i]]
+        
+            PyErr_CheckSignals()
+        
+        ''')['kmeans']
+        normalize_rows(Z, Z_norm)
+        Y_norm = np.empty((num_clusters, num_PCs), dtype=float)
+        kmeans(X=Z_norm, cluster_labels=np.empty(num_cells, dtype=np.uint32),
+               centroids=Y_norm,
+               num_cells_per_cluster=np.empty(num_clusters, dtype=np.uint32),
+               random_init=random_init, num_init_iterations=num_init_iterations,
+               oversampling_factor=oversampling_factor,
+               num_kmeans_iterations=num_kmeans_iterations, seed=seed,
+               num_threads=num_threads)
+        normalize_rows_inplace(Y_norm)
+        
+        with threadpool_limits(limits=num_threads):
+            # Complete initialization in Cython
+            objective = initialize(
+                Z_norm=Z_norm, Y_norm=Y_norm,
+                Z_norm_times_Y_norm=Z_norm_times_Y_norm, N_b=N_b, Pr_b=Pr_b,
+                batch_labels=batch_labels, R=R, R_sum=R_in_sum, E=E, O=O,
+                sigma=sigma, ratio=ratio, theta=theta,
+                theta_times_ratio=theta_times_ratio, tau=tau)
+            
+            if verbose:
+                print(f'Initialization is complete: objective = '
+                      f'{objective:.2f}')
+            
+            iteration_string = plural('iteration', max_harmony_iterations)
+            
+            for i in range(1, max_harmony_iterations + 1):
+                prev_objective = objective
+                objective = clustering(
+                    Z_norm=Z_norm, Z_norm_in=Z_norm_in, Y_norm=Y_norm,
+                    Z_norm_times_Y_norm=Z_norm_times_Y_norm, Pr_b=Pr_b,
+                    batch_labels=batch_labels, R=R, R_in=R_in,
+                    R_in_sum=R_in_sum, E=E, O=O, ratio=ratio, theta=theta,
+                    theta_times_ratio=theta_times_ratio, idx_list=idx_list,
+                    tol=tol_clustering, max_iter=max_clustering_iterations,
+                    sigma=sigma, block_size=block_size)
+                correction(Z=Z, Z_hat=Z_norm, R=R, O=O,
+                           ridge_lambda=ridge_lambda,
+                           batch_labels=batch_labels, factor=factor, P=P,
+                           P_t_B_inv=P_t_B_inv, inv_mat=inv_mat,
+                           Phi_t_diag_R_by_X=Phi_t_diag_R_by_X, W=W)
+                
+                if verbose:
+                    print(f'Completed {i} of {max_harmony_iterations} '
+                          f'{iteration_string}: objective = {objective:.2f}')
+                
+                if prev_objective - objective < \
+                        tol_harmony * abs(prev_objective):
+                    if verbose:
+                        print(f'Reached convergence after {i} '
+                              f'{iteration_string}')
+                    break
+                
+                if i == max_harmony_iterations:
+                    if verbose:
+                        print(f'Failed to converge after {i} '
+                              f'{iteration_string}')
+                    break
+                
+                normalize_rows_inplace(Z_norm)
         
         del batch_labels, Z, Pr_b, theta, R, E, O, Z_norm_in, Y_norm, \
             Z_norm_times_Y_norm, R_in, R_in_sum, ratio, theta_times_ratio, \
@@ -16064,12 +18258,11 @@ class SingleCell:
                     num_cells = nearest_neighbor_cell_types.shape[0], \
                     num_neighbors = nearest_neighbor_cell_types.shape[1]
                 cdef double inv_num_neighbors = 1.0 / num_neighbors
-                cdef vector[vector][unsigned]] thread_counts
+                cdef vector[vector[unsigned]] thread_counts
                 
-                counts = <unsigned[:num_cell_types * num_threads:]> counts_buffer
                 if num_threads == 1:
                     thread_counts.resize(1)
-                    thread_counts[0].resize(num_total_neighbors)
+                    thread_counts[0].resize(num_neighbors)
                     for i in range(num_cells):
                         fill(thread_counts[0].begin(),
                              thread_counts[0].end(), 0)
@@ -16104,6 +18297,9 @@ class SingleCell:
                         next_best_confidences[i] = \
                             second_max_count * inv_num_neighbors
                 else:
+                    thread_counts.resize(num_threads)
+                    for thread_index in range(num_threads):
+                        thread_counts[thread_index].resize(num_neighbors)
                     for i in prange(num_cells, nogil=True,
                                     num_threads=num_threads):
                         thread_index = threadid()
@@ -18373,8 +20569,9 @@ class SingleCell:
                 num_total_neighbors = scaled_distances.shape[1], \
                 num_PCs = X.shape[1]
             cdef long neighbor
-            cdef vector[double] sig = vector[double](num_cells)
             cdef unsigned too_small = 0, too_large = 0
+            cdef vector[double] sig
+            sig.resize(num_cells)
             
             if num_threads == 1:
                 for i in range(num_cells):
@@ -18606,24 +20803,30 @@ class SingleCell:
             cdef unsigned i, j, k, dest_index, num_cells = pairs.shape[0], \
                 num_pairs_per_cell = pairs.shape[1]
             cdef vector[unsigned] dest_indices
+            
             # Tabulate how often each cell appears in pairs; at a minimum, it
             # will appear `pairs.shape[1]` times (i.e. the number of
             # neighbors), as the `i` in the pair, but it will also appear a
             # variable number of times as the `j` in the pair.
+            
             pair_indptr[0] = 0
             pair_indptr[1:] = pairs.shape[1]
             for i in range(num_cells):
                 for k in range(num_pairs_per_cell):
                     j = pairs[i, k]
                     pair_indptr[j + 1] += 1
+                    
             # Take the cumulative sum of the values in `pair_indptr`
+            
             for i in range(2, pair_indptr.shape[0]):
                 pair_indptr[i] += pair_indptr[i - 1]
+                
             # Now that we know how many pairs each cell is a part of, do a
             # second pass over `pairs` to populate `pair_indices` with the
             # pairs' indices. Use a temporary buffer, `dest_indices`, to keep
             # track of the index within `pair_indptr` to write each cell's next
             # pair to.
+            
             dest_indices.resize(num_cells)
             memcpy(dest_indices.data(), &pair_indptr[0],
                    num_cells * sizeof(unsigned))
@@ -18648,7 +20851,9 @@ class SingleCell:
                 num_further_pairs = further_pairs.shape[1]
             cdef double distance_ij, embedding_ij_0, embedding_ij_1, w
             gradients[:] = 0
+            
             # Nearest-neighbor pairs
+            
             for i in range(num_cells):
                 for k in range(num_neighbors):
                     j = neighbor_pairs[i, k]
@@ -18660,7 +20865,9 @@ class SingleCell:
                     gradients[j, 0] -= w * embedding_ij_0
                     gradients[i, 1] += w * embedding_ij_1
                     gradients[j, 1] -= w * embedding_ij_1
+                    
             # Mid-near pairs
+            
             for i in range(num_cells):
                 for k in range(num_mid_near_pairs):
                     j = mid_near_pairs[i, k]
@@ -18672,7 +20879,9 @@ class SingleCell:
                     gradients[j, 0] -= w * embedding_ij_0
                     gradients[i, 1] += w * embedding_ij_1
                     gradients[j, 1] -= w * embedding_ij_1
+                    
             # Further pairs
+            
             for i in range(num_cells):
                 for k in range(num_further_pairs):
                     j = further_pairs[i, k]
@@ -18703,7 +20912,9 @@ class SingleCell:
                 for i in range(num_cells):
                     gradients[i, 0] = 0
                     gradients[i, 1] = 0
+                    
                     # Nearest-neighbor pairs
+                    
                     for k in range(neighbor_pair_indptr[i],
                                    neighbor_pair_indptr[i + 1]):
                         j = neighbor_pair_indices[k]
@@ -18713,7 +20924,9 @@ class SingleCell:
                         w = w_neighbors * (20 / (10 + distance_ij) ** 2)
                         gradients[i, 0] = gradients[i, 0] + w * embedding_ij_0
                         gradients[i, 1] = gradients[i, 1] + w * embedding_ij_1
+                        
                     # Mid-near pairs
+                    
                     for k in range(mid_near_pair_indptr[i],
                                    mid_near_pair_indptr[i + 1]):
                         j = mid_near_pair_indices[k]
@@ -18723,7 +20936,9 @@ class SingleCell:
                         w = w_mid_near * 20000 / (10000 + distance_ij) ** 2
                         gradients[i, 0] = gradients[i, 0] + w * embedding_ij_0
                         gradients[i, 1] = gradients[i, 1] + w * embedding_ij_1
+                        
                     # Further pairs
+                    
                     for k in range(further_pair_indptr[i],
                                    further_pair_indptr[i + 1]):
                         j = further_pair_indices[k]
@@ -18737,7 +20952,9 @@ class SingleCell:
                 for i in prange(num_cells, nogil=True, num_threads=num_threads):
                     gradients[i, 0] = 0
                     gradients[i, 1] = 0
+                    
                     # Nearest-neighbor pairs
+                    
                     for k in range(neighbor_pair_indptr[i],
                                    neighbor_pair_indptr[i + 1]):
                         j = neighbor_pair_indices[k]
@@ -18747,7 +20964,9 @@ class SingleCell:
                         w = w_neighbors * (20 / (10 + distance_ij) ** 2)
                         gradients[i, 0] = gradients[i, 0] + w * embedding_ij_0
                         gradients[i, 1] = gradients[i, 1] + w * embedding_ij_1
+                        
                     # Mid-near pairs
+                    
                     for k in range(mid_near_pair_indptr[i],
                                    mid_near_pair_indptr[i + 1]):
                         j = mid_near_pair_indices[k]
@@ -18757,7 +20976,9 @@ class SingleCell:
                         w = w_mid_near * 20000 / (10000 + distance_ij) ** 2
                         gradients[i, 0] = gradients[i, 0] + w * embedding_ij_0
                         gradients[i, 1] = gradients[i, 1] + w * embedding_ij_1
+                        
                     # Further pairs
+                    
                     for k in range(further_pair_indptr[i],
                                    further_pair_indptr[i + 1]):
                         j = further_pair_indices[k]
@@ -23411,6 +25632,7 @@ class Pseudobulk:
                     current_val = data[indices[i]]
 
                     # Count elements equal to current value
+                    
                     i += 1
                     if i == n:
                         end = True
@@ -23422,6 +25644,7 @@ class Pseudobulk:
                                 break
 
                     # Assign average rank to all tied elements
+                    
                     rank = 0.5 * (start_pos + i) + 0.5
                     while start_pos < i:
                         ranks[indices[start_pos]] = rank
@@ -23457,14 +25680,16 @@ class Pseudobulk:
                 cdef bint large_enough_logR
 
                 # Calculate each sample's library size relative to the
-                # reference sample's (to use in the logR calculation)
+                # reference sample's (to use in the `logR` calculation)
+                
                 ref_library_size = library_size[ref_sample]
                 for i in range(num_samples):
                     inv_relative_library_size[i] = \
                         <double> ref_library_size / library_size[i]
 
                 # Calculate each gene's log normalized expression (to use in
-                # the absE calculation)
+                # the `absE` calculation)
+                
                 inverse_ref_library_size = 1. / ref_library_size
                 for j in range(num_genes):
                     count = X[ref_sample, j]
@@ -23472,6 +25697,7 @@ class Pseudobulk:
                         log2(count * inverse_ref_library_size)
 
                 # Calculate the normalization factor for each sample
+                
                 for i in range(num_samples):
                     inverse_library_size = 1. / library_size[i]
                     large_enough_logR = False
@@ -23479,6 +25705,7 @@ class Pseudobulk:
                     for j in range(num_genes):
                         # Get the count and reference count for this gene; skip
                         # the gene if either are 0
+                        
                         ref_count = X[ref_sample, j]
                         if ref_count == 0:
                             continue
@@ -23489,39 +25716,46 @@ class Pseudobulk:
 
                         # Calculate the log ratio of expression accounting for
                         # library size
+                        
                         logR_ = log2(inv_relative_library_size[i] * (
                             <double> count / ref_count))
 
                         # Calculate "absolute expression": the average log2
                         # expression of this gene between this sample and the
                         # reference sample
+                        
                         absE_ = 0.5 * (log2(count * inverse_library_size) +
                                        log_normalized_X_ref[j])
 
                         # Cutoff based on `A_cutoff`
+                        
                         if absE_ <= A_cutoff:
                             continue
 
-                        # Store logR, absE, and the count for genes passing the
-                        # infinite value and `A_cutoff` filters above
+                        # Store `logR`, `absE`, and the count for genes passing
+                        # the infinite value and `A_cutoff` filters above
+                        
                         logR[n] = logR_
                         absE[n] = absE_
                         counts[n] = count
                         ref_counts[n] = ref_count
                         n += 1
 
-                        # Keep track of whether any gene's logR is above 1e-6
+                        # Keep track of whether any gene's `logR` is above 1e-6
                         # in magnitude for this sample
+                        
                         large_enough_logR |= abs(logR_) >= 1e-6
 
-                    # If every gene's logR is below 1e-6 in magnitude for this
-                    # sample (i.e. expression is extremely low across the
+                    # If every gene's `logR` is below 1e-6 in magnitude for
+                    # this sample (i.e. expression is extremely low across the
                     # board), set the sample's norm factor to 1
+                    
                     if not large_enough_logR:
                         norm_factors[i] = 1
                         continue
 
-                    # Rank genes by logR and absE
+                    # Rank genes by `logR` and `absE`
+                    
                     loL = <unsigned> (n * logratio_trim)
                     hiL = n - loL
                     loS = <unsigned> (n * sum_trim)
@@ -23530,11 +25764,12 @@ class Pseudobulk:
                     rankdata(absE, indices, absE_rank, n)
 
                     # Calculate the norm factors themselves. Find genes with
-                    # intermediate ranks of both logR and absE (this is the
+                    # intermediate ranks of both `logR` and `absE` (this is the
                     # "trimmed" part, the "T" in "TMM"). The norm factors are 2
                     # to the power of the weighted average of the logRs for
                     # these intermediate-ranked genes, where the weights are
                     # the inverse asymptotic variances.
+                    
                     total_inverse_library_size = \
                         inverse_library_size + inverse_ref_library_size
                     norm_factor = 0
@@ -23550,13 +25785,15 @@ class Pseudobulk:
                     norm_factor = 2 ** (norm_factor / total_weight)
 
                     # Results will be missing if the two libraries share no
-                    # features with positive counts; in this case, set to unity
+                    # features with positive counts; in this case, set to 1
+                    
                     if norm_factor != norm_factor:  # i.e. NaN
                         norm_factor = 1
 
                     norm_factors[i] = norm_factor
 
                 # Normalize factors across samples so that they multiply to 1
+                
                 scale = 0
                 for i in range(num_samples):
                     scale += log(norm_factors[i])
@@ -23565,6 +25802,7 @@ class Pseudobulk:
                     norm_factors[i] *= scale
 
                 # Multiply norm factors by library sizes
+                
                 for i in range(num_samples):
                     norm_factors[i] *= library_size[i]
 
