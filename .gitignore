@@ -8,3 +8,4 @@ resources/
 ryp.py
 single_cell.py
 __pycache__/
+clustering_results/
