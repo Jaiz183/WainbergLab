@@ -21,7 +21,6 @@ from scipy.cluster.hierarchy import fcluster, cut_tree, is_valid_linkage
 # Otherwise, you'd have to go up the tree per leaf (point), which would be slow... - might be useful later too.
 # I don't think we need a tree - can just recursively find the children's, it'd just take O(n) for search.
 
-# TODO: update to correct IDs.
 def get_dendrogram(dataframe: pl.DataFrame, root: int, num_cells: int) -> Node:
     """
     :param num_cells: number of cells.
@@ -73,48 +72,7 @@ def get_subcluster_sizes(root: Node, sizes: dict[int, int]):
                           sizes[root.right.val]
 
 
-if __name__ == '__main__':
-    run('export LANG=en_US.UTF-8')
-    run('export LC_ALL=en_US.UTF-8')
-    r('devtools::install_github("XuegongLab/HGC")')
-    # Set up dendextend.
-
-    # Cluster.
-    SIZE = 10
-    NUM_CLUSTERS_CUTREE, NUM_CLUSTERS_CUT_TREE, NUM_CLUSTERS_FCLUST = 15, 15, 15
-    sc = (SingleCell(f'{KNN_DIR}/data/Green_{SIZE}.h5ad')
-          .set_var_names('_index'))
-
-    snn_graph = sc.obsp['shared_neighbors']
-
-    if not os.path.exists(f'{CLUSTER_DIR}/data/snn_graph_green_{SIZE}'):
-        to_r(snn_graph.T, 'snn_graph')
-        r(f'saveRDS(snn_graph, "{CLUSTER_DIR}/data/snn_graph_green_{SIZE}")')
-    else:
-        r(f'snn_graph = readRDS("{CLUSTER_DIR}/data/snn_graph_green_{SIZE}")')
-
-    r('clusters = HGC::HGC.dendrogram(snn_graph)')
-    r('dendrogram = as.dendrogram(clusters)')
-
-    ### Try cutree in R. ###
-    r(f'cluster_assignments = cutree(clusters, k={NUM_CLUSTERS_CUTREE})')
-
-    # Returns a data frame with index and cluster label columns.
-    cluster_assignments_cutree = to_py('cluster_assignments')
-
-    ### Try cut_tree in Python. ###
-    # Retrieve object and cache.
-    if not os.path.exists(f'{CLUSTER_DIR}/data/hclust_green_{SIZE}'):
-        hclust = to_py('clusters')
-        with open(f'{CLUSTER_DIR}/data/hclust_green_{SIZE}', 'wb') as f:
-            pickle.dump(hclust, f)
-    else:
-        with open(f'{CLUSTER_DIR}/data/hclust_green_{SIZE}', 'rb') as f:
-            hclust = pickle.load(f)
-
-    # Important attributes are - 'merge', 'height'.
-    num_cells = len(sc.obsm['PCs'])
-
+def create_linkage_matrix(hclust: dict, num_cells: int) -> np.ndarray:
     merge: pl.DataFrame = hclust['merge']
     num_subclusters = len(merge)
 
@@ -144,9 +102,9 @@ if __name__ == '__main__':
     # Create from mapping.
     # Keep only subclusters, disregard points.
     subcluster_sizes_reformatted = {'subcluster': [], 'sizes': []}
-    for subcluster, size in subcluster_sizes.items():
+    for subcluster, sub_size in subcluster_sizes.items():
         subcluster_sizes_reformatted['subcluster'].append(subcluster)
-        subcluster_sizes_reformatted['sizes'].append(size)
+        subcluster_sizes_reformatted['sizes'].append(sub_size)
 
     subcluster_sizes_df = pl.DataFrame(subcluster_sizes_reformatted).sort(
         by='subcluster').drop('subcluster')
@@ -154,6 +112,40 @@ if __name__ == '__main__':
     cluster_df = pl.concat(
         [merge, pl.DataFrame(hclust['height']), subcluster_sizes_df],
         how='horizontal')
+
+    # Convert to numpy.
+    cluster_arr = cluster_df.to_numpy()
+    return cluster_arr
+
+
+def dendrogram_cut_cutree(dataset: str, dataset_size: int,
+                          num_clusters_cutree: int, ):
+    run('export LANG=en_US.UTF-8')
+    run('export LC_ALL=en_US.UTF-8')
+    r('devtools::install_github("XuegongLab/HGC")')
+    # Cluster.
+    # Constants.
+    sc = (SingleCell(
+        f'{PROJECT_DIR}/single-cell/Subsampled/{dataset}_{dataset_size}.h5ad')
+          .set_var_names('_index'))
+
+    snn_graph = sc.obsp['shared_neighbors']
+
+    if not os.path.exists(
+            f'{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}'):
+        to_r(snn_graph.T, 'snn_graph')
+        r(f'saveRDS(snn_graph, "{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}")')
+    else:
+        r(f'snn_graph = readRDS("{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}")')
+
+    r('clusters = HGC::HGC.dendrogram(snn_graph)')
+    r('dendrogram = as.dendrogram(clusters)')
+
+    ### Try cutree in R. ###
+    r(f'cluster_assignments = cutree(clusters, k={num_clusters_cutree})')
+
+    # Returns a data frame with index and cluster label columns.
+    cluster_assignments_cutree = to_py('cluster_assignments')
 
     # Checking for bugs.
     # test: pl.DataFrame = cluster_df.group_by('column_1').agg(pl.col('column_0').count())
@@ -167,38 +159,157 @@ if __name__ == '__main__':
         cluster_assignments_cutree).flatten()
     cluster_assignments_cutree = np.array(
         [x for x in cluster_assignments_cutree if x is not None])
-    # print(cluster_assignments_cutree)
 
-    # Cut_tree.
-    cluster_arr = cluster_df.to_numpy()
-    assert is_valid_linkage(cluster_arr)
-    cluster_assignments_cut_tree = cut_tree(cluster_arr, NUM_CLUSTERS_CUT_TREE)
-    cluster_assignments_cut_tree = np.array(
-        cluster_assignments_cut_tree).flatten()
-
-    # fclust.
-    cluster_assignments_fclust = fcluster(cluster_arr, NUM_CLUSTERS_FCLUST, 'maxclust')
-    cluster_assignments_fclust = np.array(
-        cluster_assignments_fclust).flatten()
-
-    sc.obs = (sc.obs.with_columns(
-        cut_tree_clusters=cluster_assignments_cut_tree,
-        cutree_clusters=cluster_assignments_cutree,
-        fclust_clusters=cluster_assignments_fclust)
-              .with_columns(pl.col('cut_tree_clusters').cast(pl.String),
-                            pl.col('cutree_clusters').cast(pl.String),
-                            pl.col('fclust_clusters').cast(pl.String)))
+    sc.obs = (sc.obs
+              .with_columns(cutree_clusters=cluster_assignments_cutree)
+              .with_columns(pl.col('cutree_clusters').cast(pl.String)))
 
     # none_params = {'lightness_range': None, 'chroma_range': None, 'hue_range': None,
     # 'first_color': None, 'stride': None}
     none_params = {}
 
-    sc.plot_embedding('cut_tree_clusters',
-                      filename=f'{CLUSTER_DIR}/results/pacmap_cut_tree_green_{SIZE}.png',
-                      **none_params)
+    # Save plots.
     sc.plot_embedding('cutree_clusters',
-                      filename=f'{CLUSTER_DIR}/results/pacmap_cutree_green_{SIZE}.png',
+                      filename=f'{CLUSTER_DIR}/results/pacmap_cutree_{dataset}_{dataset_size}_{num_clusters_cutree}.png',
                       **none_params)
+
+
+def dendrogram_cut_cut_tree(dataset: str, dataset_size: int,
+                            num_clusters_cut_tree):
+    run('export LANG=en_US.UTF-8')
+    run('export LC_ALL=en_US.UTF-8')
+    r('devtools::install_github("XuegongLab/HGC")')
+    # Cluster.
+    # Constants.
+    sc = (SingleCell(
+        f'{PROJECT_DIR}/single-cell/Subsampled/{dataset}_{dataset_size}.h5ad')
+          .set_var_names('_index'))
+
+    snn_graph = sc.obsp['shared_neighbors']
+
+    if not os.path.exists(
+            f'{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}'):
+        to_r(snn_graph.T, 'snn_graph')
+        r(f'saveRDS(snn_graph, "{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}")')
+    else:
+        r(f'snn_graph = readRDS("{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}")')
+
+    r('clusters = HGC::HGC.dendrogram(snn_graph)')
+
+    ### Try cut_tree in Python. ###
+    # Retrieve object and cache.
+    if not os.path.exists(
+            f'{CLUSTER_DIR}/data/hclust_{dataset}_{dataset_size}'):
+        hclust = to_py('clusters')
+        with open(f'{CLUSTER_DIR}/data/hclust_{dataset}_{dataset_size}',
+                  'wb') as f:
+            pickle.dump(hclust, f)
+    else:
+        with open(f'{CLUSTER_DIR}/data/hclust_{dataset}_{dataset_size}',
+                  'rb') as f:
+            hclust = pickle.load(f)
+
+    # Important attributes are - 'merge', 'height'.
+    num_cells = len(sc.obsm['PCs'])
+
+    merge: pl.DataFrame = hclust['merge']
+    num_subclusters = len(merge)
+
+    cluster_arr = create_linkage_matrix(hclust, num_cells)
+
+    # Convert to numpy.
+    # Cut_tree.
+    assert is_valid_linkage(cluster_arr)
+    cluster_assignments_cut_tree = cut_tree(cluster_arr, num_clusters_cut_tree)
+    cluster_assignments_cut_tree = np.array(
+        cluster_assignments_cut_tree).flatten()
+
+    sc.obs = (sc.obs.with_columns(
+        cut_tree_clusters=cluster_assignments_cut_tree)
+              .with_columns(pl.col('cut_tree_clusters').cast(pl.String)))
+
+    # none_params = {'lightness_range': None, 'chroma_range': None, 'hue_range': None,
+    # 'first_color': None, 'stride': None}
+    none_params = {}
+
+    # Save plots.
+    sc.plot_embedding('cut_tree_clusters',
+                      filename=f'{CLUSTER_DIR}/results/pacmap_cut_tree_{dataset}_{dataset_size}_{num_clusters_cut_tree}.png',
+                      **none_params)
+
+
+def dendrogram_cut_fclust(dataset: str, dataset_size: int, num_clusters_fclust,
+                          criterion_fclust):
+    run('export LANG=en_US.UTF-8')
+    run('export LC_ALL=en_US.UTF-8')
+    # r('devtools::install_github("XuegongLab/HGC")')
+    # Cluster.
+    # Constants.
+    sc = (SingleCell(
+        f'{PROJECT_DIR}/single-cell/Subsampled/{dataset}_{dataset_size}.h5ad')
+          .set_var_names('_index'))
+
+    snn_graph = sc.obsp['shared_neighbors']
+
+    if not os.path.exists(
+            f'{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}'):
+        to_r(snn_graph.T, 'snn_graph')
+        r(f'saveRDS(snn_graph, "{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}")')
+    else:
+        r(f'snn_graph = readRDS("{CLUSTER_DIR}/data/snn_graph_{dataset}_{dataset_size}")')
+
+    r('clusters = HGC::HGC.dendrogram(snn_graph)')
+    r('dendrogram = as.dendrogram(clusters)')
+
+    # Retrieve object and cache.
+    if not os.path.exists(
+            f'{CLUSTER_DIR}/data/hclust_{dataset}_{dataset_size}'):
+        hclust = to_py('clusters')
+        with open(f'{CLUSTER_DIR}/data/hclust_{dataset}_{dataset_size}',
+                  'wb') as f:
+            pickle.dump(hclust, f)
+    else:
+        with open(f'{CLUSTER_DIR}/data/hclust_{dataset}_{dataset_size}',
+                  'rb') as f:
+            hclust = pickle.load(f)
+
+    # Important attributes are - 'merge', 'height'.
+    num_cells = len(sc.obsm['PCs'])
+    cluster_arr = create_linkage_matrix(hclust, num_cells)
+
+    # fclust.
+    cluster_assignments_fclust: np.ndarray = fcluster(cluster_arr, num_clusters_fclust,
+                                          criterion_fclust)
+
+    all = list(cluster_assignments_fclust.flatten())
+    unique = set(list(cluster_assignments_fclust.flatten()))
+    print({item: all.count(item) for item in unique})
+
+    cluster_assignments_fclust = np.array(
+        cluster_assignments_fclust).flatten()
+
+    sc.obs = sc.obs.with_columns(
+        fclust_clusters=cluster_assignments_fclust).with_columns(
+        pl.col('fclust_clusters').cast(pl.String))
+    # none_params = {'lightness_range': None, 'chroma_range': None, 'hue_range': None,
+    # 'first_color': None, 'stride': None}
+    none_params = {}
+
+    # Save plots.
     sc.plot_embedding('fclust_clusters',
-                      filename=f'{CLUSTER_DIR}/results/pacmap_fclust_green_{SIZE}.png',
+                      filename=f'{CLUSTER_DIR}/results/pacmap_fclust_{dataset}_{dataset_size}_{criterion_fclust}_{num_clusters_fclust}.png',
                       **none_params)
+
+
+if __name__ == '__main__':
+    datasets = ['Green']
+    sizes = [10]
+    num_clusters_fclust = [30]
+    fclust_criteria = ['maxclust']
+
+    # Run everything.
+    for dataset in datasets:
+        for size in sizes:
+            for criterion in fclust_criteria:
+                for cluster in num_clusters_fclust:
+                    dendrogram_cut_fclust(dataset, size, cluster, criterion)

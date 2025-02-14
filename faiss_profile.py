@@ -1,4 +1,5 @@
 import os
+import typing
 
 import plotly.graph_objects
 
@@ -15,16 +16,21 @@ import polars as pl
 import pandas as pd
 import optuna
 
+NUM_NEIGHBOURS = 5
+APPLICATION = 'label transfer'
+TRAINING_SPLIT = 70
+NUM_TRIALS = 10
 
-def profile_faiss_ivf(cells: np.ndarray,
+
+def profile_faiss_ivf(training_data: np.ndarray,
                       num_voronoi_cells: int, num_centroids: int,
                       num_neighbours: int,
-                      query: np.ndarray, search_untrained: bool,
+                      validation_data: np.ndarray,
                       subsampling_factor: float | None = None) -> tuple[
     np.ndarray, float, float]:
     """
     Monitors performance of FAISS algorithm (IVF).
-    :param cells: PCs corresponding to individual cells.
+    :param training_data: PCs corresponding to individual cells.
     :param num_voronoi_cells: number of voronoi cells that the space is split
     into. More voronoi cells => more accuracy, but less speed.
     :param num_centroids: number of centroids initialized in k-means clustering.
@@ -35,15 +41,15 @@ def profile_faiss_ivf(cells: np.ndarray,
     """
     # Depth is dimensionality of space that PCs are in (number of PCs per
     # sample). Subtract one for ID column.
-    num_cells = len(cells)
-    depth = len(cells[0])
+    num_cells = len(training_data)
+    depth = len(training_data[0])
 
     start = time.time()
     index = faiss.IndexFlatL2(depth)  # the other index
     ivf_index = faiss.IndexIVFFlat(index, depth, num_centroids)
-    ivf_index.train(cells)
+    ivf_index.train(training_data)
 
-    ivf_index.add(cells)
+    ivf_index.add(training_data)
     index_time = time.time() - start
 
     ivf_index.nprobe = num_voronoi_cells
@@ -59,7 +65,7 @@ def profile_faiss_ivf(cells: np.ndarray,
 
     # Modify
     start = time.time()
-    distances, indices = ivf_index.search(query, num_neighbours)
+    distances, indices = ivf_index.search(validation_data, num_neighbours)
     search_time = time.time() - start
 
     return indices, index_time, search_time
@@ -189,44 +195,82 @@ def objective(trial: optuna.Trial, training_dataset, validation_dataset,
                                                             num_probes,
                                                             num_centroids, 5,
                                                             validation_dataset,
-                                                            True,
                                                             subsampling_factor)
     _, _, accuracy = compute_accuracies(true_neighbours, neighbours, 5)
 
     return float(index_time + search_time), float(accuracy)
 
 
-# def auto_optimise_with_save(cells: np.ndarray, sample_pt: float,
-#                             num_trials: int) -> pl.DataFrame:
-#     sample, _ = random_sample(cells, sample_pt, False, None)
-#     train_data, validation_data = split_data(sample, 70, TRAINING_DATASET,
-#                                              VALIDATION_DATASET)
-#     _ = brute_force_knn(train_data, validation_data, 5, False, 'faiss',
-#                         TRUE_NEIGHBOURS, None)
-#     study = optuna.create_study(directions=['minimize', 'maximize'])
-#     study.optimize(objective_with_save, n_trials=num_trials)
-#     run(f'rm {TRAINING_DATASET} {VALIDATION_DATASET} {TRUE_NEIGHBOURS}')
-#
-#     return study.trials_dataframe()
+# TODO - take in function to be run as input + hyperparameter ranges and settings.
+def objective_knn(trial: optuna.Trial, training_dataset,
+                  validation_dataset,
+                  hyperparam_ranges: dict, other_objective_params: dict,
+                  algorithm: typing.Callable):
+    """
+    :param trial: optuna Trial object.
+    :param training_dataset: dataset for constructing nearest neighbour graph.
+    :param validation_dataset: dataset for computing accuracy.
+    :param true_neighbours: actual neighbours to compute accuracy.
+    :param hyperparam_ranges: hyperparameter ranges. Keys should correspond to
+    names of hyperparams in algorithm. Values are a 4-tuple corresponding to
+    min. val, max. val., parameter type (limited to int or float), and scale
+    type (True if log, else false).
+    :param algorithm: nearest neighbour algorithm. Should take hyperparameters
+    and non-hyperparameter inputs. Inputs are as follows:
+    1) Hyperparameter inputs are named exactly the keys of hyperparam_ranges and
+    their corresponding types
+    2) validation_data
+    3) training_data
+    4) num_neighbours
+    :param other_objective_params: contains true_neighbours key with true neighbours.
+    :return:
+    """
+    true_neighbours = other_objective_params['true_neighbours']
+    current_hyperparams = {}
+    # Determine hyperparameters for current trial.
+    for hyperparam_range in hyperparam_ranges:
+        min_val, max_val, param_type, is_log = hyperparam_ranges[
+            hyperparam_range]
+        # Suggest the right type.
+        if param_type == 'int':
+            current_hyperparams[hyperparam_range] = trial.suggest_int(
+                hyperparam_range, min_val,
+                max_val,
+                log=is_log)
+        else:
+            current_hyperparams[hyperparam_range] = trial.suggest_float(
+                hyperparam_range, min_val,
+                max_val,
+                log=is_log)
+
+    # Add on non-hyperparameters
+    current_hyperparams['training_data'], current_hyperparams[
+        'validation_data'], current_hyperparams[
+        'num_neighbours'] = training_dataset, validation_dataset, NUM_NEIGHBOURS
+    # Compute objective values.
+    neighbours, index_time, search_time = algorithm(
+        **current_hyperparams)
+    _, _, accuracy = compute_accuracies(true_neighbours, neighbours,
+                                        NUM_NEIGHBOURS)
+
+    return float(index_time + search_time), float(accuracy)
 
 
 # Try to prevent saving files and reloading. Would require redefining objective
 # to take in datasets as arguments
-def auto_optimise(pcs: np.ndarray,
-                  num_trials: int, application: str) -> tuple[
+def auto_optimise(training_data, validation_data,
+                  num_trials: int, objective: typing.Callable,
+                  hyperparam_ranges: dict, algorithm: typing.Callable) -> tuple[
     pl.DataFrame, optuna.Study]:
-    if application == 'umap':
-        train_data, query = pcs, pcs
-    else:
-        train_data, query = split_data(pcs, 70, None,
-                                       None)
-
-    true_nn = brute_force_knn(train_data, query, 5, False, 'faiss',
+    true_nn = brute_force_knn(training_data, validation_data, NUM_NEIGHBOURS,
+                              False, 'faiss',
                               None, None)
+    other_obj_params = {'true_neighbours': true_nn}
     # Minimize runtime and maximize accuracy.
     study = optuna.create_study(directions=['minimize', 'maximize'])
     study.optimize(
-        lambda trial: objective(trial, train_data, query, true_nn),
+        lambda trial: objective(trial, training_data, validation_data,
+                                hyperparam_ranges, other_obj_params, algorithm),
         n_trials=num_trials)
 
     results: pd.DataFrame = study.trials_dataframe()
@@ -263,21 +307,18 @@ def save_plots(study, dataset_name: str, size: int):
 
 
 if __name__ == '__main__':
-    NUM_PROBES_RANGE = (1, 100)
-    SUBSAMPLING_FACTOR_RANGE = (0, 1)
-    NUM_TRIALS = 20
-
     # green_sc: SingleCell = load_green_sc(
     #     sc_file=f'{PROJECT_DIR}/single-cell/Green/p400_qced_shareable.h5ad',
     #     retrieve=True, save_to=f'{SCRATCH_DIR}/rosmap')
 
-    ### Auto-optimisation. ###
+    ### Auto-optimisation w/ default FAISS IVF algorithm. ###
     # Try a couple of dataset sizes (for Green)...
     # Sample data points.
     sizes = [1, 10, 100]
     sampled_green_pcs = []
     sampled_seadd_pcs = []
 
+    # Load up datasets.
     for i in range(len(sizes)):
         size = sizes[i]
         # print(f'{KNN_DIR}/data/pcs/green_pcs_{size}.npy')
@@ -306,14 +347,38 @@ if __name__ == '__main__':
             sampled_seadd_pcs.append(sampled_pcs)
 
     for i in range(len(sizes)):
-        size = sizes[i]
+        # Get training and validation data.
+        size, green_data, seaad_data = sizes[i], sampled_green_pcs[i], \
+            sampled_seadd_pcs[i]
+        green_train, green_val = split_data(green_data, TRAINING_SPLIT, None,
+                                            None) if APPLICATION != 'umap' else green_data, green_data
+        seaad_train, seaad_val = split_data(seaad_data, TRAINING_SPLIT, None,
+                                            None) if APPLICATION != 'umap' else seaad_data, seaad_data
+
+        # Initialise hyperparams.
+        NUM_CLUSTERS_SEAAD = (1, len(seaad_train) / 39, 'int', True)
+        NUM_CLUSTERS_GREEN = (1, len(green_train) / 39, 'int', True)
+        NUM_CLUSTERS_SEARCHED = (1, 100, 'int', True)
+        SUBSAMPLING_FACTOR = (0, 1, 'float', False)
+
+        hyperparam_ranges_faiss_default_green = {
+            'num_voronoi_cells': NUM_CLUSTERS_SEARCHED,
+            'num_centroids': NUM_CLUSTERS_GREEN,
+            'subsampling_factor': SUBSAMPLING_FACTOR}
+
+        hyperparam_ranges_faiss_default_seaad = {
+            'num_voronoi_cells': NUM_CLUSTERS_SEARCHED,
+            'num_centroids': NUM_CLUSTERS_SEAAD,
+            'subsampling_factor': SUBSAMPLING_FACTOR}
 
         # First Green.
-        if not os.path.exists(f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results'):
+        if not os.path.exists(
+                f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results'):
             current_sampled_green_pcs = sampled_green_pcs[i]
-            results, green_study = auto_optimise(current_sampled_green_pcs,
-                                                 NUM_TRIALS,
-                                                 'umap')
+            results, green_study = auto_optimise(green_train, green_val,
+                                                 NUM_TRIALS, objective_knn,
+                                                 hyperparam_ranges_faiss_default_green,
+                                                 profile_faiss_ivf)
             results = results.sort('accuracy', descending=True)
             results.write_csv(
                 f'{KNN_DIR}/faiss/green_auto_tuning_{size}_sample_results',
@@ -321,16 +386,27 @@ if __name__ == '__main__':
             save_plots(green_study, 'green', size)
 
         # Now SEAAD.
-        if not os.path.exists(f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results'):
+        if not os.path.exists(
+                f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results'):
             current_sampled_seadd_pcs = sampled_seadd_pcs[i]
-            results, seaad_study = auto_optimise(current_sampled_seadd_pcs,
-                                                 NUM_TRIALS,
-                                                 'umap')
+            results, seaad_study = auto_optimise(seaad_train, seaad_val,
+                                                 NUM_TRIALS, objective_knn,
+                                                 hyperparam_ranges_faiss_default_seaad,
+                                                 profile_faiss_ivf)
             results = results.sort('accuracy', descending=True)
             results.write_csv(
                 f'{KNN_DIR}/faiss/seaad_auto_tuning_{size}_sample_results',
                 separator='\t')
             save_plots(seaad_study, 'seaad', size)
+
+    ### Auto-optimisation w/ Michael's implementation. ###
+    # TODO: Finish this.
+    NUM_CLUSTERS = ()
+    MIN_CLUSTERS_SEARCHED = ()
+    MAX_CLUSTERS_SEARCHED = ()
+    NUM_CANDIDATES_PER_NEIGHBOUR = ()
+    NUM_KMEANS_ITERATIONS = ()
+    KMEANS_BARBAR = ()
 
     # ### Manual optimisation. ###
     # sample, sample_indices, sample_train_data, sample_test_data = sample_data(
