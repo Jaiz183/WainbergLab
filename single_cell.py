@@ -11,7 +11,6 @@ from decimal import Decimal
 from datetime import date, datetime, time, timedelta
 from functools import cache, reduce
 from itertools import chain, islice, pairwise
-from packaging import version
 from pathlib import Path
 from subprocess import run
 from textwrap import fill
@@ -19,6 +18,25 @@ from threadpoolctl import threadpool_limits
 from timeit import default_timer
 from typing import Any, Callable, Dict, ItemsView, KeysView, Literal, \
     Mapping, Sequence, ValuesView, Union
+
+if 'logging' not in sys.modules and hasattr(os, 'register_at_fork'):
+    # Python's `logging` module calls `os.register_at_fork()` to handle aspects
+    # of its internal locking. Unfortunately, this can cause KeyboardInterrupts
+    # to be repeatedly ignored during HDF5 loading with errors like:
+    # Exception ignored in: <function _releaseLock at 0x7fb85797c5e0>
+    # Traceback (most recent call last):
+    #   File ".../logging/__init__.py", line 243, in _releaseLock
+    #     def _releaseLock():
+    # To get around this bug, temporarily monkeypatch `os.register_at_fork()`
+    # to be a null-op, then `import logging`. Unfortunately, there's no way to
+    # unregister a callback created with `os.register_at_fork()`, so this "fix"
+    # only works when the `logging` module has not been imported yet.
+    original_register_at_fork = os.register_at_fork
+    os.register_at_fork = lambda *args, **kwargs: None
+    try:
+        import logging
+    finally:
+        original_register_at_fork = os.register_at_fork
 
 
 class ignore_sigint:
@@ -89,7 +107,8 @@ def array_equal(a1: np.ndarray[Any, Any], a2: np.ndarray[Any, Any]) -> bool:
 def bincount(x: np.ndarray[1, np.dtype[np.uint32]],
              *,
              num_bins: int | np.integer,
-             num_threads: int | np.integer) -> \
+             num_threads: int | np.integer,
+             counts: np.ndarray[1, np.dtype[np.uint32]] | None = None) -> \
         np.ndarray[1, np.dtype[np.uint32]]:
     """
     A faster version of `numpy.bincount` for integer data that uses a fixed
@@ -99,14 +118,17 @@ def bincount(x: np.ndarray[1, np.dtype[np.uint32]],
         x: a 1D `uint32` NumPy array
         num_bins: the number of bins
         num_threads: the number of threads to use when counting
+        counts: an optional preallocated array to store the bin counts in;
+                assumed to be the correct size
 
     Returns:
         A 1D `uint32` NumPy array of length `num_bins`, containing the bin
         counts.
     """
-    counts = np.empty(num_bins, dtype=np.uint32)
+    if counts is None:
+        counts = np.empty(num_bins, dtype=np.uint32)
     cython_inline(r'''
-        from cython.parallel cimport parallel, prange, threadid
+        from cython.parallel cimport parallel, threadid
         from libcpp.vector cimport vector
         
         ctypedef fused integer:
@@ -121,6 +143,7 @@ def bincount(x: np.ndarray[1, np.dtype[np.uint32]],
                 num_elements = arr.shape[0]
             cdef unsigned thread_index
             cdef vector[vector[unsigned]] thread_counts
+            cdef unsigned* counts_pointer
             
             if num_threads == 1:
                 counts[:] = 0
@@ -144,14 +167,16 @@ def bincount(x: np.ndarray[1, np.dtype[np.uint32]],
                             counts[arr[i]] += 1
                     else:
                         thread_counts[thread_index].resize(num_bins)
+                        counts_pointer = thread_counts[thread_index].data()
                         end = start + chunk_size
                         for i in range(start, end):
-                            thread_counts[thread_index][arr[i]] += 1
+                            counts_pointer[arr[i]] += 1
                 
                 # Aggregate counts from all threads except the last
                 for thread_index in range(num_threads - 1):
+                    counts_pointer = thread_counts[thread_index].data()
                     for i in range(num_bins):
-                        counts[i] += thread_counts[thread_index][i]
+                        counts[i] += counts_pointer[i]
         ''', warn_undeclared=False)['bincount'](
             arr=x, counts=counts, num_threads=num_threads)
     return counts
@@ -393,7 +418,7 @@ def concatenate(arrays: Sequence[np.ndarray[1, Any]] |
     concatenate = cython_inline(_uninitialized_vector_import + r'''
         import numpy as np
         cimport numpy as np
-        from cython.parallel import parallel, threadid
+        from cython.parallel cimport parallel, threadid
         from libc.string cimport memcpy
         from libcpp.vector cimport vector
         
@@ -403,26 +428,20 @@ def concatenate(arrays: Sequence[np.ndarray[1, Any]] |
             cdef unsigned long num_bytes, num_chunks, num_rows, start_chunk, \
                 end_chunk, current_chunk, array_offset, total_bytes = 0, \
                 total_chunks = 0, total_rows = 0
-            cdef uninitialized_vector[unsigned long] byte_count, chunk_count, \
-                byte_offset, chunk_offset
+            cdef uninitialized_vector[unsigned long] byte_count_buffer, \
+                chunk_count_buffer, byte_offset_buffer, chunk_offset_buffer
             cdef uninitialized_vector[char*] array_pointers
+            cdef unsigned long[::1] byte_count, chunk_count, byte_offset, chunk_offset
             cdef char* output_pointer
             cdef char* src
             cdef char* dest
             cdef np.ndarray array, output
-         
-            # Cache relevant information from each array:
-            array_pointers.resize(num_arrays)
-            byte_count.resize(num_arrays)
-            chunk_count.resize(num_arrays)
-            byte_offset.resize(num_arrays)
-            chunk_offset.resize(num_arrays)
             
             if num_threads == 1:
                 # Cache relevant information from each array:
                 array_pointers.resize(num_arrays)
-                byte_count.resize(num_arrays)
-                byte_offset.resize(num_arrays)
+                byte_count_buffer.resize(num_arrays)
+                byte_count = <unsigned long[:num_arrays]> byte_count_buffer.data()
                 
                 for array_index in range(num_arrays):
                     array = arrays[array_index]
@@ -445,11 +464,22 @@ def concatenate(arrays: Sequence[np.ndarray[1, Any]] |
                 output_pointer = <char*> output.data
                 
                 # Copy the data from each input array to the output array
-                for array_index in range( num_arrays):
+                for array_index in range(num_arrays):
                     memcpy(output_pointer, array_pointers[array_index],
                            byte_count[array_index])
                     output_pointer += byte_count[array_index]
             else:
+                # Cache relevant information from each array:
+                array_pointers.resize(num_arrays)
+                byte_count_buffer.resize(num_arrays)
+                byte_count = <unsigned long[:num_arrays]> byte_count_buffer.data()
+                chunk_count_buffer.resize(num_arrays)
+                chunk_count = <unsigned long[:num_arrays]> chunk_count_buffer.data()
+                byte_offset_buffer.resize(num_arrays)
+                byte_offset = <unsigned long[:num_arrays]> byte_offset_buffer.data()
+                chunk_offset_buffer.resize(num_arrays)
+                chunk_offset = <unsigned long[:num_arrays]> chunk_offset_buffer.data()
+            
                 for array_index in range(num_arrays):
                     array = arrays[array_index]
                     
@@ -940,7 +970,8 @@ def generate_palette(num_colors: int | np.integer,
 
 def getnnz(sparse_matrix: csr_array | csc_array,
            axis: Literal[0] | Literal[1] | None,
-           num_threads: int | np.integer) -> \
+           num_threads: int | np.integer,
+           nnz: np.ndarray[1, np.dtype[np.integer]] | None = None) -> \
         np.ndarray[1, np.dtype[np.integer]]:
     """
     Count the number of stored values in a sparse array along an axis,
@@ -954,6 +985,8 @@ def getnnz(sparse_matrix: csr_array | csc_array,
               (`axis=0`), or within each row (`axis=1`)
         num_threads: the number of threads to use when counting; only used for
                      CSR when `axis=0` and for CSC when `axis=1`
+        nnz: an optional preallocated array to store the number of non-zero
+             values in; assumed to be the correct size
     
     Returns:
         The number of stored values as a 1D array.
@@ -962,7 +995,8 @@ def getnnz(sparse_matrix: csr_array | csc_array,
     if axis == is_csr:
         # The code below is equivalent to `nnz = np.diff(sparse_matrix.indptr)`
         indptr = sparse_matrix.indptr
-        nnz = np.empty(len(indptr) - 1, dtype=np.uint32)
+        if nnz is None:
+            nnz = np.empty(len(indptr) - 1, dtype=np.uint32)
         cython_inline('''
             from cython.parallel cimport prange
             
@@ -989,7 +1023,8 @@ def getnnz(sparse_matrix: csr_array | csc_array,
     else:
         return bincount(sparse_matrix.indices,
                         num_bins=sparse_matrix.shape[is_csr],
-                        num_threads=num_threads)
+                        num_threads=num_threads,
+                        counts=nnz)
 
 
 def plural(string: str, count: int | np.integer) -> str:
@@ -1041,7 +1076,7 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
     """
     cython_functions = cython_inline(_uninitialized_vector_import + r'''
         cimport numpy as np
-        from cython.parallel import parallel, threadid
+        from cython.parallel cimport parallel, threadid
         from libc.string cimport memcpy
         
         def concatenate_indptrs_int64(list arrays, const unsigned num_threads):
@@ -1053,13 +1088,17 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
             
             cdef unsigned array_index, thread_index, chunk_size = 8, \
                 num_arrays = len(arrays)
-            cdef unsigned long num_elements, num_chunks, start_chunk, end_chunk, \
-                current_chunk, array_offset, i, total_elements = 0, total_chunks = 0, \
-                total_nnz = 0
-            cdef uninitialized_vector[unsigned long] element_count, chunk_count, \
-                element_offset, chunk_offset, nnz_offset
+            cdef unsigned long num_elements, offset, num_chunks, start_chunk, \
+                end_chunk, current_chunk, array_offset, i, total_elements = 0, \
+                total_chunks = 0, total_nnz = 0
+            cdef uninitialized_vector[unsigned long] element_count_buffer, \
+                chunk_count_buffer, element_offset_buffer, chunk_offset_buffer, \
+                nnz_offset_buffer
             cdef uninitialized_vector[long*] array_pointers
+            cdef unsigned long[::1] element_count, chunk_count, element_offset, \
+                chunk_offset, nnz_offset
             cdef long* output_pointer
+            cdef long* array_pointer
             cdef long* src
             cdef long* dest
             cdef np.ndarray array, output
@@ -1068,9 +1107,14 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
             if num_threads == 1:
                 # Cache relevant information from each array:
                 array_pointers.resize(num_arrays)
-                element_count.resize(num_arrays)
-                element_offset.resize(num_arrays)
-                nnz_offset.resize(num_arrays)
+                element_count_buffer.resize(num_arrays)
+                element_count = \
+                    <unsigned long[:num_arrays]> element_count_buffer.data()
+                element_offset_buffer.resize(num_arrays)
+                element_offset = \
+                    <unsigned long[:num_arrays]> element_offset_buffer.data()
+                nnz_offset_buffer.resize(num_arrays)
+                nnz_offset = <unsigned long[:num_arrays]> nnz_offset_buffer.data()
                 
                 for array_index in range(num_arrays):
                     array = arrays[array_index]
@@ -1109,18 +1153,26 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                 # Copy the remaining indptrs' data, adding the nnz offset
                 for array_index in range(1, num_arrays):
                     num_elements = element_count[array_index]
+                    offset = nnz_offset[array_index]
+                    array_pointer = array_pointers[array_index]
                     for i in range(num_elements):
-                        output_pointer[i] = array_pointers[array_index][i] + \
-                            nnz_offset[array_index]
+                        output_pointer[i] = array_pointer[i] + offset
                     output_pointer += num_elements
             else:
                 # Cache relevant information from each array:
                 array_pointers.resize(num_arrays)
-                element_count.resize(num_arrays)
-                chunk_count.resize(num_arrays)
-                element_offset.resize(num_arrays)
-                chunk_offset.resize(num_arrays)
-                nnz_offset.resize(num_arrays)
+                element_count_buffer.resize(num_arrays)
+                element_count = \
+                    <unsigned long[:num_arrays]> element_count_buffer.data()
+                chunk_count_buffer.resize(num_arrays)
+                chunk_count = <unsigned long[:num_arrays]> chunk_count_buffer.data()
+                element_offset_buffer.resize(num_arrays)
+                element_offset = \
+                    <unsigned long[:num_arrays]> element_offset_buffer.data()
+                chunk_offset_buffer.resize(num_arrays)
+                chunk_offset = <unsigned long[:num_arrays]> chunk_offset_buffer.data()
+                nnz_offset_buffer.resize(num_arrays)
+                nnz_offset = <unsigned long[:num_arrays]> nnz_offset_buffer.data()
                 
                 for array_index in range(num_arrays):
                     array = arrays[array_index]
@@ -1205,8 +1257,9 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                         if array_index == 0:
                             memcpy(dest, src, num_elements * sizeof(long))
                         else:
+                            offset = nnz_offset[array_index]
                             for i in range(num_elements):
-                                dest[i] = src[i] + nnz_offset[array_index]
+                                dest[i] = src[i] + offset
                                 
                         # Update the position and array index
                         current_chunk = current_chunk + num_chunks
@@ -1218,33 +1271,34 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
             # The int32 version of `concatenate_indptrs_int64()`. We can safely use
             # unsigned rather than unsigned long for everything.
             
-            cdef unsigned array_index, num_elements, num_chunks, thread_index, \
-                start_chunk, end_chunk, current_chunk, array_offset, i, \
+            cdef unsigned array_index, num_elements, offset, num_chunks, \
+                thread_index, start_chunk, end_chunk, current_chunk, array_offset, i, \
                 chunk_size = 16, num_arrays = len(arrays), total_elements = 0, \
                 total_chunks = 0, total_nnz = 0
-            cdef uninitialized_vector[unsigned] element_count, chunk_count, \
-                element_offset, chunk_offset, nnz_offset
+            cdef uninitialized_vector[unsigned] element_count_buffer, \
+                chunk_count_buffer, element_offset_buffer, chunk_offset_buffer, \
+                nnz_offset_buffer
             cdef uninitialized_vector[int*] array_pointers
+            cdef unsigned[::1] element_count, chunk_count, element_offset, \
+                chunk_offset, nnz_offset
             cdef int* output_pointer
+            cdef int* array_pointer
             cdef int* src
             cdef int* dest
             cdef np.ndarray array, output
             cdef np.npy_intp total_elements_plus_one
          
-            # Cache relevant information from each array:
-            array_pointers.resize(num_arrays)
-            element_count.resize(num_arrays)
-            chunk_count.resize(num_arrays)
-            element_offset.resize(num_arrays)
-            chunk_offset.resize(num_arrays)
-            nnz_offset.resize(num_arrays)
-            
             if num_threads == 1:
                 # Cache relevant information from each array:
                 array_pointers.resize(num_arrays)
-                element_count.resize(num_arrays)
-                element_offset.resize(num_arrays)
-                nnz_offset.resize(num_arrays)
+                element_count_buffer.resize(num_arrays)
+                element_count = \
+                    <unsigned[:num_arrays]> element_count_buffer.data()
+                element_offset_buffer.resize(num_arrays)
+                element_offset = \
+                    <unsigned[:num_arrays]> element_offset_buffer.data()
+                nnz_offset_buffer.resize(num_arrays)
+                nnz_offset = <unsigned[:num_arrays]> nnz_offset_buffer.data()
                 
                 for array_index in range(num_arrays):
                     array = arrays[array_index]
@@ -1283,11 +1337,27 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                 # Copy the remaining indptrs' data, adding the nnz offset
                 for array_index in range(1, num_arrays):
                     num_elements = element_count[array_index]
+                    offset = nnz_offset[array_index]
+                    array_pointer = array_pointers[array_index]
                     for i in range(num_elements):
-                        output_pointer[i] = array_pointers[array_index][i] + \
-                            nnz_offset[array_index]
+                        output_pointer[i] = array_pointer[i] + offset
                     output_pointer += num_elements
             else:
+                # Cache relevant information from each array:
+                array_pointers.resize(num_arrays)
+                element_count_buffer.resize(num_arrays)
+                element_count = \
+                    <unsigned[:num_arrays]> element_count_buffer.data()
+                chunk_count_buffer.resize(num_arrays)
+                chunk_count = <unsigned[:num_arrays]> chunk_count_buffer.data()
+                element_offset_buffer.resize(num_arrays)
+                element_offset = \
+                    <unsigned[:num_arrays]> element_offset_buffer.data()
+                chunk_offset_buffer.resize(num_arrays)
+                chunk_offset = <unsigned[:num_arrays]> chunk_offset_buffer.data()
+                nnz_offset_buffer.resize(num_arrays)
+                nnz_offset = <unsigned[:num_arrays]> nnz_offset_buffer.data()
+                
                 for array_index in range(num_arrays):
                     array = arrays[array_index]
                     
@@ -1371,8 +1441,9 @@ def sparse_major_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                         if array_index == 0:
                             memcpy(dest, src, num_elements * sizeof(int))
                         else:
+                            offset = nnz_offset[array_index]
                             for i in range(num_elements):
-                                dest[i] = src[i] + nnz_offset[array_index]
+                                dest[i] = src[i] + offset
                                 
                         # Update the position and array index
                         current_chunk = current_chunk + num_chunks
@@ -1424,7 +1495,7 @@ def sparse_minor_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
     """
     sparse_minor_stack = cython_inline(_uninitialized_vector_import + r'''
         cimport numpy as np
-        from cython.parallel import prange
+        from cython.parallel cimport prange
         from libc.string cimport memcpy
         
         ctypedef fused numeric:
@@ -1448,14 +1519,13 @@ def sparse_minor_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                                const unsigned num_threads):
             # Closely based on SciPy's `csr_hstack()` function from sparsetools/csr.h
             
-            cdef unsigned array_index, i, total_nnz, nnz, offset, \
+            cdef unsigned array_index, i, total_nnz, nnz, offset, output_offset, \
                 num_arrays = len(arrays)
             cdef np.ndarray array_data, array_indices, array_indptr
             cdef signed_integer start, end, j
             cdef uninitialized_vector[numeric*] data_pointers
             cdef uninitialized_vector[signed_integer*] indices_pointers, \
                 indptr_pointers
-            
             indptr_pointers.resize(num_arrays)
             indices_pointers.resize(num_arrays)
             data_pointers.resize(num_arrays)
@@ -1503,8 +1573,9 @@ def sparse_minor_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                         
                         # Copy indices and apply offset
                         offset = offsets[array_index]
+                        output_offset = total_nnz - start
                         for j in range(start, end):
-                            indices[total_nnz + j - start] = \
+                            indices[output_offset + j] = \
                                 indices_pointers[array_index][j] + offset
                         
                         total_nnz += nnz
@@ -1563,7 +1634,8 @@ def sparse_minor_stack(arrays: Sequence[csr_array] | Sequence[csc_array],
                             # Copy indices and apply offset
                             offset = offsets[array_index]
                             for j in range(start, end):
-                                indices[total_nnz + j - start] = \
+                                output_offset = total_nnz - start
+                                indices[output_offset + j] = \
                                     indices_pointers[array_index][j] + offset
                             
                             array_index = array_index + 1
@@ -1720,435 +1792,493 @@ def to_tuple_checked(variable: Any,
     return variable
 
 
+# Functions for load-balancing parallel iteration over sparse arrays
+
+_thread_offset_import = r'''
+        from libcpp.algorithm cimport lower_bound
+        from libcpp.pair cimport pair
+        
+        ctypedef unsigned unsigned_  # hack to get templates to work with unsigned
+        
+        ctypedef fused signed_integer:
+            int
+            long
+        
+        cdef inline pair[unsigned, unsigned] get_thread_offset(
+                const signed_integer[::1] indptr,
+                const unsigned thread_index,
+                const unsigned num_threads) noexcept nogil:
+            # Gets the start and end row (for CSR) or column (for CSC) index
+            # that each thread will work on, to ensure each thread works on
+            # about the same number of sparse matrix elements as a form of
+            # load-balancing.
+
+            cdef unsigned start, end, num_major = indptr.shape[0] - 1
+            cdef unsigned long num_elements_per_thread = \
+                indptr[num_major] / num_threads, \
+                num_elements_start = thread_index * num_elements_per_thread, \
+                num_elements_end = (thread_index + 1) * num_elements_per_thread
+            
+            start = 0 if thread_index == 0 else min(
+                <unsigned> (lower_bound(&indptr[0], &indptr[0] + indptr.shape[0],
+                                        num_elements_start) - &indptr[0]),
+                num_major)
+            end = num_major if thread_index == num_threads - 1 else min(
+                <unsigned> (lower_bound(&indptr[0], &indptr[0] + indptr.shape[0],
+                                        num_elements_end) - &indptr[0]),
+                num_major)
+            return pair[unsigned_, unsigned_](start, end)
+
+        cdef inline void get_thread_offsets(const signed_integer[::1] indptr,
+                                            unsigned* thread_offsets,
+                                            const unsigned num_threads) noexcept nogil:
+            # A variant of `get_thread_offset()` that gets the start and end row
+            # (for CSR) or column (for CSC) index that each thread will work on,
+            # for all threads simultaneously. For each thread,
+            # `thread_offsets[thread_index]` will contain the start index, and
+            # `thread_offsets[thread_index + 1]` will contain the end index.
+
+            cdef unsigned thread_index, num_major = indptr.shape[0] - 1
+            cdef unsigned long num_elements_start, \
+                num_elements_per_thread = indptr[num_major] / num_threads
+
+            thread_offsets[0] = 0
+            for thread_index in range(1, num_threads):
+                num_elements_start = thread_index * num_elements_per_thread
+                thread_offsets[thread_index] = min(
+                    <unsigned> (lower_bound(&indptr[0], &indptr[0] + indptr.shape[0],
+                                            num_elements_start) - &indptr[0]),
+                    num_major)
+            thread_offsets[num_threads] = num_major
+'''
+
 # Custom sparse array classes that support parallel operations
 
-cython_functions = cython_inline(r'''
-    from cpython.exc cimport PyErr_CheckSignals
-    from cython.parallel cimport parallel, prange, threadid
-    from libcpp.algorithm cimport fill
-    from libcpp.vector cimport vector
-    
-    ctypedef fused I:
-        int
-        long
+cython_functions = cython_inline(_thread_offset_import + r'''
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libcpp.vector cimport vector
         
-    ctypedef fused T:
-        int
-        unsigned
-        long
-        unsigned long
-        float
-        double
-    
-    cdef extern from "<algorithm>" namespace "std" nogil:
-        ForwardIt lower_bound[ForwardIt, T](
-            ForwardIt first, ForwardIt last, const T& value)
-    
-    cdef extern from * nogil:
-        """
-        #define atomic_and(x, y) _Pragma("omp atomic") x &= y
-        """
-        void atomic_and(bint &x, bint y)
-    
-    cpdef bint csr_has_canonical_format(const unsigned n_row,
-                                        const I[::1] Ap,
-                                        const I[::1] Aj,
-                                        const unsigned num_threads):
-        cdef unsigned i
-        cdef I jj
-        cdef bint has_canonical_format = True
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
         
-        if num_threads == 1:
-            for i in range(n_row):
-                if Ap[i] > Ap[i + 1]:
-                    return False
-                for jj in range(Ap[i] + 1, Ap[i + 1]):
-                    if not Aj[jj - 1] < Aj[jj]:
+        cdef extern from * nogil:
+            """
+            #define atomic_and(x, y) _Pragma("omp atomic") x &= y
+            """
+            void atomic_and(bint &x, bint y)
+        
+        cpdef bint csr_has_canonical_format(const unsigned n_row,
+                                            const signed_integer[::1] Ap,
+                                            const signed_integer[::1] Aj,
+                                            const unsigned num_threads):
+            cdef unsigned i
+            cdef signed_integer jj
+            cdef bint has_canonical_format = True
+            
+            if num_threads == 1:
+                for i in range(n_row):
+                    if Ap[i] > Ap[i + 1]:
                         return False
-        else:
-            # Use hardware-level atomics to thread-safely flag non-canonical
-            # rows
-            for i in prange(n_row, nogil=True, num_threads=num_threads):
-                if Ap[i] > Ap[i + 1]:
-                    atomic_and(has_canonical_format, False)
-                    with gil:
-                        return False
-                for jj in range(Ap[i] + 1, Ap[i + 1]):
-                    if not Aj[jj - 1] < Aj[jj]:
+                    for jj in range(Ap[i] + 1, Ap[i + 1]):
+                        if not Aj[jj - 1] < Aj[jj]:
+                            return False
+            else:
+                # Use hardware-level atomics to thread-safely flag non-canonical
+                # rows
+                for i in prange(n_row, nogil=True, num_threads=num_threads):
+                    if Ap[i] > Ap[i + 1]:
                         atomic_and(has_canonical_format, False)
                         with gil:
                             return False
-        return has_canonical_format
-    
-    def csr_has_sorted_indices(const unsigned n_row,
-                                      const I[::1] Ap,
-                                      const I[::1] Aj,
-                                      const unsigned num_threads):
-        cdef unsigned i
-        cdef I jj
-        cdef bint has_sorted_indices = True
+                    for jj in range(Ap[i] + 1, Ap[i + 1]):
+                        if not Aj[jj - 1] < Aj[jj]:
+                            atomic_and(has_canonical_format, False)
+                            with gil:
+                                return False
+            return has_canonical_format
         
-        if num_threads == 1:
-            for i in range(n_row):
-                for jj in range(Ap[i], Ap[i + 1] - 1):
-                    if Aj[jj] > Aj[jj + 1]:
-                        return False
-        else:
-            # Use hardware-level atomics to thread-safely flag unsorted rows
-            for i in prange(n_row, nogil=True, num_threads=num_threads):
-                for jj in range(Ap[i], Ap[i + 1] - 1):
-                    if Aj[jj] > Aj[jj + 1]:
-                        atomic_and(has_sorted_indices, False)
-                        with gil:
+        def csr_has_sorted_indices(const unsigned n_row,
+                                          const signed_integer[::1] Ap,
+                                          const signed_integer[::1] Aj,
+                                          const unsigned num_threads):
+            cdef unsigned i
+            cdef signed_integer jj
+            cdef bint has_sorted_indices = True
+            
+            if num_threads == 1:
+                for i in range(n_row):
+                    for jj in range(Ap[i], Ap[i + 1] - 1):
+                        if Aj[jj] > Aj[jj + 1]:
                             return False
-                    
-        return has_sorted_indices
-    
-    cdef extern from * nogil:
-        """
-        #include <algorithm>
-        #include <iterator>
-        template<typename I, typename T>
-        struct RefTuple;
-
-        template<typename I, typename T>
-        struct Tuple {
-            I i;
-            T x;
-            Tuple(const RefTuple<I, T>& t) noexcept : i(t.i), x(t.x) {};
-            bool operator<(const Tuple<I, T>& t) const noexcept { return i < t.i; };
-            bool operator<(const RefTuple<I, T>& t) const noexcept { return i < t.i; };
-        };
-
-        template<typename I, typename T>
-        struct RefTuple {
-            I& i;
-            T& x;
-            RefTuple(I& i, T& x) noexcept : i(i), x(x) {}
-            void operator=(const Tuple<I, T>& t) noexcept { i = t.i; x = t.x; };
-            void operator=(const RefTuple<I, T>& t) noexcept { i = t.i; x = t.x; };
-            bool operator<(const Tuple<I, T>& t) const noexcept { return i < t.i; };
-        };
-
-        template<typename I, typename T>
-        inline void swap(RefTuple<I, T>&& t1, RefTuple<I, T>&& t2) noexcept {
-            std::swap(t1.i, t2.i);
-            std::swap(t1.x, t2.x);
-        }
-
-        template<typename I, typename T>
-        class IterTuple {
-            I* i;
-            T* x;
-        public:
-            using iterator_category = std::random_access_iterator_tag;
-            using value_type = Tuple<I, T>;
-            using difference_type = std::ptrdiff_t;
-            using pointer = Tuple<I, T>*;
-            using reference = Tuple<I, T>&;
-            IterTuple(I* i, T* t) noexcept : i(i), x(t) {}
-            IterTuple(const IterTuple& e) noexcept : i(e.i), x(e.x) {}
-            RefTuple<I, T> operator*() const noexcept {
-                return RefTuple<I, T>(*i, *x); }
-            IterTuple& operator++() noexcept { i++; x++; return *this; }
-            IterTuple& operator--() noexcept { i--; x--; return *this; }
-            IterTuple operator++(int) noexcept {
-                IterTuple tmp(*this); i++; x++; return tmp; }
-            IterTuple operator--(int) noexcept {
-                IterTuple tmp(*this); i--; x--; return tmp; }
-            difference_type operator-(IterTuple& rhs) const noexcept {
-                return i - rhs.i; }
-            IterTuple operator+(difference_type n) const noexcept {
-                IterTuple tmp(*this); tmp.i += n; tmp.x += n; return tmp; }
-            IterTuple operator-(difference_type n) const noexcept {
-                IterTuple tmp(*this); tmp.i -= n; tmp.x -= n; return tmp; }
-            bool operator==(const IterTuple& rhs) const noexcept { return i == rhs.i; }
-            bool operator!=(const IterTuple& rhs) const noexcept { return i != rhs.i; }
-            bool operator<(IterTuple& rhs) const noexcept { return i < rhs.i; }
-        };
-
-        template<typename I, typename T>
-        void sort_both_by_indices(I* Aj_start, I* Aj_end,
-                                  T* Ax_start, T* Ax_end) noexcept {
-            IterTuple<I, T> begin(Aj_start, Ax_start);
-            IterTuple<I, T> end(Aj_end, Ax_end);
-            std::sort(begin, end);
-        }
-        """
-        cdef void sort_both_by_indices[I, T](I* Aj_start, I* Aj_end,
-                                             T* Ax_start, T* Ax_end) noexcept
-
-    def csr_sort_indices(const unsigned n_row,
-                         const I[::1] Ap,
-                         I[::1] Aj,
-                         T[::1] Ax,
-                         const unsigned num_threads):
-        cdef unsigned i
-        cdef I row_start, row_end
-
-        if num_threads == 1:
-            for i in range(n_row):
-                row_start = Ap[i]
-                row_end = Ap[i + 1]
-                sort_both_by_indices(&Aj[row_start], &Aj[row_end],
-                                     &Ax[row_start], &Ax[row_end])
-        else:
-            for i in prange(n_row, nogil=True, num_threads=num_threads):
-                row_start = Ap[i]
-                row_end = Ap[i + 1]
-                sort_both_by_indices(&Aj[row_start], &Aj[row_end],
-                                     &Ax[row_start], &Ax[row_end])
-    
-    def get_csr_submatrix1(const unsigned n_row,
-                           const unsigned n_col,
-                           const I[::1] Ap,
-                           const I[::1] Aj,
-                           const T[::1] Ax,
-                           const I ir0,
-                           const I ir1,
-                           const I ic0,
-                           const I ic1,
-                           I[::1] Bp,
-                           const unsigned num_threads):
-        cdef unsigned i, new_n_row = ir1 - ir0
-        cdef I new_nnz, jj
-        
-        Bp[0] = 0
-        if num_threads == 1:
-            new_nnz = 0
-            for i in range(new_n_row):
-                for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
-                    if Aj[jj] >= ic0 and Aj[jj] < ic1:
-                        new_nnz += 1
-                Bp[i + 1] = new_nnz
-                
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    PyErr_CheckSignals()
-        else:
-            for i in prange(new_n_row, nogil=True, num_threads=num_threads):
-                new_nnz = 0
-                for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
-                    if Aj[jj] >= ic0 and Aj[jj] < ic1:
-                        new_nnz = new_nnz + 1
-                Bp[i + 1] = new_nnz
-                
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    with gil:
-                        PyErr_CheckSignals()
-                
-            for i in range(1, new_n_row):
-                Bp[i + 1] += Bp[i]  # cumsum
-    
-    def get_csr_submatrix2(const unsigned n_row,
-                           const unsigned n_col,
-                           const I[::1] Ap,
-                           const I[::1] Aj,
-                           const T[::1] Ax,
-                           const I ir0,
-                           const I ir1,
-                           const I ic0,
-                           const I ic1,
-                           I[::1] Bp,
-                           I[::1] Bj,
-                           T[::1] Bx,
-                           const unsigned num_threads):
-        cdef unsigned i, new_n_row = ir1 - ir0
-        cdef I jj, kk
-        
-        if num_threads == 1:
-            kk = 0
-            for i in range(new_n_row):
-                for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
-                    if Aj[jj] >= ic0 and Aj[jj] < ic1:
-                        Bj[kk] = Aj[jj] - ic0
-                        Bx[kk] = Ax[jj]
-                        kk = kk + 1
-                        
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    PyErr_CheckSignals()
-        else:
-            for i in prange(new_n_row, nogil=True, num_threads=num_threads):
-                kk = Bp[i]
-                for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
-                    if Aj[jj] >= ic0 and Aj[jj] < ic1:
-                        Bj[kk] = Aj[jj] - ic0
-                        Bx[kk] = Ax[jj]
-                        kk = kk + 1
-                        
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    with gil:
-                        PyErr_CheckSignals()
-    
-    def csr_row_index(const unsigned n_row_idx,
-                      const I[::1] rows,
-                      const I[::1] Ap,
-                      const I[::1] Aj,
-                      const T[::1] Ax,
-                      I[::1] Bp,
-                      I[::1] Bj,
-                      T[::1] Bx,
-                      const unsigned num_threads):
-        
-        cdef unsigned i
-        cdef I row, row_start, row_end, dest_row_start, dest_row_end
-        
-        if num_threads == 1:
-            dest_row_start = 0
-            for i in range(n_row_idx):
-                row = rows[i]
-                row_start = Ap[row]
-                row_end = Ap[row + 1]
-                dest_row_end = dest_row_start + row_end - row_start
-                Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
-                Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
-                dest_row_start = dest_row_end
-                
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    PyErr_CheckSignals()
-        else:
-            for i in prange(n_row_idx, nogil=True, num_threads=num_threads):
-                row = rows[i]
-                row_start = Ap[row]
-                row_end = Ap[row + 1]
-                dest_row_start = Bp[i]
-                dest_row_end = Bp[i + 1]
-                Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
-                Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
-                
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    with gil:
-                        PyErr_CheckSignals()
-    
-    def csr_row_slice(const unsigned start,
-                      const unsigned stop,
-                      const int step,
-                      const I[::1] Ap,
-                      const I[::1] Aj,
-                      const T[::1] Ax,
-                      I[::1] Bp,
-                      I[::1] Bj,
-                      T[::1] Bx,
-                      const unsigned num_threads):
-                
-        cdef unsigned i, row, num_iterations
-        cdef I row_start, row_end, dest_row_start, dest_row_end
-        
-        if num_threads == 1:
-            dest_row_start = 0
-            for i in range(start, stop, step):
-                row_start = Ap[i]
-                row_end = Ap[i + 1]
-                dest_row_end = dest_row_start + row_end - row_start
-                Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
-                Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
-                dest_row_start = dest_row_end
-                
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    PyErr_CheckSignals()
-        else:
-            if step > 0 and start < stop:
-                num_iterations = (stop - start + step - 1) // step
-            elif step < 0 and start > stop:
-                num_iterations = (start - stop - step - 1) // -step
             else:
-                num_iterations = 0
-            for i in prange(num_iterations, nogil=True,
-                            num_threads=num_threads):
-                row = start + i * step
-                row_start = Ap[row]
-                row_end = Ap[row + 1]
-                dest_row_start = Bp[i]
-                dest_row_end = Bp[i + 1]
-                Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
-                Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
-                
-                # Check for KeyboardInterrupts
-                if i % 10000 == 9999:
-                    with gil:
-                        PyErr_CheckSignals()
+                # Use hardware-level atomics to thread-safely flag unsorted rows
+                for i in prange(n_row, nogil=True, num_threads=num_threads):
+                    for jj in range(Ap[i], Ap[i + 1] - 1):
+                        if Aj[jj] > Aj[jj + 1]:
+                            atomic_and(has_sorted_indices, False)
+                            with gil:
+                                return False
+                        
+            return has_sorted_indices
         
-    def csr_column_index1(const unsigned n_idx,
-                          const I[::1] col_idxs,
-                          const unsigned n_row,
-                          const unsigned n_col,
-                          const I[::1] Ap,
-                          const I[::1] Aj,
-                          I[::1] col_offsets,
-                          I[::1] Bp,
-                          const unsigned num_threads):
-        cdef unsigned i, j
-        cdef I new_nnz, jj
-        
-        # bincount(col_idxs)
-        for i in range(n_idx):
-            j = col_idxs[i]
-            col_offsets[j] += 1
+        cdef extern from * nogil:
+            """
+            #include <algorithm>
+            #include <iterator>
+            
+            template<typename I, typename T>
+            struct RefTuple;
     
-        # Compute new indptr
-        Bp[0] = 0
-        if num_threads == 1:
-            new_nnz = 0
-            for i in range(n_row):
-                for jj in range(Ap[i], Ap[i + 1]):
-                    new_nnz += col_offsets[Aj[jj]]
-                Bp[i + 1] = new_nnz
-        else:
-            for i in prange(n_row, nogil=True, num_threads=num_threads):
+            template<typename I, typename T>
+            struct Tuple {
+                I i;
+                T x;
+                Tuple(const RefTuple<I, T>& t) noexcept : i(t.i), x(t.x) {}
+                bool operator<(const Tuple<I, T>& t) const noexcept { return i < t.i; };
+                bool operator<(const RefTuple<I, T>& t) const noexcept { return i < t.i; };
+            };
+    
+            template<typename I, typename T>
+            struct RefTuple {
+                I& i;
+                T& x;
+                RefTuple(I& i, T& x) noexcept : i(i), x(x) {}
+                void operator=(const Tuple<I, T>& t) noexcept { i = t.i; x = t.x; };
+                void operator=(const RefTuple<I, T>& t) noexcept { i = t.i; x = t.x; };
+                bool operator<(const Tuple<I, T>& t) const noexcept { return i < t.i; };
+            };
+    
+            template<typename I, typename T>
+            inline void swap(RefTuple<I, T>&& t1, RefTuple<I, T>&& t2) noexcept {
+                std::swap(t1.i, t2.i);
+                std::swap(t1.x, t2.x);
+            }
+    
+            template<typename I, typename T>
+            class IterTuple {
+                I* i;
+                T* x;
+            public:
+                using iterator_category = std::random_access_iterator_tag;
+                using value_type = Tuple<I, T>;
+                using difference_type = std::ptrdiff_t;
+                using pointer = Tuple<I, T>*;
+                using reference = Tuple<I, T>&;
+                IterTuple(I* i, T* t) noexcept : i(i), x(t) {}
+                IterTuple(const IterTuple& e) noexcept : i(e.i), x(e.x) {}
+                RefTuple<I, T> operator*() const noexcept {
+                    return RefTuple<I, T>(*i, *x); }
+                IterTuple& operator++() noexcept { i++; x++; return *this; }
+                IterTuple& operator--() noexcept { i--; x--; return *this; }
+                IterTuple operator++(int) noexcept {
+                    IterTuple tmp(*this); i++; x++; return tmp; }
+                IterTuple operator--(int) noexcept {
+                    IterTuple tmp(*this); i--; x--; return tmp; }
+                difference_type operator-(IterTuple& rhs) const noexcept {
+                    return i - rhs.i; }
+                IterTuple operator+(difference_type n) const noexcept {
+                    IterTuple tmp(*this); tmp.i += n; tmp.x += n; return tmp; }
+                IterTuple operator-(difference_type n) const noexcept {
+                    IterTuple tmp(*this); tmp.i -= n; tmp.x -= n; return tmp; }
+                bool operator==(const IterTuple& rhs) const noexcept { return i == rhs.i; }
+                bool operator!=(const IterTuple& rhs) const noexcept { return i != rhs.i; }
+                bool operator<(IterTuple& rhs) const noexcept { return i < rhs.i; }
+            };
+    
+            template<typename I, typename T>
+            void sort_both_by_indices(I* Aj_start, I* Aj_end,
+                                      T* Ax_start, T* Ax_end) noexcept {
+                IterTuple<I, T> begin(Aj_start, Ax_start);
+                IterTuple<I, T> end(Aj_end, Ax_end);
+                std::sort(begin, end);
+            }
+            """
+            cdef void sort_both_by_indices[I, T](I* Aj_start, I* Aj_end,
+                                                 T* Ax_start, T* Ax_end) noexcept
+    
+        def csr_sort_indices(const unsigned n_row,
+                             const signed_integer[::1] Ap,
+                             signed_integer[::1] Aj,
+                             numeric[::1] Ax,
+                             unsigned num_threads):
+            cdef unsigned i, thread_index
+            cdef signed_integer row_start, row_end
+            cdef pair[unsigned, unsigned] row_range
+            
+            num_threads = min(num_threads, n_row)
+            if num_threads == 1:
+                for i in range(n_row):
+                    row_start = Ap[i]
+                    row_end = Ap[i + 1]
+                    sort_both_by_indices(&Aj[row_start], &Aj[row_end],
+                                         &Ax[row_start], &Ax[row_end])
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(Ap, thread_index, num_threads)
+                    for i in range(row_range.first, row_range.second):
+                        row_start = Ap[i]
+                        row_end = Ap[i + 1]
+                        sort_both_by_indices(&Aj[row_start], &Aj[row_end],
+                                             &Ax[row_start], &Ax[row_end])
+        
+        def get_csr_submatrix1(const unsigned n_row,
+                               const unsigned n_col,
+                               const signed_integer[::1] Ap,
+                               const signed_integer[::1] Aj,
+                               const numeric[::1] Ax,
+                               const signed_integer ir0,
+                               const signed_integer ir1,
+                               const signed_integer ic0,
+                               const signed_integer ic1,
+                               signed_integer[::1] Bp,
+                               unsigned num_threads):
+            cdef unsigned i, thread_index, new_n_row = ir1 - ir0
+            cdef signed_integer new_nnz, jj
+            cdef pair[unsigned, unsigned] row_range
+            
+            Bp[0] = 0
+            num_threads = min(num_threads, new_n_row)
+            if num_threads == 1:
                 new_nnz = 0
-                for jj in range(Ap[i], Ap[i + 1]):
-                    new_nnz = new_nnz + col_offsets[Aj[jj]]
-                Bp[i + 1] = new_nnz
-            for i in range(1, n_row):
-                Bp[i + 1] += Bp[i]
+                for i in range(new_n_row):
+                    for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
+                        if Aj[jj] >= ic0 and Aj[jj] < ic1:
+                            new_nnz += 1
+                    Bp[i + 1] = new_nnz
+                    
+                    # Check for KeyboardInterrupts
+                    if i % 10000 == 9999:
+                        PyErr_CheckSignals()
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(Ap[ir0:ir1 + 1], thread_index,
+                                                  num_threads)
+                    for i in range(row_range.first, row_range.second):
+                        new_nnz = 0
+                        for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
+                            if Aj[jj] >= ic0 and Aj[jj] < ic1:
+                                new_nnz = new_nnz + 1
+                        Bp[i + 1] = new_nnz
+                        
+                        # Check for KeyboardInterrupts
+                        if i % 10000 == 9999:
+                            with gil:
+                                PyErr_CheckSignals()
+                    
+                for i in range(1, new_n_row):
+                    Bp[i + 1] += Bp[i]  # cumsum
         
-        # cumsum in-place
-        for j in range(1, n_col):
-            col_offsets[j] += col_offsets[j - 1]
-    
-    def csr_column_index2(const I[::1] col_order,
-                          const I[::1] col_offsets,
-                          const I nnz,
-                          const I[::1] Ap,
-                          const I[::1] Aj,
-                          const T[::1] Ax,
-                          I[::1] Bp,
-                          I[::1] Bj,
-                          T[::1] Bx,
+        def get_csr_submatrix2(const unsigned n_row,
+                               const unsigned n_col,
+                               const signed_integer[::1] Ap,
+                               const signed_integer[::1] Aj,
+                               const numeric[::1] Ax,
+                               const signed_integer ir0,
+                               const signed_integer ir1,
+                               const signed_integer ic0,
+                               const signed_integer ic1,
+                               signed_integer[::1] Bp,
+                               signed_integer[::1] Bj,
+                               numeric[::1] Bx,
+                               unsigned num_threads):
+            cdef unsigned i, thread_index, new_n_row = ir1 - ir0
+            cdef signed_integer jj, kk
+            cdef pair[unsigned, unsigned] row_range
+            
+            num_threads = min(num_threads, new_n_row)
+            if num_threads == 1:
+                kk = 0
+                for i in range(new_n_row):
+                    for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
+                        if Aj[jj] >= ic0 and Aj[jj] < ic1:
+                            Bj[kk] = Aj[jj] - ic0
+                            Bx[kk] = Ax[jj]
+                            kk = kk + 1
+                            
+                    # Check for KeyboardInterrupts
+                    if i % 10000 == 9999:
+                        PyErr_CheckSignals()
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(Ap[ir0:ir1 + 1], thread_index,
+                                                  num_threads)
+                    for i in range(row_range.first, row_range.second):
+                        kk = Bp[i]
+                        for jj in range(Ap[ir0 + i], Ap[ir0 + i + 1]):
+                            if Aj[jj] >= ic0 and Aj[jj] < ic1:
+                                Bj[kk] = Aj[jj] - ic0
+                                Bx[kk] = Ax[jj]
+                                kk = kk + 1
+                                
+                        # Check for KeyboardInterrupts
+                        if i % 10000 == 9999:
+                            with gil:
+                                PyErr_CheckSignals()
+        
+        def csr_row_index(const unsigned n_row_idx,
+                          const signed_integer[::1] rows,
+                          const signed_integer[::1] Ap,
+                          const signed_integer[::1] Aj,
+                          const numeric[::1] Ax,
+                          signed_integer[::1] Bp,
+                          signed_integer[::1] Bj,
+                          numeric[::1] Bx,
                           const unsigned num_threads):
-        
-        cdef unsigned row
-        cdef I n, jj, j, offset, prev_offset, k
-        cdef T v
-        
-        if num_threads == 1:
-            n = 0
-            for jj in range(nnz):
-                j = Aj[jj]
-                offset = col_offsets[j]
-                prev_offset = 0 if j == 0 else col_offsets[j - 1]
-                if offset != prev_offset:
-                    v = Ax[jj]
-                    for k in range(prev_offset, offset):
-                        Bj[n] = col_order[k]
-                        Bx[n] = v
-                        n += 1
             
-            # Check for KeyboardInterrupts
-            if jj % 1000000 == 999999:
-                PyErr_CheckSignals()
+            cdef unsigned i
+            cdef signed_integer row, row_start, row_end, dest_row_start, dest_row_end
             
-        else:
-            for row in prange(Ap.shape[0] - 1, nogil=True,
-                              num_threads=num_threads):
-                n = Bp[row]
-                for jj in range(Ap[row], Ap[row + 1]):
+            if num_threads == 1:
+                dest_row_start = 0
+                for i in range(n_row_idx):
+                    row = rows[i]
+                    row_start = Ap[row]
+                    row_end = Ap[row + 1]
+                    dest_row_end = dest_row_start + row_end - row_start
+                    Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
+                    Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
+                    dest_row_start = dest_row_end
+                    
+                    # Check for KeyboardInterrupts
+                    if i % 10000 == 9999:
+                        PyErr_CheckSignals()
+            else:
+                for i in prange(n_row_idx, nogil=True, num_threads=num_threads):
+                    row = rows[i]
+                    row_start = Ap[row]
+                    row_end = Ap[row + 1]
+                    dest_row_start = Bp[i]
+                    dest_row_end = Bp[i + 1]
+                    Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
+                    Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
+                    
+                    # Check for KeyboardInterrupts
+                    if i % 10000 == 9999:
+                        with gil:
+                            PyErr_CheckSignals()
+        
+        def csr_row_slice(const unsigned start,
+                          const unsigned stop,
+                          const int step,
+                          const signed_integer[::1] Ap,
+                          const signed_integer[::1] Aj,
+                          const numeric[::1] Ax,
+                          signed_integer[::1] Bp,
+                          signed_integer[::1] Bj,
+                          numeric[::1] Bx,
+                          const unsigned num_threads):
+                    
+            cdef unsigned i, row, num_iterations
+            cdef signed_integer row_start, row_end, dest_row_start, dest_row_end
+            
+            if num_threads == 1:
+                dest_row_start = 0
+                for i in range(start, stop, step):
+                    row_start = Ap[i]
+                    row_end = Ap[i + 1]
+                    dest_row_end = dest_row_start + row_end - row_start
+                    Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
+                    Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
+                    dest_row_start = dest_row_end
+                    
+                    # Check for KeyboardInterrupts
+                    if i % 10000 == 9999:
+                        PyErr_CheckSignals()
+            else:
+                if step > 0 and start < stop:
+                    num_iterations = (stop - start + step - 1) // step
+                elif step < 0 and start > stop:
+                    num_iterations = (start - stop - step - 1) // -step
+                else:
+                    num_iterations = 0
+                for i in prange(num_iterations, nogil=True,
+                                num_threads=num_threads):
+                    row = start + i * step
+                    row_start = Ap[row]
+                    row_end = Ap[row + 1]
+                    dest_row_start = Bp[i]
+                    dest_row_end = Bp[i + 1]
+                    Bj[dest_row_start:dest_row_end] = Aj[row_start:row_end]
+                    Bx[dest_row_start:dest_row_end] = Ax[row_start:row_end]
+                    
+                    # Check for KeyboardInterrupts
+                    if i % 10000 == 9999:
+                        with gil:
+                            PyErr_CheckSignals()
+            
+        def csr_column_index1(const unsigned n_idx,
+                              const signed_integer[::1] col_idxs,
+                              const unsigned n_row,
+                              const unsigned n_col,
+                              const signed_integer[::1] Ap,
+                              const signed_integer[::1] Aj,
+                              signed_integer[::1] col_offsets,
+                              signed_integer[::1] Bp,
+                              unsigned num_threads):
+            cdef unsigned i, j, thread_index
+            cdef signed_integer new_nnz, jj
+            cdef pair[unsigned, unsigned] row_range
+            
+            # bincount(col_idxs)
+            col_offsets[:] = 0
+            for i in range(n_idx):
+                j = col_idxs[i]
+                col_offsets[j] += 1
+        
+            # Compute new indptr
+            Bp[0] = 0
+            num_threads = min(num_threads, n_row)
+            if num_threads == 1:
+                new_nnz = 0
+                for i in range(n_row):
+                    for jj in range(Ap[i], Ap[i + 1]):
+                        new_nnz += col_offsets[Aj[jj]]
+                    Bp[i + 1] = new_nnz
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(Ap, thread_index, num_threads)
+                    for i in range(row_range.first, row_range.second):
+                        new_nnz = 0
+                        for jj in range(Ap[i], Ap[i + 1]):
+                            new_nnz = new_nnz + col_offsets[Aj[jj]]
+                        Bp[i + 1] = new_nnz
+                for i in range(1, n_row):
+                    Bp[i + 1] += Bp[i]
+            
+            # cumsum in-place
+            for j in range(1, n_col):
+                col_offsets[j] += col_offsets[j - 1]
+        
+        def csr_column_index2(const signed_integer[::1] col_order,
+                              const signed_integer[::1] col_offsets,
+                              const signed_integer nnz,
+                              const signed_integer[::1] Ap,
+                              const signed_integer[::1] Aj,
+                              const numeric[::1] Ax,
+                              signed_integer[::1] Bp,
+                              signed_integer[::1] Bj,
+                              numeric[::1] Bx,
+                              unsigned num_threads):
+            
+            cdef unsigned row, thread_index
+            cdef signed_integer n, jj, j, offset, prev_offset, k
+            cdef numeric v
+            cdef pair[unsigned, unsigned] row_range
+            
+            num_threads = min(num_threads, Ap.shape[0] - 1)
+            if num_threads == 1:
+                n = 0
+                for jj in range(nnz):
                     j = Aj[jj]
                     offset = col_offsets[j]
                     prev_offset = 0 if j == 0 else col_offsets[j - 1]
@@ -2157,189 +2287,158 @@ cython_functions = cython_inline(r'''
                         for k in range(prev_offset, offset):
                             Bj[n] = col_order[k]
                             Bx[n] = v
-                            n = n + 1
+                            n += 1
                 
                 # Check for KeyboardInterrupts
-                if row % 10000 == 9999:
-                    with gil:
-                        PyErr_CheckSignals()
-    
-    def csr_sample_values(const unsigned n_row,
-                          const unsigned n_col,
-                          const I[::1] Ap,
-                          const I[::1] Aj,
-                          const T[::1] Ax,
-                          const I n_samples,
-                          const I[::1] Bi,
-                          const I[::1] Bj,
-                          T[::1] Bx,
-                          const unsigned num_threads):
-        cdef I n, i, j, row_start, row_end, offset, jj, nnz = Ap[n_row], \
-            threshold = nnz / 10  # constant is arbitrary
-        cdef T x
-    
-        if n_samples > threshold and csr_has_canonical_format(n_row, Ap, Aj,
-                                                              num_threads):
-            if num_threads == 1:
-                for n in range(n_samples):
-                    i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
-                    j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
-        
-                    row_start = Ap[i]
-                    row_end = Ap[i + 1]
-        
-                    if row_start < row_end:
-                        offset = lower_bound(&Aj[0] + row_start,
-                                             &Aj[0] + row_end, j) - &Aj[0]
-                        if offset < row_end and Aj[offset] == j:
-                            Bx[n] = Ax[offset]
-                        else:
-                            Bx[n] = 0
-                    else:
-                        Bx[n] = 0
-                
-                # Check for KeyboardInterrupts
-                if n % 10000 == 9999:
+                if jj % 1000000 == 999999:
                     PyErr_CheckSignals()
                 
             else:
-                for n in prange(n_samples, nogil=True,
-                                num_threads=num_threads):
-                    i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
-                    j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
-        
-                    row_start = Ap[i]
-                    row_end = Ap[i + 1]
-        
-                    if row_start < row_end:
-                        offset = lower_bound(&Aj[0] + row_start,
-                                             &Aj[0] + row_end, j) - &Aj[0]
-                        if offset < row_end and Aj[offset] == j:
-                            Bx[n] = Ax[offset]
-                        else:
-                            Bx[n] = 0
-                    else:
-                        Bx[n] = 0
-                    
-                    # Check for KeyboardInterrupts
-                    if n % 10000 == 9999:
-                        with gil:
-                            PyErr_CheckSignals()
-        else:
-            if num_threads == 1:
-                for n in range(n_samples):
-                    i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
-                    j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
-        
-                    row_start = Ap[i]
-                    row_end = Ap[i + 1]
-        
-                    x = 0
-                    for jj in range(row_start, row_end):
-                        if Aj[jj] == j:
-                            x += Ax[jj]
-                    Bx[n] = x
-                    
-                    # Check for KeyboardInterrupts
-                    if n % 10000 == 9999:
-                        PyErr_CheckSignals()
-            else:
-                for n in prange(n_samples, nogil=True,
-                                num_threads=num_threads):
-                    i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
-                    j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
-        
-                    row_start = Ap[i]
-                    row_end = Ap[i + 1]
-        
-                    x = 0
-                    for jj in range(row_start, row_end):
-                        if Aj[jj] == j:
-                            x = x + Ax[jj]
-                    Bx[n] = x
-                    
-                    # Check for KeyboardInterrupts
-                    if n % 10000 == 9999:
-                        with gil:
-                            PyErr_CheckSignals()
-    
-    def csr_tocsc(const unsigned n_row,
-                  const unsigned n_col,
-                  const I[::1] Ap,
-                  const I[::1] Aj,
-                  const T[::1] Ax,
-                        I[::1] Bp,
-                        I[::1] Bi,
-                        T[::1] Bx,
-                  const unsigned num_threads):
-        cdef unsigned col, thread_index, preceding_thread_index, chunk_size
-        cdef I n, temp, cumsum, jj, dest, nnz = Ap[n_row]
-        cdef I row, row_start, row_end, preceding_count, i
-        cdef vector[vector[unsigned]] thread_col_counts
-        cdef vector[vector[I]] thread_col_offsets
-        
-        if num_threads == 1:
-            # Count the number of non-zero entries per column of `A`
-            fill(&Bp[0], &Bp[0] + n_col, 0)
-            for n in range(nnz):
-                Bp[Aj[n]] += 1
-    
-            # Cumsum the nnz per column, shifting right by 1, to get `Bp`
-            cumsum = 0
-            for col in range(n_col):
-                temp = Bp[col]
-                Bp[col] = cumsum
-                cumsum += temp
-            Bp[n_col] = nnz
-    
-            # Fill in `Bi` and `Bx`, using `Bp[col]` to keep track of the current
-            # insertion index for each column
-            for row in range(<I> n_row):
-                for jj in range(Ap[row], Ap[row + 1]):
-                    col = Aj[jj]
-                    dest = Bp[col]
-                    Bi[dest] = row
-                    Bx[dest] = Ax[jj]
-                    Bp[col] += 1
-                
-                # Check for KeyboardInterrupts
-                if row % 10000 == 9999:
-                    PyErr_CheckSignals()
-            
-            # After the previous step, `Bp[col]` now points to the start of
-            # `col + 1`'s column. Reset it to point to the start of `col`'s column.
-            col = n_col
-            while col > 0:
-                Bp[col] = Bp[col - 1]
-                col = col - 1
-            Bp[0] = 0
-        else:
-            thread_col_counts.resize(num_threads)
-            thread_col_offsets.resize(num_threads)
-            chunk_size = (n_row + num_threads - 1) / num_threads
-            
-            with nogil:
-                # Count the number of non-zero entries per column of `A`
-                # per thread
-                with parallel(num_threads=num_threads):
+                with nogil, parallel(num_threads=num_threads):
                     thread_index = threadid()
-                    thread_col_counts[thread_index].resize(n_col)
-                    thread_col_offsets[thread_index].resize(n_col)
-                    
-                    row_start = thread_index * chunk_size
-                    row_end = min(row_start + chunk_size, n_row)
-                    
-                    for row in range(row_start, row_end):
+                    row_range = get_thread_offset(Ap, thread_index, num_threads)
+                    for row in range(row_range.first, row_range.second):
+                        n = Bp[row]
                         for jj in range(Ap[row], Ap[row + 1]):
-                            col = Aj[jj]
-                            thread_col_counts[thread_index][col] += 1
-    
-                # Sum these numbers of non-zero entries across threads
-                fill(&Bp[0], &Bp[0] + n_col + 1, 0)
-                for col in range(n_col):
-                    for thread_index in range(num_threads):
-                        Bp[col] += thread_col_counts[thread_index][col]
-    
+                            j = Aj[jj]
+                            offset = col_offsets[j]
+                            prev_offset = 0 if j == 0 else col_offsets[j - 1]
+                            if offset != prev_offset:
+                                v = Ax[jj]
+                                for k in range(prev_offset, offset):
+                                    Bj[n] = col_order[k]
+                                    Bx[n] = v
+                                    n = n + 1
+                        
+                        # Check for KeyboardInterrupts
+                        if row % 10000 == 9999:
+                            with gil:
+                                PyErr_CheckSignals()
+        
+        def csr_sample_values(const unsigned n_row,
+                              const unsigned n_col,
+                              const signed_integer[::1] Ap,
+                              const signed_integer[::1] Aj,
+                              const numeric[::1] Ax,
+                              const signed_integer n_samples,
+                              const signed_integer[::1] Bi,
+                              const signed_integer[::1] Bj,
+                              numeric[::1] Bx,
+                              const unsigned num_threads):
+            cdef signed_integer n, i, j, row_start, row_end, offset, jj, \
+                nnz = Ap[n_row], threshold = nnz / 10  # constant is arbitrary
+            cdef numeric x
+        
+            if n_samples > threshold and csr_has_canonical_format(n_row, Ap, Aj,
+                                                                  num_threads):
+                if num_threads == 1:
+                    for n in range(n_samples):
+                        i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
+                        j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
+            
+                        row_start = Ap[i]
+                        row_end = Ap[i + 1]
+            
+                        if row_start < row_end:
+                            offset = lower_bound(&Aj[0] + row_start,
+                                                 &Aj[0] + row_end, j) - &Aj[0]
+                            if offset < row_end and Aj[offset] == j:
+                                Bx[n] = Ax[offset]
+                            else:
+                                Bx[n] = 0
+                        else:
+                            Bx[n] = 0
+                    
+                    # Check for KeyboardInterrupts
+                    if n % 10000 == 9999:
+                        PyErr_CheckSignals()
+                    
+                else:
+                    for n in prange(n_samples, nogil=True,
+                                    num_threads=num_threads):
+                        i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
+                        j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
+            
+                        row_start = Ap[i]
+                        row_end = Ap[i + 1]
+            
+                        if row_start < row_end:
+                            offset = lower_bound(&Aj[0] + row_start,
+                                                 &Aj[0] + row_end, j) - &Aj[0]
+                            if offset < row_end and Aj[offset] == j:
+                                Bx[n] = Ax[offset]
+                            else:
+                                Bx[n] = 0
+                        else:
+                            Bx[n] = 0
+                        
+                        # Check for KeyboardInterrupts
+                        if n % 10000 == 9999:
+                            with gil:
+                                PyErr_CheckSignals()
+            else:
+                if num_threads == 1:
+                    for n in range(n_samples):
+                        i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
+                        j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
+            
+                        row_start = Ap[i]
+                        row_end = Ap[i + 1]
+            
+                        x = 0
+                        for jj in range(row_start, row_end):
+                            if Aj[jj] == j:
+                                x += Ax[jj]
+                        Bx[n] = x
+                        
+                        # Check for KeyboardInterrupts
+                        if n % 10000 == 9999:
+                            PyErr_CheckSignals()
+                else:
+                    for n in prange(n_samples, nogil=True,
+                                    num_threads=num_threads):
+                        i = Bi[n] + n_row if Bi[n] < 0 else Bi[n]  # sample row
+                        j = Bj[n] + n_col if Bj[n] < 0 else Bj[n]  # sample column
+            
+                        row_start = Ap[i]
+                        row_end = Ap[i + 1]
+            
+                        x = 0
+                        for jj in range(row_start, row_end):
+                            if Aj[jj] == j:
+                                x = x + Ax[jj]
+                        Bx[n] = x
+                        
+                        # Check for KeyboardInterrupts
+                        if n % 10000 == 9999:
+                            with gil:
+                                PyErr_CheckSignals()
+        
+        def csr_tocsc(const unsigned n_row,
+                      const unsigned n_col,
+                      const signed_integer[::1] Ap,
+                      const signed_integer[::1] Aj,
+                      const numeric[::1] Ax,
+                      signed_integer[::1] Bp,
+                      signed_integer[::1] Bi,
+                      numeric[::1] Bx,
+                      unsigned num_threads):
+            cdef unsigned col, row, thread_index, preceding_thread_index
+            cdef signed_integer n, cumsum, temp, jj, dest, preceding_count, i, \
+                nnz = Ap[n_row]
+            cdef pair[unsigned, unsigned] row_range
+            cdef vector[vector[unsigned]] thread_col_counts
+            cdef vector[vector[signed_integer]] thread_col_offsets
+            cdef unsigned* col_counts
+            cdef signed_integer* col_offsets
+            
+            num_threads = min(num_threads, n_row)
+            if num_threads == 1:
+                # Count the number of non-zero entries per column of `A`
+                Bp[:n_col] = 0
+                for n in range(nnz):
+                    Bp[Aj[n]] += 1
+        
                 # Cumsum the nnz per column, shifting right by 1, to get `Bp`
                 cumsum = 0
                 for col in range(n_col):
@@ -2347,70 +2446,122 @@ cython_functions = cython_inline(r'''
                     Bp[col] = cumsum
                     cumsum += temp
                 Bp[n_col] = nnz
-    
-                # Fill in `Bi` and `Bx`, using `thread_col_offsets[col]` to keep
-                # track of the current insertion index for each column. Initialize
-                # each thread's `thread_col_offsets[col]` by summing
-                # `thread_col_counts` for that column across all threads preceding
-                # `thread_index`, and adding `Bp[col]`, the start index of the
-                # column.
-                with parallel(num_threads=num_threads):
-                    thread_index = threadid()
-                    row_start = thread_index * chunk_size
-                    row_end = min(row_start + chunk_size, n_row)
+        
+                # Fill in `Bi` and `Bx`, using `Bp[col]` to keep track of the current
+                # insertion index for each column
+                for row in range(n_row):
+                    for jj in range(Ap[row], Ap[row + 1]):
+                        col = Aj[jj]
+                        dest = Bp[col]
+                        Bi[dest] = row
+                        Bx[dest] = Ax[jj]
+                        Bp[col] += 1
                     
+                    # Check for KeyboardInterrupts
+                    if row % 10000 == 9999:
+                        PyErr_CheckSignals()
+                
+                # After the previous step, `Bp[col]` now points to the start of
+                # `col + 1`'s column. Reset it to point to the start of `col`'s column.
+                col = n_col
+                while col > 0:
+                    Bp[col] = Bp[col - 1]
+                    col = col - 1
+                Bp[0] = 0
+            else:
+                thread_col_counts.resize(num_threads)
+                thread_col_offsets.resize(num_threads)
+                
+                with nogil:
+                    # Count the number of non-zero entries per column of `A`
+                    # per thread
+                    with parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        thread_col_counts[thread_index].resize(n_col)
+                        thread_col_offsets[thread_index].resize(n_col)
+                        row_range = get_thread_offset(Ap, thread_index, num_threads)
+                        col_counts = thread_col_counts[thread_index].data()
+                        for row in range(row_range.first, row_range.second):
+                            for jj in range(Ap[row], Ap[row + 1]):
+                                col = Aj[jj]
+                                col_counts[col] += 1
+        
+                    # Sum these numbers of non-zero entries across threads
+                    Bp[:] = 0
                     for col in range(n_col):
-                        preceding_count = Bp[col]
-                        for preceding_thread_index in range(thread_index):
-                            preceding_count = preceding_count + \
-                                thread_col_counts[preceding_thread_index][col]
-                        thread_col_offsets[thread_index][col] = preceding_count
-                    
-                    for row in range(row_start, row_end):
-                        for jj in range(Ap[row], Ap[row + 1]):
-                            col = Aj[jj]
-                            dest = thread_col_offsets[thread_index][col]
-                            Bi[dest] = row
-                            Bx[dest] = Ax[jj]
-                            thread_col_offsets[thread_index][col] += 1
+                        for thread_index in range(num_threads):
+                            Bp[col] += thread_col_counts[thread_index][col]
+        
+                    # Cumsum the nnz per column, shifting right by 1, to get `Bp`
+                    cumsum = 0
+                    for col in range(n_col):
+                        temp = Bp[col]
+                        Bp[col] = cumsum
+                        cumsum += temp
+                    Bp[n_col] = nnz
+        
+                    # Fill in `Bi` and `Bx`, using `thread_col_offsets[col]` to keep
+                    # track of the current insertion index for each column. Initialize
+                    # each thread's `thread_col_offsets[col]` by summing
+                    # `thread_col_counts` for that column across all threads preceding
+                    # `thread_index`, and adding `Bp[col]`, the start index of the
+                    # column.
+                    with parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_offsets = thread_col_offsets[thread_index].data()
+                        for col in range(n_col):
+                            preceding_count = Bp[col]
+                            for preceding_thread_index in range(thread_index):
+                                preceding_count = preceding_count + \
+                                    thread_col_counts[preceding_thread_index][col]
+                            col_offsets[col] = preceding_count
                         
-                        # Check for KeyboardInterrupts
-                        if row % 10000 == 9999:
-                            with gil:
-                                PyErr_CheckSignals()
+                        row_range = get_thread_offset(Ap, thread_index, num_threads)
+                        for row in range(row_range.first, row_range.second):
+                            for jj in range(Ap[row], Ap[row + 1]):
+                                col = Aj[jj]
+                                dest = col_offsets[col]
+                                Bi[dest] = row
+                                Bx[dest] = Ax[jj]
+                                col_offsets[col] += 1
+                            
+                            # Check for KeyboardInterrupts
+                            if row % 10000 == 9999:
+                                with gil:
+                                    PyErr_CheckSignals()
+        
+        def csc_tocsr(const unsigned n_row,
+                      const unsigned n_col,
+                      const signed_integer[::1] Ap,
+                      const signed_integer[::1] Ai,
+                      const numeric[::1] Ax,
+                      signed_integer[::1] Bp,
+                      signed_integer[::1] Bj,
+                      numeric[::1] Bx,
+                      const unsigned num_threads):
+            return csr_tocsc(n_col, n_row, Ap, Ai, Ax, Bp, Bj, Bx, num_threads)
+        
+        def csr_eliminate_zeros(const unsigned n_row,
+                                const unsigned n_col,
+                                signed_integer[::1] Ap,
+                                signed_integer[::1] Aj,
+                                numeric[::1] Ax):
+            cdef unsigned i
+            cdef signed_integer row_end = 0, nnz = 0, jj, j
+            cdef numeric x
     
-    def csc_tocsr(const unsigned n_row,
-                  const unsigned n_col,
-                  const I[::1] Ap,
-                  const I[::1] Ai,
-                  const T[::1] Ax,
-                        I[::1] Bp,
-                        I[::1] Bj,
-                        T[::1] Bx,
-                  const unsigned num_threads):
-        return csr_tocsc(n_col, n_row, Ap, Ai, Ax, Bp, Bj, Bx, num_threads)
-    
-    def csr_eliminate_zeros(const unsigned n_row,
-                            const unsigned n_col,
-                            I[::1] Ap,
-                            I[::1] Aj,
-                            T[::1] Ax):
-        cdef unsigned i
-        cdef I row_end = 0, nnz = 0, jj, j
-        cdef T x
-
-        for i in range(n_row):
-            jj = row_end
-            row_end = Ap[i+1]
-            while jj < row_end:
-                j = Aj[jj]
-                x = Ax[jj]
-                if x != 0:
-                    Aj[nnz] = j
-                    Ax[nnz] = x
-                    nnz += 1
-                jj += 1
-            Ap[i + 1] = nnz
+            for i in range(n_row):
+                jj = row_end
+                row_end = Ap[i+1]
+                while jj < row_end:
+                    j = Aj[jj]
+                    x = Ax[jj]
+                    if x != 0:
+                        Aj[nnz] = j
+                        Ax[nnz] = x
+                        nnz += 1
+                    jj += 1
+                Ap[i + 1] = nnz
 ''', warn_undeclared=False)
 get_csr_submatrix1 = cython_functions['get_csr_submatrix1']
 get_csr_submatrix2 = cython_functions['get_csr_submatrix2']
@@ -2497,6 +2648,236 @@ class cs_matrix(_cs_matrix):
     _num_threads = os.cpu_count()
     _has_sorted_indices = None
     _has_canonical_format = None
+    
+    def __getitem__(self, key):
+        index, new_shape = self._validate_indices(key)
+        INT_TYPES = int, np.integer
+        
+        # 1D array
+        if len(index) == 1:
+            idx = index[0]
+            if isinstance(idx, np.ndarray):
+                if idx.shape == ():
+                    idx = idx.item()
+            if isinstance(idx, INT_TYPES):
+                res = self._get_int(idx)
+            elif isinstance(idx, slice):
+                res = self._get_slice(idx)
+            else:  # assume array idx
+                res = self._get_array(idx)
+            
+            # handle np.newaxis in idx when result would otherwise be a scalar
+            if res.shape == () and new_shape != ():
+                if len(new_shape) == 1:
+                    return self.__class__([res], shape=new_shape,
+                                          dtype=self.dtype)
+                if len(new_shape) == 2:
+                    return self.__class__([[res]], shape=new_shape,
+                                          dtype=self.dtype)
+            return res.reshape(new_shape)
+
+        # 2D array
+        row, col = index
+
+        # Dispatch to specialized methods.
+        if isinstance(row, INT_TYPES):
+            if isinstance(col, INT_TYPES):
+                return self._get_intXint(row, col)
+            elif isinstance(col, slice):
+                return self._get_intXslice(row, col)
+            elif col.ndim == 1:
+                return self._get_intXarray(row, col)
+            elif col.ndim == 2:
+                return self._get_intXarray(row, col)
+            else:
+                raise IndexError('index results in >2 dimensions')
+        elif isinstance(row, slice):
+            if isinstance(col, INT_TYPES):
+                return self._get_sliceXint(row, col)
+            elif isinstance(col, slice):
+                if row == slice(None) and row == col:
+                    return self.copy()
+                else:
+                    return self._get_sliceXslice(row, col)
+            elif col.ndim == 1:
+                return self._get_sliceXarray(row, col)
+            else:
+                raise IndexError('index results in >2 dimensions')
+        else:
+            if isinstance(col, INT_TYPES):
+                return self._get_arrayXint(row, col)
+            elif isinstance(col, slice):
+                return self._get_arrayXslice(row, col)
+            # arrayXarray preprocess
+            elif row.ndim == 2 and row.shape[1] == 1 and \
+                    (col.ndim == 1 or col.shape[0] == 1):
+                # outer indexing
+                return self._get_columnXarray(row[:, 0], col.ravel())
+            else:
+                # inner indexing
+                row, col = self._broadcast_arrays(row, col)
+                if row.shape != col.shape:
+                    raise IndexError('number of row and column indices differ')
+                if row.size == 0:
+                    return self.__class__(np.atleast_2d(row).shape,
+                                         dtype=self.dtype)
+                else:
+                    return self._get_arrayXarray(row, col)
+    
+    @staticmethod
+    def _broadcast_arrays(a, b):
+        """
+        Same as np.broadcast_arrays(a, b) but old writeability rules.
+
+        NumPy >= 1.17.0 transitions broadcast_arrays to return
+        read-only arrays. Set writeability explicitly to avoid warnings.
+        Retain the old writeability rules, as our Cython code assumes
+        the old behavior.
+        """
+        x, y = np.broadcast_arrays(a, b)
+        x.flags.writeable = a.flags.writeable
+        y.flags.writeable = b.flags.writeable
+        return x, y
+    
+    @staticmethod
+    def _compatible_boolean_index(idx, desired_ndim):
+        """Check for boolean array or array-like. peek before asarray for
+        array-like"""
+        # use attribute ndim to indicate a compatible array and check dtype
+        # if not, look at 1st element as quick rejection of bool, else slower
+        # asanyarray
+        if not hasattr(idx, 'ndim'):
+            # is first element boolean?
+            try:
+                ix = next(iter(idx), None)
+                for _ in range(desired_ndim):
+                    if isinstance(ix, bool):
+                        break
+                    ix = next(iter(ix), None)
+                else:
+                    return None
+            except TypeError:
+                return None
+            # since first is boolean, construct array and check all elements
+            idx = np.asanyarray(idx)
+    
+        if idx.dtype.kind == 'b':
+            return idx
+        return None
+    
+    def _validate_indices(self, key):
+        """Returns two tuples: (index tuple, requested shape tuple)"""
+        # single ellipsis
+        if key is Ellipsis:
+            return (slice(None),) * self.ndim, self.shape
+
+        if not isinstance(key, tuple):
+            key = [key]
+
+        ellps_pos = None
+        index_1st = []
+        prelim_ndim = 0
+        for i, idx in enumerate(key):
+            if idx is ...:
+                if ellps_pos is not None:
+                    error_message = \
+                        'an index can only have a single ellipsis'
+                    raise IndexError(error_message)
+                ellps_pos = i
+            elif idx is None:
+                index_1st.append(idx)
+            elif isinstance(idx, slice) or isintlike(idx):
+                index_1st.append(idx)
+                prelim_ndim += 1
+            else:
+                ix = self._compatible_boolean_index(idx, self.ndim)
+                if ix is not None:
+                    index_1st.append(ix)
+                    prelim_ndim += ix.ndim
+                elif sparse.issparse(idx):
+                    raise IndexError(
+                        'Indexing with sparse matrices is not supported '
+                        'except boolean indexing where matrix and index '
+                        'are equal shapes.')
+                else:  # dense array
+                    index_1st.append(np.asarray(idx))
+                    prelim_ndim += 1
+        ellip_slices = (self.ndim - prelim_ndim) * [slice(None)]
+        if ellip_slices:
+            if ellps_pos is None:
+                index_1st.extend(ellip_slices)
+            else:
+                index_1st = index_1st[:ellps_pos] + ellip_slices + \
+                            index_1st[ellps_pos:]
+
+        # second pass (have processed ellipsis and preprocessed arrays)
+        idx_shape = []
+        index_ndim = 0
+        index = []
+        array_indices = []
+        for i, idx in enumerate(index_1st):
+            if idx is None:
+                idx_shape.append(1)
+            elif isinstance(idx, slice):
+                index.append(idx)
+                Ms = self._shape[index_ndim]
+                len_slice = len(range(*idx.indices(Ms)))
+                idx_shape.append(len_slice)
+                index_ndim += 1
+            elif isintlike(idx):
+                N = self._shape[index_ndim]
+                if not -N <= idx < N:
+                    error_message = f'index ({idx}) out of range'
+                    raise IndexError(error_message)
+                idx = int(idx + N if idx < 0 else idx)
+                index.append(idx)
+                index_ndim += 1
+            # bool array (checked in first pass)
+            elif idx.dtype.kind == 'b':
+                ix = idx
+                tmp_ndim = index_ndim + ix.ndim
+                mid_shape = self._shape[index_ndim:tmp_ndim]
+                if ix.shape != mid_shape:
+                    error_message = (
+                        f'bool index {i} has shape {mid_shape} instead of '
+                        f'{ix.shape}')
+                    raise IndexError(error_message)
+                index.extend(ix.nonzero())
+                array_indices.extend(range(index_ndim, tmp_ndim))
+                index_ndim = tmp_ndim
+            else:  # dense array
+                N = self._shape[index_ndim]
+                idx = self._asindices(idx, N)
+                index.append(idx)
+                array_indices.append(index_ndim)
+                index_ndim += 1
+        if index_ndim > self.ndim:
+            error_message = (
+                f'invalid index ndim. Array is {self.ndim}D. Index needs '
+                f'{index_ndim}D')
+            raise IndexError(error_message)
+        if len(array_indices) > 1:
+            idx_arrays = \
+                self._broadcast_arrays(*(index[i] for i in array_indices))
+            if any(idx_arrays[0].shape != ix.shape
+                   for ix in idx_arrays[1:]):
+                shapes = " ".join(str(ix.shape) for ix in idx_arrays)
+                error_message = (
+                    f'shape mismatch: indexing arrays could not be '
+                    f'broadcast together with shapes {shapes}')
+                raise IndexError(error_message)
+            idx_shape = list(idx_arrays[0].shape) + idx_shape
+        elif len(array_indices) == 1:
+            arr_index = array_indices[0]
+            arr_shape = list(index[arr_index].shape)
+            idx_shape = idx_shape[:arr_index] + arr_shape + \
+                        idx_shape[arr_index:]
+        ndim = len(idx_shape)
+        if ndim > 2:
+            error_message = \
+                f'Only 1D or 2D arrays allowed. Index makes {ndim}D'
+            raise IndexError(error_message)
+        return tuple(index), tuple(idx_shape)
     
     @property
     def num_threads(self) -> int:
@@ -2695,7 +3076,7 @@ class cs_matrix(_cs_matrix):
             return result
 
         # pass 1: count idx entries and compute new indptr
-        col_offsets = np.zeros(N, dtype=idx_dtype)
+        col_offsets = np.empty(N, dtype=idx_dtype)
         res_indptr = np.empty_like(self.indptr, dtype=idx_dtype)
         csr_column_index1(
             k,
@@ -2899,6 +3280,20 @@ class csr_array(cs_matrix, sparse.csr_array):
         result._has_canonical_format = self._has_canonical_format
         return result
         
+    def equals(self, other: Any) -> bool:
+        """
+        Determine whether this `csr_array` equals another object.
+        
+        Args:
+            other: another object
+
+        Returns:
+            `True` if `other` is a `csr_array` and has `data`, `indices` and 
+            `indptr` all equal to this one's, `False` otherwise. NaNs will 
+            always compare equal.  
+        """
+        return isinstance(other, csr_array) and sparse_equal(self, other)
+    
     def _getrow(self, i):
         """Returns a copy of row i of the matrix, as a (1 x n)
         CSR matrix (row vector).
@@ -3043,7 +3438,21 @@ class csc_array(cs_matrix, sparse.csc_array):
         result._has_sorted_indices = self._has_sorted_indices
         result._has_canonical_format = self._has_canonical_format
         return result
+    
+    def equals(self, other: Any) -> bool:
+        """
+        Determine whether this `csc_array` equals another object.
         
+        Args:
+            other: another object
+
+        Returns:
+            `True` if `other` is a `csc_array` and has `data`, `indices` and 
+            `indptr` all equal to this one's, `False` otherwise. NaNs will 
+            always compare equal.  
+        """
+        return isinstance(other, csc_array) and sparse_equal(self, other)
+    
     def _getrow(self, i):
         """Returns a copy of row i of the matrix, as a (1 x n)
         CSR matrix (row vector).
@@ -3288,46 +3697,9 @@ _uninitialized_vector_import = '''
                 T& emplace_back(...) except +
 '''
 
-# Functions for k-means clustering and nearest-neighbors search
+# Functions for min- and max-heaps
 
-_kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
-        from cpython.exc cimport PyErr_CheckSignals
-        from cython.parallel cimport parallel, prange, threadid
-        from libc.string cimport memcpy
-        from libcpp.algorithm cimport fill
-        from libcpp.cmath cimport sqrt
-        from libcpp.vector cimport vector
-        from scipy.linalg.cython_blas cimport sgemm
-        
-        cdef extern from "float.h":
-            cdef float FLT_MAX
-
-        cdef extern from "limits.h":
-            cdef unsigned UINT_MAX
-
-        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
-            cdef unsigned long x = state[0]
-            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
-            cdef unsigned s = (x ^ (x >> 18)) >> 27
-            cdef unsigned rot = x >> 59
-            return (s >> rot) | (s << ((-rot) & 31))
-
-        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
-            cdef unsigned long state = seed + 1442695040888963407UL
-            rand(&state)
-            return state
-
-        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
-            cdef unsigned r, threshold = -bound % bound
-            while True:
-                r = rand(state)
-                if r >= threshold:
-                    return r % bound
-        
-        cdef inline float random_probability(unsigned long* state) noexcept nogil:
-            # Returns a random probability, i.e. a random number in U(0, 1)
-            return <float> rand(state) / UINT_MAX
-            
+_heap_functions = '''
         cdef inline void max_heap_replace_top(unsigned* labels_i,
                                               float* distances_i,
                                               const unsigned label,
@@ -3393,7 +3765,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 distances_i[k - j - 1] = distance
                 labels_i[k - j - 1] = label
 
-        cdef inline void min_heap_replace_top(unsigned* neighbors_i,
+        cdef inline void min_heap_replace_top(unsigned* labels_i,
                                               float* distances_i,
                                               const unsigned label,
                                               const float distance,
@@ -3404,7 +3776,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             
             cdef unsigned j = 1, child
             distances_i -= 1  # use 1-based indexing for easier node->child translation
-            neighbors_i -= 1
+            labels_i -= 1
             while True:
                 child = j << 1
                 if child > k:
@@ -3413,12 +3785,12 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 if distance < distances_i[child]:
                     break
                 distances_i[j] = distances_i[child]
-                neighbors_i[j] = neighbors_i[child]
+                labels_i[j] = labels_i[child]
                 j = child
             distances_i[j] = distance
-            neighbors_i[j] = label
+            labels_i[j] = label
         
-        cdef inline void min_heap_pop(unsigned* neighbors_i,
+        cdef inline void min_heap_pop(unsigned* labels_i,
                                       float* distances_i,
                                       const unsigned k) noexcept nogil:
             # Pops the top element from the min-heap defined by `distances_i[0..k-1]` and
@@ -3427,9 +3799,9 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             cdef unsigned label, j = 1, child
             cdef float distance
             distances_i -= 1  # use 1-based indexing for easier node->child translation
-            neighbors_i -= 1
+            labels_i -= 1
             distance = distances_i[k]
-            label = neighbors_i[k]
+            label = labels_i[k]
             while True:
                 child = j << 1
                 if child > k:
@@ -3438,12 +3810,12 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 if distance < distances_i[child]:
                     break
                 distances_i[j] = distances_i[child]
-                neighbors_i[j] = neighbors_i[child]
+                labels_i[j] = labels_i[child]
                 j = child
             distances_i[j] = distance
-            neighbors_i[j] = label
+            labels_i[j] = label
         
-        cdef inline void min_heap_sort(unsigned* neighbors_i,
+        cdef inline void min_heap_sort(unsigned* labels_i,
                                        float* distances_i,
                                        const unsigned k) noexcept nogil:
             cdef unsigned j, label
@@ -3451,26 +3823,85 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             for j in range(k):
                 # Save the root (minimum element)
                 distance = distances_i[0]
-                label = neighbors_i[0]
+                label = labels_i[0]
                 # Restore the heap property with reduced size `k - i`
-                min_heap_pop(neighbors_i, distances_i, k - j)
+                min_heap_pop(labels_i, distances_i, k - j)
                 # Place the minimum element after the end of the heap
                 distances_i[k - j - 1] = distance
-                neighbors_i[k - j - 1] = label
+                labels_i[k - j - 1] = label
+'''
+
+# Functions for k-means clustering and nearest-neighbors search
+
+_kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + _heap_functions + r'''
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libc.float cimport FLT_MAX
+        from libc.limits cimport UINT_MAX
+        from libc.string cimport memcpy
+        from libcpp.algorithm cimport fill
+        from libcpp.cmath cimport sqrt
+        from libcpp.vector cimport vector
+        from scipy.linalg.cython_blas cimport sgemm as sgemm_
+
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+
+        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+            cdef unsigned r, threshold = -bound % bound
+            while True:
+                r = rand(state)
+                if r >= threshold:
+                    return r % bound
         
+        cdef inline float random_uniform(unsigned long* state) noexcept nogil:
+            # Returns a random number in U(0, 1)
+            return <float> rand(state) / UINT_MAX
+        
+        cdef inline void sgemm(const char transa,
+                               const char transb,
+                               const int m,
+                               const int n,
+                               const int k,
+                               const float alpha,
+                               const float* a,
+                               const int lda,
+                               const float* b,
+                               const int ldb,
+                               const float beta,
+                               float* c,
+                               const int ldc) noexcept nogil:
+            # Matrix multiplication wrapper that accepts scalars by value and
+            # provides const-correctness
+            
+            sgemm_(<char*> &transa, <char*> &transb, <int*> &m, <int*> &n, <int*> &k,
+                   <float*> &alpha, <float*> a, <int*> &lda, <float*> b, <int*> &ldb,
+                   <float*> &beta, c, <int*> &ldc)
+
         cdef inline void kmeans_random_init(const float[:, ::1] X,
                                             float[:, ::1] centroids,
                                             const unsigned num_cells,
                                             const unsigned num_clusters,
-                                            const unsigned long seed) noexcept nogil:
+                                            const unsigned long seed):
             # Initialize centroids with random cells. Use a bitmap to efficiently keep
             # track of which cells have been sampled already, to avoid sampling the
             # same cell twice.
             
             cdef unsigned i, j
             cdef unsigned long word_index, bit_index, state = srand(seed)
-            cdef vector[unsigned long] bitmap
-            bitmap.resize((num_cells + 63) // 64)
+            cdef vector[unsigned long] bitmap_buffer
+            bitmap_buffer.resize((num_cells + 63) / 64)
+            cdef unsigned long[::1] bitmap = \
+                <unsigned long[:(num_cells + 63) / 64]> bitmap_buffer.data()
             
             for i in range(num_clusters):
                 while True:
@@ -3503,12 +3934,15 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 min_distance, inverse_cost, probability, alpha = -2, beta = 1, \
                 l = oversampling_factor * num_clusters
             cdef char transA = b'T', transB = b'N'
-            cdef uninitialized_vector[float] X_norms, min_distances, \
-                newly_selected_X, chunk_costs
-            cdef vector[unsigned] best_selected_cells, selected_cells, \
-                selected_cell_weights
-            cdef uninitialized_vector[unsigned] centroid_indices
-            cdef uninitialized_vector[float] distances
+            cdef uninitialized_vector[float] min_distances_buffer, X_norms_buffer, \
+                newly_selected_X_buffer, distances_buffer, chunk_costs_buffer
+            cdef vector[unsigned] best_selected_cells_buffer, selected_cells, \
+                selected_cell_weights_buffer
+            cdef uninitialized_vector[unsigned] centroid_indices_buffer
+            cdef float[::1] min_distances, X_norms, chunk_costs
+            cdef float[:, ::1] newly_selected_X, distances
+            cdef unsigned[::1] best_selected_cells, selected_cell_weights, \
+                centroid_indices
             
             # Reserve 25% more than the expected number to be safe
             selected_cells.reserve(<unsigned> (1.25 * num_init_iterations * l))
@@ -3523,8 +3957,10 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             # Calculate the (squared Euclidean) distance from each cell to the
             # random cell, storing it in `min_distances`. In the same loop, also
             # calculate the squared L2 norm of each cell, ||X||².
-            min_distances.resize(num_cells)
-            X_norms.resize(num_cells)
+            min_distances_buffer.resize(num_cells)
+            min_distances = <float[:num_cells]> min_distances_buffer.data()
+            X_norms_buffer.resize(num_cells)
+            X_norms = <float[:num_cells]> X_norms_buffer.data()
             for i in range(num_cells):
                 difference = X[i, 0] - X[random_cell, 0]
                 distance = difference * difference
@@ -3548,7 +3984,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             l_over_cost = l / cost
             for i in range(num_cells):
                 state = srand(seed + i)
-                if l_over_cost * min_distances[i] >= random_probability(&state):
+                if l_over_cost * min_distances[i] >= random_uniform(&state):
                     selected_cells.push_back(i)
                     min_distances[i] = 0
             
@@ -3566,13 +4002,16 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             # now itself. `best_selected_cells` starts off at 0 for non-newly
             # selected cells, i.e. they still have the initial random cell
             # (`selected_cells[0]`) listed as their closest centroid candidate.
-            best_selected_cells.resize(num_cells)
+            best_selected_cells_buffer.resize(num_cells)
+            best_selected_cells = <unsigned[:num_cells]> \
+                best_selected_cells_buffer.data()
             for i in range(num_previously_selected_cells, num_selected_cells):
                 selected_cell = selected_cells[i]
                 best_selected_cells[selected_cell] = i
             
             # For each remaining iteration...
-            chunk_costs.resize(num_chunks)
+            chunk_costs_buffer.resize(num_chunks)
+            chunk_costs = <float[:num_chunks]> chunk_costs_buffer.data()
             iteration = 1
             while True:
                 # For very small datasets, it's possible no cells are selected
@@ -3580,11 +4019,13 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 # calculations and go straight to sampling more cells.
                 if num_newly_selected_cells > 0:
                     # Copy newly selected cells into a temporary buffer
-                    newly_selected_X.resize(num_newly_selected_cells * num_dimensions)
+                    newly_selected_X_buffer.resize(num_newly_selected_cells * num_dimensions)
+                    newly_selected_X = \
+                        <float[:num_newly_selected_cells, :num_dimensions]> \
+                        newly_selected_X_buffer.data()
                     for i in range(num_newly_selected_cells):
                         selected_cell = selected_cells[num_previously_selected_cells + i]
-                        memcpy(newly_selected_X.data() + i * num_dimensions,
-                               &X[selected_cell, 0], num_dimensions * sizeof(float))
+                        newly_selected_X[i, :] = X[selected_cell, :]
                     
                     # Update each cell's nearest candidate centroid selected so far
                     # (`best_selected_cells`) and distance to this candidate centroid
@@ -3595,7 +4036,9 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # ||X - C||² = ||X||² - 2 * X.dot(C.T) + ||C||²
                     # but add the ||X||² at the end since the minimum distance for
                     # a given cell doesn't depend on ||X||².
-                    distances.resize(chunk_size * num_newly_selected_cells)
+                    distances_buffer.resize(chunk_size * num_newly_selected_cells)
+                    distances = <float[:chunk_size, :num_newly_selected_cells]> \
+                        distances_buffer.data()
                     for chunk_index in range(num_chunks):
                         chunk_cost = 0
                         start = chunk_index * chunk_size
@@ -3606,16 +4049,14 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                 # distances = ||C||²
                                 selected_cell = \
                                     selected_cells[num_previously_selected_cells + j]
-                                distances[i * num_newly_selected_cells + j] = \
-                                    X_norms[selected_cell]
+                                distances[i, j] = X_norms[selected_cell]
                         
                         # distances -= 2 * X.dot(C.T)
-                        sgemm(&transA, &transB, <int*> &num_newly_selected_cells,
-                              <int*> &chunk_num_cells, <int*> &num_dimensions,
-                              <float*> &alpha, <float*> newly_selected_X.data(),
-                              <int*> &num_dimensions, <float*> &X[start, 0],
-                              <int*> &num_dimensions, <float*> &beta,
-                              distances.data(), <int*> &num_newly_selected_cells)
+                        sgemm(transA, transB, num_newly_selected_cells,
+                              chunk_num_cells, num_dimensions, alpha,
+                              &newly_selected_X[0, 0], num_dimensions, &X[start, 0],
+                              num_dimensions, beta, &distances[0, 0],
+                              num_newly_selected_cells)
                         
                         # distances += ||X||², and find the best distance. As an
                         # optimization, to avoid having to add `X_norms[start + i]`
@@ -3630,7 +4071,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             min_distance = min_distances[start + i] - X_norms[start + i]
                             best_selected_cell = best_selected_cells[start + i] - num_previously_selected_cells
                             for j in range(num_newly_selected_cells):
-                                distance = distances[i * num_newly_selected_cells + j]
+                                distance = distances[i, j]
                                 if distance < min_distance:
                                     min_distance = distance
                                     best_selected_cell = j
@@ -3654,7 +4095,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 l_over_cost = l / cost
                 for i in range(num_cells):
                     state = srand(seed + i * iteration)
-                    probability = random_probability(&state)
+                    probability = random_uniform(&state)
                     if l_over_cost * min_distances[i] >= probability:
                         selected_cells.push_back(i)
                         min_distances[i] = 0
@@ -3690,7 +4131,9 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             # whittle down to the final centroids. Get the weight for each selected
             # cell: the number of cells that are closer to the selected cell than
             # to any other selected cell.
-            selected_cell_weights.resize(num_selected_cells)
+            selected_cell_weights_buffer.resize(num_selected_cells)
+            selected_cell_weights = <unsigned[:num_selected_cells]> \
+                selected_cell_weights_buffer.data()
             for i in range(num_cells):
                 best_selected_cell = best_selected_cells[i]
                 selected_cell_weights[best_selected_cell] += 1
@@ -3700,7 +4143,8 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             # random cell from our selected cells as the first centroid.
             state = srand(seed - 2)
             random_cell = selected_cells[randint(num_selected_cells, &state)]
-            centroid_indices.resize(num_clusters)
+            centroid_indices_buffer.resize(num_clusters)
+            centroid_indices = <unsigned[:num_clusters]> centroid_indices_buffer.data()
             centroid_indices[0] = random_cell
             centroids[0] = X[random_cell]
             
@@ -3735,7 +4179,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 # `min_distances[i] / cost`. Set `min_distances` to 0 for the
                 # sampled cell, to avoid sampling it twice.
                 inverse_cost = 1 / cost
-                probability = random_probability(&state)
+                probability = random_uniform(&state)
                 i = 0
                 while True:
                     probability -= min_distances[i] * inverse_cost
@@ -3795,15 +4239,19 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 min_distance, inverse_cost, probability, alpha = -2, beta = 1, \
                 l = oversampling_factor * num_clusters
             cdef char transA = b'T', transB = b'N'
-            cdef uninitialized_vector[float] X_norms, min_distances, \
-                newly_selected_X, chunk_costs
-            cdef vector[unsigned] best_selected_cells, selected_cells, \
+            cdef uninitialized_vector[float] min_distances_buffer, X_norms_buffer, \
+                newly_selected_X, chunk_costs_buffer
+            cdef vector[unsigned] best_selected_cells_buffer, selected_cells, \
                 selected_cell_weights
-            cdef uninitialized_vector[unsigned] centroid_indices
+            cdef uninitialized_vector[unsigned] centroid_indices_buffer
             cdef vector[uninitialized_vector[float]] thread_distances
             cdef vector[vector[unsigned]] thread_selected_cells, \
                 thread_selected_cell_weights
-            
+            cdef float[::1] min_distances, X_norms, chunk_costs
+            cdef unsigned[::1] best_selected_cells, centroid_indices
+            cdef unsigned* cell_weights
+            cdef float* distance_pointer
+
             # Reserve 25% more than the expected number to be safe
             selected_cells.reserve(<unsigned> (1.25 * num_init_iterations * l))
             
@@ -3814,12 +4262,14 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             random_cell = randint(num_cells, &state)
             selected_cells.push_back(random_cell)
             
+            # Calculate the (squared Euclidean) distance from each cell to the random
+            # cell, storing it in `min_distances`. In the same loop, also calculate the
+            # squared L2 norm of each cell, ||X||².
+            min_distances_buffer.resize(num_cells)
+            min_distances = <float[:num_cells]> min_distances_buffer.data()
+            X_norms_buffer.resize(num_cells)
+            X_norms = <float[:num_cells]> X_norms_buffer.data()
             with nogil:
-                # Calculate the (squared Euclidean) distance from each cell to the
-                # random cell, storing it in `min_distances`. In the same loop, also
-                # calculate the squared L2 norm of each cell, ||X||².
-                min_distances.resize(num_cells)
-                X_norms.resize(num_cells)
                 for i in prange(num_cells, num_threads=num_threads):
                     difference = X[i, 0] - X[random_cell, 0]
                     distance = difference * difference
@@ -3850,7 +4300,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     c1 = num_cells * (thread_index + 1) / num_threads
                     for i in range(c0, c1):
                         state = srand(seed + i)
-                        if l_over_cost * min_distances[i] >= random_probability(&state):
+                        if l_over_cost * min_distances[i] >= random_uniform(&state):
                             thread_selected_cells[thread_index].push_back(i)
                             min_distances[i] = 0
             
@@ -3875,13 +4325,16 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             # now itself. `best_selected_cells` starts off at 0 for non-newly
             # selected cells, i.e. they still have the initial random cell
             # (`selected_cells[0]`) listed as their closest centroid candidate.
-            best_selected_cells.resize(num_cells)
+            best_selected_cells_buffer.resize(num_cells)
+            best_selected_cells = <unsigned[:num_cells]> \
+                best_selected_cells_buffer.data()
             for i in range(num_previously_selected_cells, num_selected_cells):
                 selected_cell = selected_cells[i]
                 best_selected_cells[selected_cell] = i
             
             # For each remaining iteration...
-            chunk_costs.resize(num_chunks)
+            chunk_costs_buffer.resize(num_chunks)
+            chunk_costs = <float[:num_chunks]> chunk_costs_buffer.data()
             thread_distances.resize(num_threads)
             iteration = 1
             while True:
@@ -3891,11 +4344,15 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # calculations and go straight to sampling more cells.
                     if num_newly_selected_cells > 0:
                         # Copy newly selected cells into a temporary buffer
-                        newly_selected_X.resize(num_newly_selected_cells * num_dimensions)
-                        for i in prange(num_newly_selected_cells, num_threads=num_threads):
-                            selected_cell = selected_cells[num_previously_selected_cells + i]
+                        newly_selected_X.resize(
+                            num_newly_selected_cells * num_dimensions)
+                        for i in prange(num_newly_selected_cells,
+                                        num_threads=num_threads):
+                            selected_cell = selected_cells[
+                                num_previously_selected_cells + i]
                             memcpy(newly_selected_X.data() + i * num_dimensions,
-                                   &X[selected_cell, 0], num_dimensions * sizeof(float))
+                                   &X[selected_cell, 0],
+                                   num_dimensions * sizeof(float))
                         
                         # Update each cell's nearest candidate centroid selected so far
                         # (`best_selected_cells`) and distance to this candidate centroid
@@ -3908,7 +4365,9 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         # a given cell doesn't depend on ||X||².
                         with parallel(num_threads=num_threads):
                             thread_index = threadid()
-                            thread_distances[thread_index].resize(chunk_size * num_newly_selected_cells)
+                            thread_distances[thread_index].resize(
+                                chunk_size * num_newly_selected_cells)
+                            distance_pointer = thread_distances[thread_index].data()
                             for chunk_index in prange(num_chunks):
                                 chunk_cost = 0
                                 start = chunk_index * chunk_size
@@ -3919,17 +4378,15 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                         # distances = ||C||²
                                         selected_cell = \
                                             selected_cells[num_previously_selected_cells + j]
-                                        thread_distances[thread_index][
-                                            i * num_newly_selected_cells + j] = \
+                                        distance_pointer[i * num_newly_selected_cells + j] = \
                                             X_norms[selected_cell]
                                 
                                 # distances -= 2 * X.dot(C.T)
-                                sgemm(&transA, &transB, <int*> &num_newly_selected_cells,
-                                      <int*> &chunk_num_cells, <int*> &num_dimensions,
-                                      <float*> &alpha, <float*> newly_selected_X.data(),
-                                      <int*> &num_dimensions, <float*> &X[start, 0],
-                                      <int*> &num_dimensions, <float*> &beta,
-                                      thread_distances[thread_index].data(), <int*> &num_newly_selected_cells)
+                                sgemm(transA, transB, num_newly_selected_cells,
+                                      chunk_num_cells, num_dimensions, alpha,
+                                      newly_selected_X.data(), num_dimensions,
+                                      &X[start, 0], num_dimensions, beta,
+                                      distance_pointer, num_newly_selected_cells)
                                 
                                 # distances += ||X||², and find the best distance. As an
                                 # optimization, to avoid having to add `X_norms[start + i]`
@@ -3944,7 +4401,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                     min_distance = min_distances[start + i] - X_norms[start + i]
                                     best_selected_cell = best_selected_cells[start + i] - num_previously_selected_cells
                                     for j in range(num_newly_selected_cells):
-                                        distance = thread_distances[thread_index][i * num_newly_selected_cells + j]
+                                        distance = distance_pointer[i * num_newly_selected_cells + j]
                                         if distance < min_distance:
                                             min_distance = distance
                                             best_selected_cell = j
@@ -3973,7 +4430,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         c1 = num_cells * (thread_index + 1) / num_threads
                         for i in range(c0, c1):
                             state = srand(seed + i * iteration)
-                            probability = random_probability(&state)
+                            probability = random_uniform(&state)
                             if l_over_cost * min_distances[i] >= probability:
                                 thread_selected_cells[thread_index].push_back(i)
                                 min_distances[i] = 0
@@ -4011,6 +4468,8 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         num_selected_cells == num_cells:
                     break
             
+            centroid_indices_buffer.resize(num_clusters)
+            centroid_indices = <unsigned[:num_clusters]> centroid_indices_buffer.data()
             with nogil:
                 # Now we are done selecting cells as candidate centroids and need to
                 # whittle down to the final centroids. Get the weight for each selected
@@ -4032,20 +4491,21 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             selected_cell_weights[best_selected_cell] += 1
                     else:
                         thread_selected_cell_weights[thread_index].resize(num_selected_cells)
+                        cell_weights = thread_selected_cell_weights[thread_index].data()
                         end = start + chunk_size_2
                         for i in range(start, end):
                             best_selected_cell = best_selected_cells[i]
-                            thread_selected_cell_weights[thread_index][best_selected_cell] += 1
+                            cell_weights[best_selected_cell] += 1
                 for thread_index in range(num_threads - 1):
+                    cell_weights = thread_selected_cell_weights[thread_index].data()
                     for i in range(num_selected_cells):
-                        selected_cell_weights[i] += thread_selected_cell_weights[thread_index][i]
+                        selected_cell_weights[i] += cell_weights[i]
                 
                 # Run k-means++ to select `num_clusters` of the selected cells as the
                 # centroids, using `selected_cell_weights` as weights. Start by selecting a
                 # random cell from our selected cells as the first centroid.
                 state = srand(seed - 2)
                 random_cell = selected_cells[randint(num_selected_cells, &state)]
-                centroid_indices.resize(num_clusters)
                 centroid_indices[0] = random_cell
                 centroids[0] = X[random_cell]
                 
@@ -4079,7 +4539,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # `min_distances[i] / cost`. Set `min_distances` to 0 for the
                     # sampled cell, to avoid sampling it twice.
                     inverse_cost = 1 / cost
-                    probability = random_probability(&state)
+                    probability = random_uniform(&state)
                     i = 0
                     while True:
                         probability -= min_distances[i] * inverse_cost
@@ -4131,8 +4591,10 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 num_clusters = centroids.shape[0]
             cdef float distance, difference
             cdef vector[unsigned] empty_cluster_indices
-            cdef uninitialized_vector[unsigned] farthest_cells
-            cdef uninitialized_vector[float] farthest_distances
+            cdef uninitialized_vector[unsigned] farthest_cells_buffer
+            cdef uninitialized_vector[float] farthest_distances_buffer
+            cdef unsigned[::1] farthest_cells
+            cdef float[::1] farthest_distances
             cdef str error_message
             
             # Collect indices of empty clusters
@@ -4147,8 +4609,10 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
             
             # Find the `num_empty` farthest points from their assigned centroids,
             # using a min-heap to keep track of the `num_empty` largest distances
-            farthest_cells.resize(num_empty)
-            farthest_distances.resize(num_empty)
+            farthest_cells_buffer.resize(num_empty)
+            farthest_cells = <unsigned[:num_empty]> farthest_cells_buffer.data()
+            farthest_distances_buffer.resize(num_empty)
+            farthest_distances = <float[:num_empty]> farthest_distances_buffer.data()
             for i in range(num_empty):
                 farthest_distances[i] = -FLT_MAX
             for i in range(num_cells):
@@ -4159,12 +4623,11 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     difference = X[i, k] - centroids[j, k]
                     distance = distance + difference * difference
                 if distance > farthest_distances[0]:
-                    min_heap_replace_top(farthest_cells.data(),
-                                         farthest_distances.data(),
-                                         i, distance, num_empty)
+                    min_heap_replace_top(&farthest_cells[0], &farthest_distances[0], i,
+                                         distance, num_empty)
                                        
             # Sort the heap to get distances in descending order
-            min_heap_sort(farthest_cells.data(), farthest_distances.data(), num_empty)
+            min_heap_sort(&farthest_cells[0], &farthest_distances[0], num_empty)
             
             # Check if any of the farthest distances are 0
             if farthest_distances[0] == 0:
@@ -4226,12 +4689,11 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     difference = X[i, k] - centroids[j, k]
                     distance = distance + difference * difference
                 if distance > farthest_distances[0]:
-                    min_heap_replace_top(farthest_cells.data(),
-                                         farthest_distances.data(),
-                                         i, distance, num_empty)
+                    min_heap_replace_top(&farthest_cells[0], &farthest_distances[0], i,
+                                         distance, num_empty)
                                        
             # Sort the heap to get distances in descending order
-            min_heap_sort(farthest_cells.data(), farthest_distances.data(), num_empty)
+            min_heap_sort(&farthest_cells[0], &farthest_distances[0], num_empty)
             
             # Check if any of the farthest distances are 0
             if farthest_distances[0] == 0:
@@ -4274,10 +4736,8 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     distances[i * num_B + j] = B_norms[j]
             
             # distances -= 2 * A.dot(B.T)
-            sgemm(&transA, &transB, <int*> &num_B, <int*> &num_A,
-                  <int*> &num_dimensions, <float*> &alpha, <float*> B,
-                  <int*> &num_dimensions, <float*> A, <int*> &num_dimensions,
-                  <float*> &beta, distances, <int*> &num_B)
+            sgemm(transA, transB, num_B, num_A, num_dimensions, alpha, B,
+                  num_dimensions, A, num_dimensions, beta, distances, num_B)
         
         def kmeans(const float[:, ::1] X,
                    unsigned[::1] cluster_labels,
@@ -4290,26 +4750,28 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                    const unsigned num_kmeans_iterations,
                    const unsigned chunk_size,
                    const unsigned long seed,
-                   const unsigned num_threads):
+                   unsigned num_threads):
             cdef unsigned i, j, k, l, iteration, best_cluster, thread_index, \
                 chunk_index, start, chunk_num_cells, num_empty, \
                 num_cells = X.shape[0], num_clusters = centroids.shape[0], \
                 num_dimensions = centroids.shape[1], \
-                num_chunks = (num_cells + chunk_size - 1) / chunk_size, \
-                num_lloyd_threads = min(num_threads, num_chunks)
+                num_chunks = (num_cells + chunk_size - 1) / chunk_size
             cdef unsigned long state = srand(seed)
             cdef float difference, distance, min_distance, norm, \
                 inv_cells_minus_clusters = 1.0 / (num_cells - num_clusters), \
                 one_plus_eps = 1025.0 / 1024, one_minus_eps = 1023.0 / 1024
-            cdef uninitialized_vector[float] centroid_norms
-            cdef uninitialized_vector[float] chunk_centroids_new
+            cdef uninitialized_vector[float] centroid_norms_buffer, \
+                chunk_centroids_new_buffer, distances_buffer
             cdef vector[vector[unsigned]] thread_num_cells_per_cluster
-            cdef uninitialized_vector[float] distances
             cdef vector[uninitialized_vector[float]] thread_distances
-            cdef float[:, ::1] temp
-            cdef float* centroids_new_this_chunk
+            cdef float[::1] centroid_norms
+            cdef float[:, ::1] distances, temp
+            cdef float[:, :, ::1] chunk_centroids_new
+            cdef float* distance_pointer
+            cdef unsigned* num_cells_per_cluster_pointer
             cdef str error_message
             
+            num_threads = min(num_threads, num_chunks)
             if num_threads == 1:
                 if kmeans_barbar:
                     # Initialize centroids with k-means||
@@ -4323,20 +4785,24 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 # 1. Run the E and M steps of k-means for `num_kmeans_iterations`
                 # iterations
                 
-                centroid_norms.resize(num_clusters)
-                chunk_centroids_new.resize(num_chunks * num_clusters * num_dimensions)
-                distances.resize(chunk_size * num_clusters)
+                centroid_norms_buffer.resize(num_clusters)
+                centroid_norms = <float[:num_clusters]> centroid_norms_buffer.data()
+                chunk_centroids_new_buffer.resize(num_chunks * num_clusters * num_dimensions)
+                chunk_centroids_new = <float[:num_chunks, :num_clusters, :num_dimensions]> \
+                    chunk_centroids_new_buffer.data()
+                distances_buffer.resize(chunk_size * num_clusters)
+                distances = <float[:chunk_size, :num_clusters]> distances_buffer.data()
                 
                 for iteration in range(num_kmeans_iterations):
                     centroids_new[:] = 0
                     num_cells_per_cluster[:] = 0
-                    fill(chunk_centroids_new.begin(), chunk_centroids_new.end(), 0)
+                    chunk_centroids_new[:] = 0
                     
                     # Calculate the squared L2 norm of each centroid, ||C||²
                     for i in range(num_clusters):
                         norm = centroids[i, 0] * centroids[i, 0]
                         for j in range(1, num_dimensions):
-                            norm = norm + centroids[i, j] * centroids[i, j]
+                            norm += centroids[i, j] * centroids[i, j]
                         centroid_norms[i] = norm
                     
                     # Run the E and M steps of Lloyd's algorithm in chunks
@@ -4351,8 +4817,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         # but skip calculating the ||X||² term since the best
                         # cluster for a given cell does not depend on ||X||².
                         partial_distances(&X[start, 0], &centroids[0, 0],
-                                          centroid_norms.data(),
-                                          distances.data(),
+                                          &centroid_norms[0], &distances[0, 0],
                                           chunk_num_cells, num_clusters,
                                           num_dimensions)
                         
@@ -4364,21 +4829,18 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         # that were assigned to a centroid's cluster; we will
                         # normalize to get the mean later). Aggregate centroids
                         # by chunk, to allow deterministic parallelism.
-                        centroids_new_this_chunk = chunk_centroids_new.data() + \
-                            chunk_index * num_clusters * num_dimensions
                         for i in range(chunk_num_cells):
-                            min_distance = distances[i * num_clusters]
+                            min_distance = distances[i, 0]
                             best_cluster = 0
                             for j in range(1, num_clusters):
-                                distance = distances[i * num_clusters + j]
+                                distance = distances[i, j]
                                 if distance < min_distance:
                                     min_distance = distance
                                     best_cluster = j
                             cluster_labels[start + i] = best_cluster
                             num_cells_per_cluster[best_cluster] += 1
                             for j in range(num_dimensions):
-                                centroids_new_this_chunk[
-                                    best_cluster * num_dimensions + j] += \
+                                chunk_centroids_new[chunk_index, best_cluster, j] += \
                                     X[start + i, j]
                         
                     # Aggregate the contributions of each chunk to the new centroids.
@@ -4388,9 +4850,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         for chunk_index in range(num_chunks):
                             for j in range(num_dimensions):
                                 centroids_new[i, j] += \
-                                    chunk_centroids_new[
-                                        chunk_index * num_clusters * num_dimensions +
-                                        i * num_dimensions + j]
+                                    chunk_centroids_new[chunk_index, i, j]
                         if num_cells_per_cluster[i] > 0:
                             norm = 1.0 / num_cells_per_cluster[i]
                             for j in range(num_dimensions):
@@ -4400,9 +4860,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     relocate_empty_clusters(X, cluster_labels, centroids,
                                             centroids_new, num_cells_per_cluster)
                     
-                    # Swap `centroids` and `centroids_new` after each k-means
-                    # iteration (can't use `std::swap()` on memoryviews so do
-                    # it the old-fashioned way)
+                    # Swap `centroids` and `centroids_new` after each k-means iteration
                     temp = centroids
                     centroids = centroids_new
                     centroids_new = temp
@@ -4419,7 +4877,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 for i in range(num_clusters):
                     norm = centroids[i, 0] * centroids[i, 0]
                     for j in range(1, num_dimensions):
-                        norm = norm + centroids[i, j] * centroids[i, j]
+                        norm += centroids[i, j] * centroids[i, j]
                     centroid_norms[i] = norm
                     
                 # Run the E step of Lloyd's algorithm in chunks
@@ -4434,8 +4892,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # but skip calculating the ||X||² term since the best
                     # cluster for a given cell does not depend on ||X||².
                     partial_distances(&X[start, 0], &centroids[0, 0],
-                                      centroid_norms.data(),
-                                      distances.data(),
+                                      &centroid_norms[0], &distances[0, 0],
                                       chunk_num_cells, num_clusters,
                                       num_dimensions)
                     
@@ -4443,10 +4900,10 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # i.e. the cell's cluster assignment. Keep track of how
                     # many cells were assigned to each cluster.
                     for i in range(chunk_num_cells):
-                        min_distance = distances[i * num_clusters]
+                        min_distance = distances[i, 0]
                         best_cluster = 0
                         for j in range(1, num_clusters):
-                            distance = distances[i * num_clusters + j]
+                            distance = distances[i, j]
                             if distance < min_distance:
                                 min_distance = distance
                                 best_cluster = j
@@ -4471,10 +4928,13 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 # 1. Run the E and M steps of k-means for `num_kmeans_iterations`
                 # iterations
                 
-                centroid_norms.resize(num_clusters)
-                chunk_centroids_new.resize(num_chunks * num_clusters * num_dimensions)
-                thread_num_cells_per_cluster.resize(num_lloyd_threads)
-                thread_distances.resize(num_lloyd_threads)
+                centroid_norms_buffer.resize(num_clusters)
+                centroid_norms = <float[:num_clusters]> centroid_norms_buffer.data()
+                chunk_centroids_new_buffer.resize(num_chunks * num_clusters * num_dimensions)
+                chunk_centroids_new = <float[:num_chunks, :num_clusters, :num_dimensions]> \
+                    chunk_centroids_new_buffer.data()
+                thread_num_cells_per_cluster.resize(num_threads)
+                thread_distances.resize(num_threads)
                 
                 for iteration in range(num_kmeans_iterations):
                     with nogil:
@@ -4486,9 +4946,9 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             centroid_norms[i] = norm
                         
                         # Run the E and M steps of Lloyd's algorithm in chunks
-                        with parallel(num_threads=num_lloyd_threads):
+                        with parallel(num_threads=num_threads):
                             thread_index = threadid()
-                            
+
                             # Allocate thread-local buffers to store temporary data for
                             # each chunk
                             if iteration == 0:
@@ -4498,6 +4958,9 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             else:
                                 fill(thread_num_cells_per_cluster[thread_index].begin(),
                                      thread_num_cells_per_cluster[thread_index].end(), 0)
+                            distance_pointer = thread_distances[thread_index].data()
+                            num_cells_per_cluster_pointer = \
+                                thread_num_cells_per_cluster[thread_index].data()
                             
                             for chunk_index in prange(num_chunks):
                                 start = chunk_index * chunk_size
@@ -4510,8 +4973,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                 # but skip calculating the ||X||² term since the best
                                 # cluster for a given cell does not depend on ||X||².
                                 partial_distances(&X[start, 0], &centroids[0, 0],
-                                                  centroid_norms.data(),
-                                                  thread_distances[thread_index].data(),
+                                                  &centroid_norms[0], distance_pointer,
                                                   chunk_num_cells, num_clusters,
                                                   num_dimensions)
                                 
@@ -4525,24 +4987,19 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                 # by chunk, to allow deterministic parallelism, but just
                                 # aggregate the number of cells in each cluster by thread
                                 # since they are not floating-point.
-                                centroids_new_this_chunk = chunk_centroids_new.data() + \
-                                    chunk_index * num_clusters * num_dimensions
-                                fill(centroids_new_this_chunk,
-                                     centroids_new_this_chunk +
-                                     num_clusters * num_dimensions, 0)
+                                chunk_centroids_new[chunk_index, :] = 0
                                 for i in range(chunk_num_cells):
-                                    min_distance = thread_distances[thread_index][i * num_clusters]
+                                    min_distance = distance_pointer[i * num_clusters]
                                     best_cluster = 0
                                     for j in range(1, num_clusters):
-                                        distance = thread_distances[thread_index][i * num_clusters + j]
+                                        distance = distance_pointer[i * num_clusters + j]
                                         if distance < min_distance:
                                             min_distance = distance
                                             best_cluster = j
                                     cluster_labels[start + i] = best_cluster
-                                    thread_num_cells_per_cluster[thread_index][best_cluster] += 1
+                                    num_cells_per_cluster_pointer[best_cluster] += 1
                                     for j in range(num_dimensions):
-                                        centroids_new_this_chunk[
-                                            best_cluster * num_dimensions + j] += \
+                                        chunk_centroids_new[chunk_index, best_cluster, j] += \
                                             X[start + i, j]
                         
                         # Aggregate the contributions of each thread/chunk to
@@ -4552,17 +5009,14 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         # instead of the sum.
                         for i in prange(num_clusters, num_threads=num_threads):
                             num_cells_per_cluster[i] = 0
-                            for thread_index in range(num_lloyd_threads):
+                            for thread_index in range(num_threads):
                                 num_cells_per_cluster[i] += \
                                     thread_num_cells_per_cluster[thread_index][i]
-                            fill(&centroids_new[i, 0],
-                                 &centroids_new[i, 0] + num_dimensions, 0)
+                            centroids_new[i, :] = 0
                             for chunk_index in range(num_chunks):
                                 for j in range(num_dimensions):
                                     centroids_new[i, j] += \
-                                        chunk_centroids_new[
-                                            chunk_index * num_clusters * num_dimensions +
-                                            i * num_dimensions + j]
+                                        chunk_centroids_new[chunk_index, i, j]
                             if num_cells_per_cluster[i] > 0:
                                 norm = 1.0 / num_cells_per_cluster[i]
                                 for j in range(num_dimensions):
@@ -4602,13 +5056,13 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         centroid_norms[i] = norm
                     
                     # Run the E step of Lloyd's algorithm in chunks
-                    with parallel(num_threads=num_lloyd_threads):
+                    with parallel(num_threads=num_threads):
                         thread_index = threadid()
-                        
-                        # Allocate thread-local buffers to store temporary data for
-                        # each chunk
                         fill(thread_num_cells_per_cluster[thread_index].begin(),
                              thread_num_cells_per_cluster[thread_index].end(), 0)
+                        distance_pointer = thread_distances[thread_index].data()
+                        num_cells_per_cluster_pointer = \
+                            thread_num_cells_per_cluster[thread_index].data()
                         
                         for chunk_index in prange(num_chunks):
                             start = chunk_index * chunk_size
@@ -4621,8 +5075,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             # but skip calculating the ||X||² term since the best
                             # cluster for a given cell does not depend on ||X||².
                             partial_distances(&X[start, 0], &centroids[0, 0],
-                                              centroid_norms.data(),
-                                              thread_distances[thread_index].data(),
+                                              &centroid_norms[0], distance_pointer,
                                               chunk_num_cells, num_clusters,
                                               num_dimensions)
                             
@@ -4630,21 +5083,21 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             # i.e. the cell's cluster assignment. Keep track of how
                             # many cells were assigned to each cluster.
                             for i in range(chunk_num_cells):
-                                min_distance = thread_distances[thread_index][i * num_clusters]
+                                min_distance = distance_pointer[i * num_clusters]
                                 best_cluster = 0
                                 for j in range(1, num_clusters):
-                                    distance = thread_distances[thread_index][i * num_clusters + j]
+                                    distance = distance_pointer[i * num_clusters + j]
                                     if distance < min_distance:
                                         min_distance = distance
                                         best_cluster = j
                                 cluster_labels[start + i] = best_cluster
-                                thread_num_cells_per_cluster[thread_index][best_cluster] += 1
+                                num_cells_per_cluster_pointer[best_cluster] += 1
                     
                     # Aggregate the contributions of each thread/chunk to
                     # the number of cells assigned to each cluster.
                     for i in prange(num_clusters, num_threads=num_threads):
                         num_cells_per_cluster[i] = 0
-                        for thread_index in range(num_lloyd_threads):
+                        for thread_index in range(num_threads):
                             num_cells_per_cluster[i] += \
                                 thread_num_cells_per_cluster[thread_index][i]
         
@@ -4659,7 +5112,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                      const unsigned max_clusters_searched,
                      const unsigned num_candidates_per_neighbor,
                      const unsigned chunk_size,
-                     const unsigned num_threads):
+                     unsigned num_threads):
             # Find the `num_neighbors` nearest neighbors of each cell in `X` among the
             # cells in `X`, which have k-means cluster labels `cluster_labels`. Store
             # the nearest-neighbor indices in `neighbors` and distances in `distances`.
@@ -4672,14 +5125,23 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 num_candidates = num_neighbors * num_candidates_per_neighbor
             cdef float norm, difference, distance
             cdef vector[vector[unsigned]] cluster_members
-            cdef uninitialized_vector[unsigned] nearest_clusters
-            cdef uninitialized_vector[float] centroid_distances
-            cdef uninitialized_vector[float] centroid_norms
-            cdef uninitialized_vector[float] temp_distances
+            cdef uninitialized_vector[float] centroid_norms_buffer, \
+                temp_distances_buffer, centroid_distances_buffer
+            cdef uninitialized_vector[unsigned] nearest_clusters_buffer
             cdef vector[uninitialized_vector[float]] thread_distances
-            cdef unsigned* nearest_clusters_i
-            cdef float* centroid_distances_i
+            centroid_norms_buffer.resize(num_clusters)
+            centroid_distances_buffer.resize(num_X * max_clusters_searched)
+            nearest_clusters_buffer.resize(num_X * max_clusters_searched)
+            cdef float[::1] centroid_norms = \
+                <float[:num_clusters]> centroid_norms_buffer.data()
+            cdef float[:, ::1] temp_distances, centroid_distances = \
+                <float[:num_X, :max_clusters_searched]> \
+                    centroid_distances_buffer.data()
+            cdef unsigned[:, ::1] nearest_clusters = \
+                <unsigned[:num_X, :max_clusters_searched]> \
+                    nearest_clusters_buffer.data()
             
+            num_threads = min(num_threads, num_chunks)
             if num_threads == 1:
                 # Create the inverted file index: a mapping from cluster labels to the
                 # cells from `X` in the cluster. This is just an inversion of
@@ -4693,19 +5155,18 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 PyErr_CheckSignals()
 
                 # Calculate the squared L2 norm of each centroid, ||C||²
-                centroid_norms.resize(num_clusters)
                 for i in range(num_clusters):
                     norm = centroids[i, 0] * centroids[i, 0]
                     for j in range(1, num_dimensions):
-                        norm = norm + centroids[i, j] * centroids[i, j]
+                        norm += centroids[i, j] * centroids[i, j]
                     centroid_norms[i] = norm
 
                 # Find the `max_clusters_searched` nearest centroids of each cell in `X`,
-                # storing their indices in `nearest_clusters`. Use a max-heap to
-                # keep track of the `max_clusters_searched` smallest distances.
-                nearest_clusters.resize(num_X * max_clusters_searched)
-                centroid_distances.resize(num_X * max_clusters_searched)
-                temp_distances.resize(chunk_size * num_clusters)
+                # storing their indices in `nearest_clusters`. Use a max-heap to keep
+                # track of the `max_clusters_searched` smallest distances.
+                temp_distances_buffer.resize(chunk_size * num_clusters)
+                temp_distances = <float[:chunk_size, :num_clusters]> \
+                    temp_distances_buffer.data()
                 for chunk_index in range(num_chunks):
                     start = chunk_index * chunk_size
                     chunk_num_X = num_X - start \
@@ -4717,27 +5178,29 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # but skip calculating the ||X||² term since the ranking
                     # of centroid distances for a given cell does not depend on ||X||².
                     partial_distances(&X[start, 0], &centroids[0, 0],
-                                      centroid_norms.data(), temp_distances.data(),
+                                      &centroid_norms[0], &temp_distances[0, 0],
                                       chunk_num_X, num_clusters,
                                       num_dimensions)
                     for i in range(chunk_num_X):
-                        nearest_clusters_i = nearest_clusters.data() + (start + i) * max_clusters_searched
-                        centroid_distances_i = centroid_distances.data() + (start + i) * max_clusters_searched
                         for j in range(max_clusters_searched):
-                            centroid_distances_i[j] = FLT_MAX
+                            centroid_distances[start + i, j] = FLT_MAX
                         for cluster_index in range(num_clusters):
-                            distance = temp_distances[i * num_clusters + cluster_index]
+                            distance = temp_distances[i, cluster_index]
                             
                             # If this centroid is one of the `max_clusters_searched` nearest
                             # centroids found so far, add it to the heap, and remove the
                             # formerly `max_clusters_searched`th-nearest centroid (which is now
                             # not in the top `max_clusters_searched` centroids anymore)
-                            if distance < centroid_distances_i[0]:
-                                max_heap_replace_top(nearest_clusters_i, centroid_distances_i,
-                                                     cluster_index, distance, max_clusters_searched)
+                            if distance < centroid_distances[start + i, 0]:
+                                max_heap_replace_top(&nearest_clusters[start + i, 0],
+                                                     &centroid_distances[start + i, 0],
+                                                     cluster_index, distance,
+                                                     max_clusters_searched)
                         
                         # Sort the heap to get nearest clusters in ascending order of distance
-                        max_heap_sort(nearest_clusters_i, centroid_distances_i, max_clusters_searched)
+                        max_heap_sort(&nearest_clusters[start + i, 0],
+                                      &centroid_distances[start + i, 0],
+                                      max_clusters_searched)
                 
                 PyErr_CheckSignals()
 
@@ -4749,12 +5212,11 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 # the loop across clusters so we can check for self-neighbors
                 # only for the cluster the cell itself is in.
                 for i in range(num_X):
-                    nearest_clusters_i = nearest_clusters.data() + i * max_clusters_searched
                     for j in range(num_neighbors):
                         distances[i, j] = FLT_MAX
                     
                     # First iteration (the cluster `i` is in), checking for self-neighbors
-                    cluster_label = nearest_clusters_i[0]
+                    cluster_label = nearest_clusters[i, 0]
                     cluster_num_cells = num_cells_per_cluster[cluster_label]
                     for j in range(cluster_num_cells):
                         neighbor = cluster_members[cluster_label][j]
@@ -4772,7 +5234,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     if min_clusters_searched > 1 or num_searched < num_candidates:
                         # Remaining iterations (the other clusters)
                         for cluster_index in range(1, max_clusters_searched):
-                            cluster_label = nearest_clusters_i[cluster_index]
+                            cluster_label = nearest_clusters[i, cluster_index]
                             cluster_num_cells = num_cells_per_cluster[cluster_label]
                             for j in range(cluster_num_cells):
                                 neighbor = cluster_members[cluster_label][j]
@@ -4811,7 +5273,6 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                 cluster_members[cluster_label].push_back(i)
                         
                     # Calculate the squared L2 norm of each centroid, ||C||²
-                    centroid_norms.resize(num_clusters)
                     for i in prange(num_clusters, num_threads=num_threads):
                         norm = centroids[i, 0] * centroids[i, 0]
                         for j in range(1, num_dimensions):
@@ -4819,10 +5280,8 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         centroid_norms[i] = norm
 
                     # Find the `max_clusters_searched` nearest centroids of each cell in `X`,
-                    # storing their indices in `nearest_clusters`. Use a max-heap to
-                    # keep track of the `max_clusters_searched` smallest distances.
-                    nearest_clusters.resize(num_X * max_clusters_searched)
-                    centroid_distances.resize(num_X * max_clusters_searched)
+                    # storing their indices in `nearest_clusters`. Use a max-heap to keep
+                    # track of the `max_clusters_searched` smallest distances.
                     thread_distances.resize(num_threads)
                     with parallel(num_threads=num_threads):
                         thread_index = threadid()
@@ -4838,28 +5297,31 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             # but skip calculating the ||X||² term since the ranking
                             # of centroid distances for a given cell does not depend on ||X||².
                             partial_distances(&X[start, 0], &centroids[0, 0],
-                                              centroid_norms.data(),
+                                              &centroid_norms[0],
                                               thread_distances[thread_index].data(),
                                               chunk_num_X, num_clusters,
                                               num_dimensions)
                             for i in range(chunk_num_X):
-                                nearest_clusters_i = nearest_clusters.data() + (start + i) * max_clusters_searched
-                                centroid_distances_i = centroid_distances.data() + (start + i) * max_clusters_searched
                                 for j in range(max_clusters_searched):
-                                    centroid_distances_i[j] = FLT_MAX
+                                    centroid_distances[start + i, j] = FLT_MAX
                                 for cluster_index in range(num_clusters):
-                                    distance = thread_distances[thread_index][i * num_clusters + cluster_index]
+                                    distance = thread_distances[thread_index][
+                                        i * num_clusters + cluster_index]
                                     
                                     # If this centroid is one of the `max_clusters_searched` nearest
                                     # centroids found so far, add it to the heap, and remove the
                                     # formerly `max_clusters_searched`th-nearest centroid (which is now
                                     # not in the top `max_clusters_searched` centroids anymore)
-                                    if distance < centroid_distances_i[0]:
-                                        max_heap_replace_top(nearest_clusters_i, centroid_distances_i,
-                                                             cluster_index, distance, max_clusters_searched)
-                                
+                                    if distance < centroid_distances[start + i, 0]:
+                                        max_heap_replace_top(&nearest_clusters[start + i, 0],
+                                                             &centroid_distances[start + i, 0],
+                                                             cluster_index, distance,
+                                                             max_clusters_searched)
+                            
                                 # Sort the heap to get nearest clusters in ascending order of distance
-                                max_heap_sort(nearest_clusters_i, centroid_distances_i, max_clusters_searched)
+                                max_heap_sort(&nearest_clusters[start + i, 0],
+                                              &centroid_distances[start + i, 0],
+                                              max_clusters_searched)
                             
                             # Check for KeyboardInterrupts
                             if chunk_index % 10 == 9:
@@ -4874,12 +5336,11 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # the loop across clusters so we can check for self-neighbors
                     # only for the cluster the cell itself is in.
                     for i in prange(num_X, num_threads=num_threads):
-                        nearest_clusters_i = nearest_clusters.data() + i * max_clusters_searched
                         for j in range(num_neighbors):
                             distances[i, j] = FLT_MAX
                         
                         # First iteration (the cluster `i` is in), checking for self-neighbors
-                        cluster_label = nearest_clusters_i[0]
+                        cluster_label = nearest_clusters[i, 0]
                         cluster_num_cells = num_cells_per_cluster[cluster_label]
                         for j in range(cluster_num_cells):
                             neighbor = cluster_members[cluster_label][j]
@@ -4897,7 +5358,7 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         if min_clusters_searched > 1 or num_searched < num_candidates:
                             # Remaining iterations (the other clusters)
                             for cluster_index in range(1, max_clusters_searched):
-                                cluster_label = nearest_clusters_i[cluster_index]
+                                cluster_label = nearest_clusters[i, cluster_index]
                                 cluster_num_cells = num_cells_per_cluster[cluster_label]
                                 for j in range(cluster_num_cells):
                                     neighbor = cluster_members[cluster_label][j]
@@ -4922,19 +5383,19 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             with gil:
                                 PyErr_CheckSignals()
         
-        def knn(const float[:, ::1] Y,
-                const float[:, ::1] X,
-                const unsigned[::1] cluster_labels,
-                const float[:, ::1] centroids,
-                const unsigned[::1] num_cells_per_cluster,
-                unsigned[:, ::1] neighbors,
-                float[:, ::1] distances,
-                const unsigned num_neighbors,
-                const unsigned min_clusters_searched,
-                const unsigned max_clusters_searched,
-                const unsigned num_candidates_per_neighbor,
-                const unsigned chunk_size,
-                const unsigned num_threads):
+        def knn_cross(const float[:, ::1] Y,
+                      const float[:, ::1] X,
+                      const unsigned[::1] cluster_labels,
+                      const float[:, ::1] centroids,
+                      const unsigned[::1] num_cells_per_cluster,
+                      unsigned[:, ::1] neighbors,
+                      float[:, ::1] distances,
+                      const unsigned num_neighbors,
+                      const unsigned min_clusters_searched,
+                      const unsigned max_clusters_searched,
+                      const unsigned num_candidates_per_neighbor,
+                      const unsigned chunk_size,
+                      unsigned num_threads):
             # Find the `num_neighbors` nearest neighbors of each cell in `Y` among the
             # cells in `X`, which have k-means cluster labels `cluster_labels`. Store
             # the nearest-neighbor indices in `neighbors` and distances in `distances`.
@@ -4947,14 +5408,23 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 num_candidates = num_neighbors * num_candidates_per_neighbor
             cdef float norm, difference, distance
             cdef vector[vector[unsigned]] cluster_members
-            cdef uninitialized_vector[unsigned] nearest_clusters
-            cdef uninitialized_vector[float] centroid_distances
-            cdef uninitialized_vector[float] centroid_norms
-            cdef uninitialized_vector[float] temp_distances
+            cdef uninitialized_vector[float] centroid_norms_buffer, \
+                temp_distances_buffer, centroid_distances_buffer
+            cdef uninitialized_vector[unsigned] nearest_clusters_buffer
             cdef vector[uninitialized_vector[float]] thread_distances
-            cdef unsigned* nearest_clusters_i
-            cdef float* centroid_distances_i
-            
+            centroid_norms_buffer.resize(num_clusters)
+            centroid_distances_buffer.resize(num_Y * max_clusters_searched)
+            nearest_clusters_buffer.resize(num_Y * max_clusters_searched)
+            cdef float[::1] centroid_norms = \
+                <float[:num_clusters]> centroid_norms_buffer.data()
+            cdef float[:, ::1] temp_distances, centroid_distances = \
+                <float[:num_Y, :max_clusters_searched]> \
+                    centroid_distances_buffer.data()
+            cdef unsigned[:, ::1] nearest_clusters = \
+                <unsigned[:num_Y, :max_clusters_searched]> \
+                    nearest_clusters_buffer.data()
+
+            num_threads = min(num_threads, num_chunks)
             if num_threads == 1:
                 # Create the inverted file index: a mapping from cluster labels to the
                 # cells from `X` in the cluster. This is just an inversion of
@@ -4968,19 +5438,19 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 PyErr_CheckSignals()
 
                 # Calculate the squared L2 norm of each centroid, ||C||²
-                centroid_norms.resize(num_clusters)
                 for i in range(num_clusters):
                     norm = centroids[i, 0] * centroids[i, 0]
                     for j in range(1, num_dimensions):
-                        norm = norm + centroids[i, j] * centroids[i, j]
+                        norm += centroids[i, j] * centroids[i, j]
                     centroid_norms[i] = norm
 
                 # Find the `max_clusters_searched` nearest centroids of each cell in `Y`,
-                # storing their indices in `nearest_clusters`. Use a max-heap to
-                # keep track of the `max_clusters_searched` smallest distances.
-                nearest_clusters.resize(num_Y * max_clusters_searched)
-                centroid_distances.resize(num_Y * max_clusters_searched)
-                temp_distances.resize(chunk_size * num_clusters)
+                # storing their indices in `nearest_clusters`. Use a max-heap to keep
+                # track of the `max_clusters_searched` smallest distances.
+
+                temp_distances_buffer.resize(chunk_size * num_clusters)
+                temp_distances = <float[:chunk_size, :num_clusters]> \
+                    temp_distances_buffer.data()
                 for chunk_index in range(num_chunks):
                     start = chunk_index * chunk_size
                     chunk_num_Y = num_Y - start \
@@ -4992,27 +5462,30 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # but skip calculating the ||Y||² term since the ranking
                     # of centroid distances for a given cell does not depend on ||Y||².
                     partial_distances(&Y[start, 0], &centroids[0, 0],
-                                      centroid_norms.data(), temp_distances.data(),
+                                      &centroid_norms[0], &temp_distances[0, 0],
                                       chunk_num_Y, num_clusters,
                                       num_dimensions)
                     for i in range(chunk_num_Y):
-                        nearest_clusters_i = nearest_clusters.data() + (start + i) * max_clusters_searched
-                        centroid_distances_i = centroid_distances.data() + (start + i) * max_clusters_searched
                         for j in range(max_clusters_searched):
-                            centroid_distances_i[j] = FLT_MAX
+                            centroid_distances[start + i, j] = FLT_MAX
                         for cluster_index in range(num_clusters):
-                            distance = temp_distances[i * num_clusters + cluster_index]
+                            distance = temp_distances[i, cluster_index]
                             
-                            # If this centroid is one of the `max_clusters_searched` nearest
-                            # centroids found so far, add it to the heap, and remove the
-                            # formerly `max_clusters_searched`th-nearest centroid (which is now
-                            # not in the top `max_clusters_searched` centroids anymore)
-                            if distance < centroid_distances_i[0]:
-                                max_heap_replace_top(nearest_clusters_i, centroid_distances_i,
-                                                     cluster_index, distance, max_clusters_searched)
+                            # If this centroid is one of the `max_clusters_searched`
+                            # nearest centroids found so far, add it to the heap, and
+                            # remove the formerly `max_clusters_searched`th-nearest
+                            # centroid (which is now not in the top
+                            # `max_clusters_searched` centroids anymore)
+                            if distance < centroid_distances[start + i, 0]:
+                                max_heap_replace_top(&nearest_clusters[start + i, 0],
+                                                     &centroid_distances[start + i, 0],
+                                                     cluster_index, distance,
+                                                     max_clusters_searched)
                         
                         # Sort the heap to get nearest clusters in ascending order of distance
-                        max_heap_sort(nearest_clusters_i, centroid_distances_i, max_clusters_searched)
+                        max_heap_sort(&nearest_clusters[start + i, 0],
+                                      &centroid_distances[start + i, 0],
+                                      max_clusters_searched)
                 
                 PyErr_CheckSignals()
 
@@ -5022,12 +5495,11 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                 # been searched and more than `num_candidates` cells have been
                 # considered. Unlike for `knn_self()`, do not check for self-neighbors.
                 for i in range(num_Y):
-                    nearest_clusters_i = nearest_clusters.data() + i * max_clusters_searched
                     for j in range(num_neighbors):
                         distances[i, j] = FLT_MAX
                     num_searched = 0
                     for cluster_index in range(max_clusters_searched):
-                        cluster_label = nearest_clusters_i[cluster_index]
+                        cluster_label = nearest_clusters[i, cluster_index]
                         cluster_num_cells = num_cells_per_cluster[cluster_label]
                         for j in range(cluster_num_cells):
                             neighbor = cluster_members[cluster_label][j]
@@ -5066,7 +5538,6 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                                 cluster_members[cluster_label].push_back(i)
                         
                     # Calculate the squared L2 norm of each centroid, ||C||²
-                    centroid_norms.resize(num_clusters)
                     for i in prange(num_clusters, num_threads=num_threads):
                         norm = centroids[i, 0] * centroids[i, 0]
                         for j in range(1, num_dimensions):
@@ -5074,10 +5545,8 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                         centroid_norms[i] = norm
 
                     # Find the `max_clusters_searched` nearest centroids of each cell in `Y`,
-                    # storing their indices in `nearest_clusters`. Use a max-heap to
-                    # keep track of the `max_clusters_searched` smallest distances.
-                    nearest_clusters.resize(num_Y * max_clusters_searched)
-                    centroid_distances.resize(num_Y * max_clusters_searched)
+                    # storing their indices in `nearest_clusters`. Use a max-heap to keep
+                    # track of the `max_clusters_searched` smallest distances.
                     thread_distances.resize(num_threads)
                     with parallel(num_threads=num_threads):
                         thread_index = threadid()
@@ -5093,28 +5562,35 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                             # but skip calculating the ||Y||² term since the ranking
                             # of centroid distances for a given cell does not depend on ||Y||².
                             partial_distances(&Y[start, 0], &centroids[0, 0],
-                                              centroid_norms.data(),
+                                              &centroid_norms[0],
                                               thread_distances[thread_index].data(),
                                               chunk_num_Y, num_clusters,
                                               num_dimensions)
                             for i in range(chunk_num_Y):
-                                nearest_clusters_i = nearest_clusters.data() + (start + i) * max_clusters_searched
-                                centroid_distances_i = centroid_distances.data() + (start + i) * max_clusters_searched
                                 for j in range(max_clusters_searched):
-                                    centroid_distances_i[j] = FLT_MAX
+                                    centroid_distances[start + i, j] = FLT_MAX
                                 for cluster_index in range(num_clusters):
-                                    distance = thread_distances[thread_index][i * num_clusters + cluster_index]
+                                    distance = thread_distances[thread_index][
+                                        i * num_clusters + cluster_index]
                                     
-                                    # If this centroid is one of the `max_clusters_searched` nearest
-                                    # centroids found so far, add it to the heap, and remove the
-                                    # formerly `max_clusters_searched`th-nearest centroid (which is now
-                                    # not in the top `max_clusters_searched` centroids anymore)
-                                    if distance < centroid_distances_i[0]:
-                                        max_heap_replace_top(nearest_clusters_i, centroid_distances_i,
-                                                             cluster_index, distance, max_clusters_searched)
+                                    # If this centroid is one of the
+                                    # `max_clusters_searched` nearest centroids found
+                                    # so far, add it to the heap, and remove the
+                                    # formerly `max_clusters_searched`th-nearest
+                                    # centroid (which is now not in the top
+                                    # `max_clusters_searched` centroids anymore)
+                                    if distance < centroid_distances[start + i, 0]:
+                                        max_heap_replace_top(
+                                            &nearest_clusters[start + i, 0],
+                                            &centroid_distances[start + i, 0],
+                                            cluster_index, distance,
+                                            max_clusters_searched)
                                 
-                                # Sort the heap to get nearest clusters in ascending order of distance
-                                max_heap_sort(nearest_clusters_i, centroid_distances_i, max_clusters_searched)
+                                # Sort the heap to get nearest clusters in ascending
+                                # order of distance
+                                max_heap_sort(&nearest_clusters[start + i, 0],
+                                              &centroid_distances[start + i, 0],
+                                              max_clusters_searched)
                             
                             # Check for KeyboardInterrupts
                             if chunk_index % 10 == 9:
@@ -5128,12 +5604,11 @@ _kmeans_and_knn_functions = cython_inline(_uninitialized_vector_import + r'''
                     # considered. Unlike for `knn_self()`, do not check for
                     # self-neighbors.
                     for i in prange(num_Y, num_threads=num_threads):
-                        nearest_clusters_i = nearest_clusters.data() + i * max_clusters_searched
                         for j in range(num_neighbors):
                             distances[i, j] = FLT_MAX
                         num_searched = 0
                         for cluster_index in range(max_clusters_searched):
-                            cluster_label = nearest_clusters_i[cluster_index]
+                            cluster_label = nearest_clusters[i, cluster_index]
                             cluster_num_cells = num_cells_per_cluster[cluster_label]
                             for j in range(cluster_num_cells):
                                 neighbor = cluster_members[cluster_label][j]
@@ -6072,6 +6547,18 @@ class SingleCell:
                 'X has more than INT32_MAX (2,147,483,647) genes, which is '
                 'not currently supported')
             raise ValueError(error_message)
+        if self._obs[:, 0].dtype not in (pl.String, pl.Categorical, pl.Enum):
+            error_message = (
+                f'the first column of obs ({self._obs.columns[0]!r}) must be '
+                f'String, Enum, or Categorical, but has data type '
+                f'{self._obs[:, 0].dtype.base_type()!r}')
+            raise ValueError(error_message)
+        if self._var[:, 0].dtype not in (pl.String, pl.Categorical, pl.Enum):
+            error_message = (
+                f'the first column of var ({self._var.columns[0]!r}) must be '
+                f'String, Enum, or Categorical, but has data type '
+                f'{self._var[:, 0].dtype.base_type()!r}')
+            raise ValueError(error_message)
         if self._X is not None:
             dtype = self._X.dtype
             if dtype != np.int32 and dtype != np.int64 and \
@@ -6139,20 +6626,24 @@ class SingleCell:
             else:
                 self._uns[key] = False
         
-        # As a stopgap for now, convert float64 obsm/varm to float32 with a
-        # warning
-        for key, value in self._obsm.items():
-            if isinstance(value, np.ndarray) and value.dtype == np.float64:
-                warning_message = \
-                    f'obsm[{key!r}] is float64; converting to float32'
-                warnings.warn(warning_message)
-                self._obsm[key] = value.astype(np.float32)
-        for key, value in self._varm.items():
-            if isinstance(value, np.ndarray) and value.dtype == np.float64:
-                warning_message = \
-                    f'varm[{key!r}] is float64; converting to float32'
-                warnings.warn(warning_message)
-                self._varm[key] = value.astype(np.float32)
+        # As a stopgap for now, convert float64 obsm/varm/obsp/varp to float32 
+        # with a warning
+        for attr_name, attr in ('obsm', self._obsm), ('varm', self._varm):
+            for key, value in attr.items():
+                if isinstance(value, np.ndarray) and value.dtype == np.float64:
+                    warning_message = (
+                        f'{attr_name}[{key!r}] is float64; converting to '
+                        f'float32')
+                    warnings.warn(warning_message)
+                    attr[key] = value.astype(np.float32)
+        for attr_name, attr in ('obsp', self._obsp), ('varp', self.varp):
+            for key, value in attr.items():
+                if value.dtype == np.float64:
+                    warning_message = (
+                        f'{attr_name}[{key!r}] is float64; converting to '
+                        f'float32')
+                    warnings.warn(warning_message)
+                    value.data = value.data.astype(np.float32)
         
     @property
     def X(self) -> csr_array | csc_array | None:
@@ -6758,7 +7249,7 @@ class SingleCell:
                             buffer, dtype=dataset.dtype),
                             source_sel=chunk, dest_sel=chunk)
             except KeyboardInterrupt:
-                pass  # do not print KeyboardInterrupt tracebacks, just return
+                pass
         
         # Ignore polars warning about using `os.fork()`
         with warnings.catch_warnings():
@@ -7556,7 +8047,9 @@ class SingleCell:
                 f'the right-hand operand has type {type(other).__name__!r}')
             raise TypeError(error_message)
         # noinspection PyUnresolvedReferences
-        return self._obs.equals(other._obs) and \
+        return (other._X is None if self._X is None else
+                other._X is not None) and \
+               self._obs.equals(other._obs) and \
                self._var.equals(other._var) and \
                self._obsm.keys() == other._obsm.keys() and \
                self._varm.keys() == other._varm.keys() and \
@@ -7571,8 +8064,7 @@ class SingleCell:
                  other._varm[key].equals(value))
                 for key, value in self._varm.items()) and \
             SingleCell._eq_uns(self._uns, other._uns) and \
-            (other._X is None if self._X is None else other._X is not None and
-             self._X.nnz == other._X.nnz and not (self._X != other._X).nnz)
+            self._X.equals(other._X)
     
     @staticmethod
     def _eq_uns(uns: UnsDict,
@@ -7683,31 +8175,26 @@ class SingleCell:
                 SingleCell._getitem_error(item)
             return slice(start, stop, step)
         elif isinstance(subitem, (list, np.ndarray, pl.Series)):
-            df_0_dtype = df[:, 0].dtype
-            already_series = isinstance(subitem, pl.Series)
-            if already_series:
-                subitem_dtype = subitem.dtype
-            else:
-                subitem = pl.Series(subitem, dtype=df_0_dtype)
-                subitem_dtype = df_0_dtype
+            subitem = pl.Series(subitem)
             if subitem.is_null().any():
                 error_message = 'your indexer contains missing values'
                 raise ValueError(error_message)
-            if subitem_dtype == pl.String or subitem_dtype == \
-                    pl.Categorical or subitem_dtype == pl.Enum:
-                if already_series and subitem_dtype != df_0_dtype:
-                    subitem = subitem.cast(df_0_dtype)
+            dtype = subitem.dtype
+            if dtype in (pl.String, pl.Categorical, pl.Enum):
+                names_dtype = df[:, 0].dtype
+                if dtype != names_dtype:
+                    subitem = subitem.cast(names_dtype)
                 indices = subitem\
                     .to_frame(df.columns[0])\
                     .join(df.with_columns(_SingleCell_index=pl.int_range(
-                              pl.len(), dtype=pl.Int32)),
+                              pl.len(), dtype=pl.UInt32)),
                           on=df.columns[0], how='left')\
                     ['_SingleCell_index']
                 if indices.null_count():
                     error_message = subitem.filter(indices.is_null())[0]
                     raise KeyError(error_message)
                 return indices
-            elif subitem_dtype.is_integer() or subitem_dtype == pl.Boolean:
+            elif dtype.is_integer() or dtype == pl.Boolean:
                 return subitem
             else:
                 SingleCell._getitem_error(item)
@@ -8887,9 +9374,7 @@ class SingleCell:
             .to_pandas(split_blocks=True, types_mapper=type_mapping.get)\
             .set_index(df.columns[0])
         return anndata.AnnData(
-            X=self._X if version.parse(anndata.__version__) >=
-                         version.parse('0.11.0') else
-              sparse.csr_matrix(self._X) if isinstance(self._X, csr_array)
+            X=sparse.csr_matrix(self._X) if isinstance(self._X, csr_array)
               else sparse.csc_matrix(self._X),
             obs=to_pandas(self._obs), var=to_pandas(self._var),
             obsm=self._obsm, varm=self._varm, uns=self._uns)
@@ -9213,7 +9698,7 @@ class SingleCell:
                 try:
                     r(f'{seurat_object_name} = CreateSeuratObject('
                       f'CreateAssayObject({X_key}=.SingleCell.X.T), '
-                      f'meta.data=.SingleCell.obs, assay={assay})')
+                      f'meta.data=.SingleCell.obs, assay={assay!r})')
                     
                     # Reverse the column name-mangling introduced by Seurat
                     r(f'.SingleCell.cols_to_ignore = '
@@ -10477,7 +10962,7 @@ class SingleCell:
             .with_columns(_SingleCell_index=pl.int_range(pl.len(),
                                                          dtype=pl.Int32))\
             .filter(*predicates, **constraints)
-        mask = obs['_SingleCell_index'].to_numpy()
+        indices = obs['_SingleCell_index'].to_numpy()
         if self._X is None:
             if num_threads is not None:
                 error_message = \
@@ -10485,10 +10970,10 @@ class SingleCell:
                 raise ValueError(error_message)
             return SingleCell(X=None,
                               obs=obs.drop('_SingleCell_index'), var=self._var,
-                              obsm={key: value[mask]
+                              obsm={key: value[indices]
                                     for key, value in self._obsm.items()},
                               varm=self._varm,
-                              obsp={key: value[np.ix_(mask, mask)]
+                              obsp={key: value[np.ix_(indices, indices)]
                                     for key, value in self._obsp.items()},
                               varp=self._varp, uns=self._uns,
                               num_threads=self._num_threads)
@@ -10497,13 +10982,13 @@ class SingleCell:
             original_num_threads = self._X._num_threads
             try:
                 self._X._num_threads = num_threads
-                return SingleCell(X=self._X[mask],
+                return SingleCell(X=self._X[indices],
                                   obs=obs.drop('_SingleCell_index'),
                                   var=self._var,
-                                  obsm={key: value[mask]
+                                  obsm={key: value[indices]
                                         for key, value in self._obsm.items()},
                                   varm=self._varm,
-                                  obsp={key: value[np.ix_(mask, mask)]
+                                  obsp={key: value[np.ix_(indices, indices)]
                                         for key, value in self._obsp.items()},
                                   varp=self._varp, uns=self._uns,
                                   num_threads=self._num_threads)
@@ -10544,7 +11029,7 @@ class SingleCell:
             .with_columns(_SingleCell_index=pl.int_range(pl.len(),
                                                          dtype=pl.Int32))\
             .filter(*predicates, **constraints)
-        mask = var['_SingleCell_index'].to_numpy()
+        indices = var['_SingleCell_index'].to_numpy()
         if self._X is None:
             if num_threads is not None:
                 error_message = \
@@ -10553,10 +11038,10 @@ class SingleCell:
             return SingleCell(X=None,
                               obs=self._obs, var=var.drop('_SingleCell_index'),
                               obsm=self._obsm,
-                              varm={key: value[mask]
+                              varm={key: value[indices]
                                     for key, value in self._varm.items()},
                               obsp=self._obsp,
-                              varp={key: value[np.ix_(mask, mask)]
+                              varp={key: value[np.ix_(indices, indices)]
                                     for key, value in self._varp.items()},
                               uns=self._uns, num_threads=self._num_threads)
         else:
@@ -10564,14 +11049,14 @@ class SingleCell:
             original_num_threads = self._X._num_threads
             try:
                 self._X._num_threads = num_threads
-                return SingleCell(X=self._X[:, mask],
+                return SingleCell(X=self._X[:, indices],
                                   obs=self._obs,
                                   var=var.drop('_SingleCell_index'),
                                   obsm=self._obsm,
-                                  varm={key: value[mask]
+                                  varm={key: value[indices]
                                         for key, value in self._varm.items()},
                                   obsp=self._obsp,
-                                  varp={key: value[np.ix_(mask, mask)]
+                                  varp={key: value[np.ix_(indices, indices)]
                                         for key, value in self._varp.items()},
                                   uns=self._uns, num_threads=self._num_threads)
             finally:
@@ -12079,7 +12564,7 @@ class SingleCell:
                 # largest groups to make this happen.
                 group_counts = by_frame\
                     .group_by(by_name)\
-                    .agg(pl.len(), n=(n * pl.len() / len(by_column))
+                    .agg(pl.len(), n=(n / len(by_column) * pl.len())
                                      .round().cast(pl.Int32))\
                     .drop_nulls(by_name)
                 diff = n - group_counts['n'].sum()
@@ -12229,7 +12714,7 @@ class SingleCell:
                 # largest groups to make this happen.
                 group_counts = by_frame\
                     .group_by(by_name)\
-                    .agg(pl.len(), n=(n * pl.len() / len(by_column))
+                    .agg(pl.len(), n=(n / len(by_column) * pl.len())
                                      .round().cast(pl.Int32))\
                     .drop_nulls(by_name)
                 diff = n - group_counts['n'].sum()
@@ -13003,15 +13488,18 @@ class SingleCell:
         
         # Apply the custom filter, if specified
         if verbose:
-            print(f'Starting with {len(self):,} cells.')
+            print(f'Starting with {len(self):,} {plural("cell", len(self))}.')
         mask = None
         if custom_filter is not None:
             if verbose:
                 print('Applying the custom filter...')
             mask = custom_filter
             if verbose:
-                print(f'{mask.sum():,} cells remain after applying the custom '
-                      f'filter.')
+                num_cells = mask.sum()
+                print(
+                    f'{num_cells:,} '
+                    f'{"cell remains" if num_cells == 1 else "cells remain"} '
+                    f'after applying the custom filter.')
         
         # Filter to cells with ≤ `100 * max_mito_fraction`% mitochondrial
         # counts, if `max_mito_fraction` was specified
@@ -13035,152 +13523,141 @@ class SingleCell:
                 raise ValueError(error_message)
             mito_mask = np.empty(X.shape[0], dtype=bool)
             if isinstance(X, csr_array):
-                cython_inline(r'''
-                    from cython.parallel cimport prange
-                    
-                    ctypedef fused numeric:
-                        int
-                        unsigned
-                        long
-                        unsigned long
-                        float
-                        double
-                    
-                    ctypedef fused signed_integer:
-                        int
-                        long
-                    
-                    def mito_mask(const numeric[::1] data,
-                                  const signed_integer[::1] indices,
-                                  const signed_integer[::1] indptr,
-                                  char[::1] mt_genes,
-                                  const float max_mito_fraction,
-                                  char[::1] mito_mask,
-                                  const unsigned num_threads):
-                        
-                        cdef unsigned row, row_sum, mt_sum, \
-                            num_genes = indptr.shape[0] - 1
-                        cdef unsigned long col
-                        
-                        if num_threads == 1:
-                            for row in range(num_genes):
-                                row_sum = mt_sum = 0
-                                for col in range(<unsigned long> indptr[row],
-                                                <unsigned long> indptr[row + 1]):
-                                    row_sum = row_sum + <unsigned> data[col]
-                                    if mt_genes[indices[col]]:
-                                        mt_sum = mt_sum + <unsigned> data[col]
-                                mito_mask[row] = \
-                                    (<float> mt_sum / row_sum) <= \
-                                    max_mito_fraction
-                        else:
-                            for row in prange(num_genes, nogil=True,
-                                              num_threads=num_threads):
-                                row_sum = mt_sum = 0
-                                for col in range(<unsigned long> indptr[row],
-                                                <unsigned long> indptr[row + 1]):
-                                    row_sum = row_sum + <unsigned> data[col]
-                                    if mt_genes[indices[col]]:
-                                        mt_sum = mt_sum + <unsigned> data[col]
-                                mito_mask[row] = \
-                                    (<float> mt_sum / row_sum) <= \
-                                    max_mito_fraction
+                cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, prange, threadid
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def mito_mask(const numeric[::1] data,
+                      const signed_integer[::1] indices,
+                      const signed_integer[::1] indptr,
+                      char[::1] mt_genes,
+                      const float max_mito_fraction,
+                      char[::1] mito_mask,
+                      unsigned num_threads):
+            
+            cdef unsigned row, row_sum, mt_sum, thread_index, \
+                num_genes = indptr.shape[0] - 1
+            cdef unsigned long col
+            cdef pair[unsigned, unsigned] row_range
+            
+            num_threads = min(num_threads, num_genes)
+            if num_threads == 1:
+                for row in range(num_genes):
+                    row_sum = 0
+                    mt_sum = 0
+                    for col in range(<unsigned long> indptr[row],
+                                     <unsigned long> indptr[row + 1]):
+                        row_sum = row_sum + <unsigned> data[col]
+                        if mt_genes[indices[col]]:
+                            mt_sum = mt_sum + <unsigned> data[col]
+                    mito_mask[row] = (<float> mt_sum / row_sum) <= max_mito_fraction
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(indptr, thread_index, num_threads)
+                    for row in range(row_range.first, row_range.second):
+                        row_sum = mt_sum = 0
+                        for col in range(<unsigned long> indptr[row],
+                                         <unsigned long> indptr[row + 1]):
+                            row_sum = row_sum + <unsigned> data[col]
+                            if mt_genes[indices[col]]:
+                                mt_sum = mt_sum + <unsigned> data[col]
+                        mito_mask[row] = \
+                            (<float> mt_sum / row_sum) <= max_mito_fraction
                         ''', warn_undeclared=False)['mito_mask'](
                             data=X.data, indices=X.indices, indptr=X.indptr,
                             mt_genes=mt_genes.to_numpy(),
                             max_mito_fraction=max_mito_fraction,
                             mito_mask=mito_mask, num_threads=num_threads)
             else:
-                cython_inline(r'''
-                    from cython.parallel cimport parallel, prange, threadid
-                    from libcpp.vector cimport vector
-                    
-                    ctypedef fused numeric:
-                        int
-                        unsigned
-                        long
-                        unsigned long
-                        float
-                        double
-                    
-                    ctypedef fused signed_integer:
-                        int
-                        long
-                    
-                    def mito_mask(const numeric[::1] data,
-                                  const signed_integer[::1] indices,
-                                  const signed_integer[::1] indptr,
-                                  char[::1] mt_genes,
-                                  const float max_mito_fraction,
-                                  char[::1] mito_mask,
-                                  const unsigned num_threads):
-                        
-                        cdef unsigned thread_index, gene, chunk_size, start, end, \
-                            row_sum, mt_sum, num_genes = indptr.shape[0] - 1, \
-                            num_cells = mito_mask.shape[0]
-                        cdef unsigned long cell
-                        cdef vector[unsigned] row_sums, mt_sums
-                        cdef vector[vector[unsigned]] thread_row_sums, thread_mt_sums
-                        
-                        if num_threads == 1:
-                            row_sums.resize(num_cells)
-                            mt_sums.resize(num_cells)
-                            for gene in range(num_genes):
-                                if mt_genes[gene]:
-                                    for cell in range(<unsigned long> indptr[gene],
-                                                      <unsigned long> indptr[gene + 1]):
-                                        row_sums[indices[cell]] += <unsigned> data[cell]
-                                        mt_sums[indices[cell]] += <unsigned> data[cell]
-                                else:
-                                    for cell in range(<unsigned long> indptr[gene],
-                                                      <unsigned long> indptr[gene + 1]):
-                                        row_sums[indices[cell]] += <unsigned> data[cell]
-                            for cell in range(num_cells):
-                                mito_mask[cell] = (
-                                    <float> mt_sums[cell] / row_sums[cell]) <= \
-                                    max_mito_fraction
-                        else:
-                            # Store total counts per cell and total
-                            # mitochondrial counts per cell for each thread in
-                            # a temporary buffer, then aggregate at the end. As
-                            # an optimization, put the counts for the last
-                            # thread (`thread_index == num_threads - 1`)
-                            # directly into the final `row_sums` and `mt_sums`
-                            # arrays.
-                            chunk_size = (num_genes + num_threads - 1) / num_threads
-                            thread_row_sums.resize(num_threads)
-                            thread_mt_sums.resize(num_threads)
-                            with nogil:
-                                with parallel(num_threads=num_threads):
-                                    thread_index = threadid()
-                                    thread_row_sums[thread_index].resize(num_cells)
-                                    thread_mt_sums[thread_index].resize(num_cells)
-                                    start = thread_index * chunk_size
-                                    end = min(start + chunk_size, num_genes)
-                                    for gene in range(start, end):
-                                        if mt_genes[gene]:
-                                            for cell in range(<unsigned long> indptr[gene],
-                                                              <unsigned long> indptr[gene + 1]):
-                                                thread_row_sums[thread_index][indices[cell]] += \
-                                                    <unsigned> data[cell]
-                                                thread_mt_sums[thread_index][indices[cell]] += \
-                                                    <unsigned> data[cell]
-                                        else:
-                                            for cell in range(<unsigned long> indptr[gene],
-                                                              <unsigned long> indptr[gene + 1]):
-                                                thread_row_sums[thread_index][indices[cell]] += \
-                                                    <unsigned> data[cell]
-                            
-                                # Populate the mask
-                                for cell in prange(num_cells,
-                                                   num_threads=num_threads):
-                                    row_sum = 0
-                                    mt_sum = 0
-                                    for thread_index in range(num_threads):
-                                        row_sum = row_sum + thread_row_sums[thread_index][cell]
-                                        mt_sum = mt_sum + thread_mt_sums[thread_index][cell]
-                                    mito_mask[cell] = \
-                                        (<float> mt_sum / row_sum) <= max_mito_fraction
+                cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, prange, threadid
+        from libcpp.vector cimport vector
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def mito_mask(const numeric[::1] data,
+                      const signed_integer[::1] indices,
+                      const signed_integer[::1] indptr,
+                      char[::1] mt_genes,
+                      const float max_mito_fraction,
+                      char[::1] mito_mask,
+                      unsigned num_threads):
+            
+            cdef unsigned thread_index, gene, row_sum, mt_sum, \
+                num_genes = indptr.shape[0] - 1, num_cells = mito_mask.shape[0]
+            cdef unsigned long cell
+            cdef pair[unsigned, unsigned] col_range
+            cdef vector[unsigned] row_sums_buffer, mt_sums_buffer
+            cdef vector[vector[unsigned]] thread_row_sums, thread_mt_sums
+            cdef unsigned[::1] row_sums, mt_sums
+            
+            num_threads = min(num_threads, num_genes)
+            if num_threads == 1:
+                row_sums_buffer.resize(num_cells)
+                row_sums = <unsigned[:num_cells]> row_sums_buffer.data()
+                mt_sums_buffer.resize(num_cells)
+                mt_sums = <unsigned[:num_cells]> mt_sums_buffer.data()
+                for gene in range(num_genes):
+                    if mt_genes[gene]:
+                        for cell in range(<unsigned long> indptr[gene],
+                                          <unsigned long> indptr[gene + 1]):
+                            row_sums[indices[cell]] += <unsigned> data[cell]
+                            mt_sums[indices[cell]] += <unsigned> data[cell]
+                    else:
+                        for cell in range(<unsigned long> indptr[gene],
+                                          <unsigned long> indptr[gene + 1]):
+                            row_sums[indices[cell]] += <unsigned> data[cell]
+                for cell in range(num_cells):
+                    mito_mask[cell] = \
+                        (<float> mt_sums[cell] / row_sums[cell]) <= max_mito_fraction
+            else:
+                # Store total counts per cell and total mitochondrial counts per cell
+                # for each thread in a temporary buffer, then aggregate at the end.
+                thread_row_sums.resize(num_threads)
+                thread_mt_sums.resize(num_threads)
+                with nogil:
+                    with parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        thread_row_sums[thread_index].resize(num_cells)
+                        thread_mt_sums[thread_index].resize(num_cells)
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            if mt_genes[gene]:
+                                for cell in range(<unsigned long> indptr[gene],
+                                                  <unsigned long> indptr[gene + 1]):
+                                    thread_row_sums[thread_index][indices[cell]] += \
+                                        <unsigned> data[cell]
+                                    thread_mt_sums[thread_index][indices[cell]] += \
+                                        <unsigned> data[cell]
+                            else:
+                                for cell in range(<unsigned long> indptr[gene],
+                                                  <unsigned long> indptr[gene + 1]):
+                                    thread_row_sums[thread_index][indices[cell]] += \
+                                        <unsigned> data[cell]
+                
+                    # Populate the mask
+                    for cell in prange(num_cells, num_threads=num_threads):
+                        row_sum = 0
+                        mt_sum = 0
+                        for thread_index in range(num_threads):
+                            row_sum = row_sum + thread_row_sums[thread_index][cell]
+                            mt_sum = mt_sum + thread_mt_sums[thread_index][cell]
+                        mito_mask[cell] = \
+                            (<float> mt_sum / row_sum) <= max_mito_fraction
                         ''', warn_undeclared=False)['mito_mask'](
                             data=X.data, indices=X.indices, indptr=X.indptr,
                             mt_genes=mt_genes.to_numpy(),
@@ -13197,29 +13674,37 @@ class SingleCell:
             else:
                 mask &= mito_mask
             if verbose:
-                print(f'{mask.sum():,} cells remain after filtering to cells '
-                      f'with ≤{100 * max_mito_fraction}% mitochondrial '
-                      f'counts.')
+                num_cells = mask.sum()
+                print(
+                    f'{num_cells:,} '
+                    f'{"cell remains" if num_cells == 1 else "cells remain"} '
+                    f'after filtering to cells with '
+                    f'≤{100 * max_mito_fraction}% mitochondrial counts.')
         
         # Filter to cells with ≥ `min_genes` genes detected, if specified
         if min_genes is not None:
             if verbose:
-                print(f'Filtering to cells with ≥{min_genes:,} genes '
-                      f'detected (with non-zero count)...')
+                print(f'Filtering to cells with ≥{min_genes:,} '
+                      f'{plural("gene", min_genes)} detected (with non-zero '
+                      f'count)...')
             gene_mask = pl.Series(getnnz(X, axis=1, num_threads=num_threads) >=
                                   min_genes)
             if not gene_mask.any():
                 error_message = (
                     f'no cells remain after filtering to cells with '
-                    f'≥{min_genes:,} genes detected')
+                    f'≥{min_genes:,} {plural("gene", min_genes)} detected')
                 raise ValueError(error_message)
             if mask is None:
                 mask = gene_mask
             else:
                 mask &= gene_mask
             if verbose:
-                print(f'{mask.sum():,} cells remain after filtering to cells '
-                      f'with ≥{min_genes:,} genes detected.')
+                num_cells = mask.sum()
+                print(
+                    f'{num_cells:,} '
+                    f'{"cell remains" if num_cells == 1 else "cells remain"} '
+                    f'after filtering to cells with ≥{min_genes:,} '
+                    f'{plural("gene", min_genes)} detected.')
         
         # Filter to cells with non-zero MALAT1 expression, if
         # `nonzero_MALAT1=True`
@@ -13253,59 +13738,49 @@ class SingleCell:
                 MALAT1_mask = np.empty(X.shape[0], dtype=bool)
                 if X.has_sorted_indices:
                     # Use binary search
-                    cython_inline(r'''
-                        from cython.parallel cimport prange
-                        
-                        ctypedef fused numeric:
-                            int
-                            unsigned
-                            long
-                            unsigned long
-                            float
-                            double
-                        
-                        ctypedef fused signed_integer:
-                            int
-                            long
-                        
-                        def get_MALAT1_mask_csr(
-                                const numeric[::1] data,
-                                const signed_integer[::1] indices,
-                                const signed_integer[::1] indptr,
-                                const signed_integer MALAT1_index,
-                                char[::1] MALAT1_mask,
-                                const unsigned num_threads):
-                            
-                            cdef unsigned row, num_genes = indptr.shape[0] - 1
-                            cdef unsigned long low, high, mid
-                            
-                            if num_threads == 1:
-                                for row in range(num_genes):
-                                    low = indptr[row]
-                                    high = indptr[row + 1] - 1
-                                    while low < high:
-                                        mid = (low + high) / 2
-                                        if indices[mid] < MALAT1_index:
-                                            low = mid + 1
-                                        else:
-                                            high = mid
-                                    MALAT1_mask[row] = \
-                                        indices[low] == MALAT1_index
-                            else:
-                                for row in prange(num_genes, nogil=True,
-                                                  num_threads=num_threads):
-                                    low = indptr[row]
-                                    high = indptr[row + 1] - 1
-                                    while low < high:
-                                        mid = (low + high) / 2
-                                        if indices[mid] < MALAT1_index:
-                                            low = mid + 1
-                                        else:
-                                            high = mid
-                                    MALAT1_mask[row] = \
-                                        indices[low] == MALAT1_index
+                    cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, threadid
+        from libcpp.algorithm cimport lower_bound
+    
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def get_MALAT1_mask_csr(
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                const signed_integer MALAT1_index,
+                char[::1] MALAT1_mask,
+                unsigned num_threads):
+            
+            cdef unsigned row, thread_index, num_cells = indptr.shape[0] - 1
+            cdef signed_integer* start
+            cdef signed_integer* end
+            cdef signed_integer* found
+            cdef pair[unsigned, unsigned] row_range
+        
+            num_threads = min(num_threads, num_cells)
+            if num_threads == 1:
+                for row in range(num_cells):
+                    start = <signed_integer*> &indices[indptr[row]]
+                    end = start + indptr[row + 1] - indptr[row]
+                    found = lower_bound(start, end, MALAT1_index)
+                    MALAT1_mask[row] = found != end and found[0] == MALAT1_index
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(indptr, thread_index, num_threads)
+                    for row in range(row_range.first, row_range.second):
+                        start = <signed_integer*> &indices[indptr[row]]
+                        end = start + indptr[row + 1] - indptr[row]
+                        found = lower_bound(start, end, MALAT1_index)
+                        MALAT1_mask[row] = found != end and found[0] == MALAT1_index
                     ''', warn_undeclared=False)['get_MALAT1_mask_csr'](
-                        data=X.data, indices=X.indices, indptr=X.indptr,
+                        indices=X.indices, indptr=X.indptr,
                         MALAT1_index=MALAT1_index, MALAT1_mask=MALAT1_mask,
                         num_threads=num_threads)
                 else:
@@ -13319,52 +13794,53 @@ class SingleCell:
                     MALAT1_mask = np.empty(X.shape[0], dtype=bool)
                     
                     # Use brute-force search
-                    cython_inline(r'''
-                        from cython.parallel cimport prange
-                        
-                        ctypedef fused numeric:
-                            int
-                            unsigned
-                            long
-                            unsigned long
-                            float
-                            double
-                        
-                        ctypedef fused signed_integer:
-                            int
-                            long
-                        
-                        def get_MALAT1_mask_csr_unsorted(
-                                const numeric[::1] data,
-                                const signed_integer[::1] indices,
-                                const signed_integer[::1] indptr,
-                                const signed_integer MALAT1_index,
-                                char[::1] MALAT1_mask,
-                                const unsigned num_threads):
-                            
-                            cdef unsigned row, num_genes = indptr.shape[0] - 1
-                            cdef unsigned long col
-                            
-                            if num_threads == 1:
-                                for row in range(num_genes):
-                                    for col in range(<unsigned long> indptr[row], <unsigned long> indptr[row + 1]):
-                                        if indices[col] == MALAT1_index:
-                                            MALAT1_mask[row] = True
-                                            break
-                                    else:
-                                        MALAT1_mask[row] = False
-                            else:
-                                for row in prange(num_genes, nogil=True,
-                                                  num_threads=num_threads):
-                                    for col in range(<unsigned long> indptr[row], <unsigned long> indptr[row + 1]):
-                                        if indices[col] == MALAT1_index:
-                                            MALAT1_mask[row] = True
-                                            break
-                                    else:
-                                        MALAT1_mask[row] = False
+                    cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, threadid
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def get_MALAT1_mask_csr_unsorted(
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                const signed_integer MALAT1_index,
+                char[::1] MALAT1_mask,
+                unsigned num_threads):
+            
+            cdef unsigned row, thread_index, num_cells = indptr.shape[0] - 1
+            cdef unsigned long col
+            cdef pair[unsigned, unsigned] row_range
+            
+            num_threads = min(num_threads, num_cells)
+            if num_threads == 1:
+                for row in range(num_cells):
+                    for col in range(<unsigned long> indptr[row],
+                                     <unsigned long> indptr[row + 1]):
+                        if indices[col] == MALAT1_index:
+                            MALAT1_mask[row] = True
+                            break
+                    else:
+                        MALAT1_mask[row] = False
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(indptr, thread_index, num_threads)
+                    for row in range(row_range.first, row_range.second):
+                        for col in range(<unsigned long> indptr[row],
+                                         <unsigned long> indptr[row + 1]):
+                            if indices[col] == MALAT1_index:
+                                MALAT1_mask[row] = True
+                                break
+                    else:
+                        MALAT1_mask[row] = False
                     ''', warn_undeclared=False)\
                         ['get_MALAT1_mask_csr_unsorted'](
-                        data=X.data, indices=X.indices, indptr=X.indptr,
+                        indices=X.indices, indptr=X.indptr,
                         MALAT1_index=MALAT1_index, MALAT1_mask=MALAT1_mask,
                         num_threads=num_threads)
             else:
@@ -13378,8 +13854,12 @@ class SingleCell:
             else:
                 mask &= MALAT1_mask
             if verbose:
-                print(f'{mask.sum():,} cells remain after filtering to cells '
-                      f'with non-zero MALAT1 expression.')
+                num_cells = mask.sum()
+                print(
+                    f'{num_cells:,} '
+                    f'{"cell remains" if num_cells == 1 else "cells remain"} '
+                    f'after filtering to cells with non-zero MALAT1 '
+                    f'expression.')
         
         # Remove predicted doublets, if `remove_doublets=True`. Exclude cells
         # that have failed earlier QC steps from being considered in the
@@ -13396,8 +13876,11 @@ class SingleCell:
             else:
                 mask &= singlets
             if verbose:
-                print(f'{mask.sum():,} cells remain after removing predicted '
-                      f'doublets.')
+                num_cells = mask.sum()
+                print(
+                    f'{num_cells:,} '
+                    f'{"cell remains" if num_cells == 1 else "cells remain"} '
+                    f'after removing predicted doublets.')
         
         # Add the mask of QCed cells as a column, or subset if `subset=True`
         if mask is None:
@@ -13421,14 +13904,13 @@ class SingleCell:
     
     # noinspection PyTypeChecker
     @staticmethod
-    def _find_doublets(X: csr_array | csc_array,
-                       batch_column: SingleCellColumn | None,
-                       QC_column: SingleCellColumn | None,
-                       doublet_fraction: float | np.floating | None,
-                       num_genes: int | np.integer,
-                       return_scores: bool,
-                       # verbose: bool,
-                       num_threads: int | np.integer | None) -> \
+    def _find_doublets_old(X: csr_array | csc_array,
+                           batch_column: SingleCellColumn | None,
+                           QC_column: SingleCellColumn | None,
+                           doublet_fraction: float | np.floating | None,
+                           num_genes: int | np.integer,
+                           return_scores: bool,
+                           num_threads: int | np.integer | None) -> \
             tuple[np.ndarray[1, np.dtype[np.bool_]],
                   np.ndarray[1, np.dtype[np.float32]]]:
         """
@@ -13482,7 +13964,7 @@ class SingleCell:
         is_csr = isinstance(X, csr_array)
         cython_functions = cython_inline(r'''
             from cython.parallel cimport prange
-            from libcpp.cmath cimport erfc, exp, fabs, floor, log, log1p, sqrt
+            from libcpp.cmath cimport abs, erfc, exp, floor, log, log1p, sqrt
             
             ctypedef fused numeric:
                 int
@@ -13609,7 +14091,7 @@ class SingleCell:
                         z /= u
                         p += 1
                         u = x + p
-                    z = fabs(z)
+                    z = abs(z)
                     if u == 2:
                         return log(z)
                     p -= 2
@@ -13904,64 +14386,54 @@ class SingleCell:
             X._num_threads = num_threads
             # For each batch...
             for batch_index, batch_indices in enumerate(batches):
-                # Subset to cells in that batch
-                # with Timer('subset to batch', verbose=verbose):
+                # Subset to cells in this batch
                 X_batch = X[batch_indices] if batch_column is not None else X
                 if X_batch.shape[0] == 1:
-                    # if verbose:
-                    #     print('Skipping batch due to only having one cell')
                     continue
                 
                 # Get the detection count of each gene
-                # with Timer('getnnz', verbose=verbose):
-                detection_count = \
-                    getnnz(X_batch, axis=0, num_threads=num_threads)
+                with Timer('getnnz'):
+                    detection_count = \
+                        getnnz(X_batch, axis=0, num_threads=num_threads)
                 
                 # Subset to the `num_genes` genes with detection rates closest
                 # to 50%. Exclude genes with detection rates of 0% or 100%.
-                # with Timer('hvg_indices and misc subsetting', verbose=verbose):
-                num_cells = X_batch.shape[0]
-                p = np.divide(detection_count, num_cells, dtype=np.float32)
-                hvg_indices = \
-                    np.argsort(p * (1 - p), kind='stable')[-num_genes:]
-                least_variable_p = p[hvg_indices[-num_genes]]
-                if least_variable_p == 0 or least_variable_p == 1:
-                    hvg_p = p[hvg_indices]
-                    hvg_indices = hvg_indices[(hvg_p > 0) & (hvg_p < 1)]
-                hvg_indices.sort()
-                detection_count = detection_count[hvg_indices]
-                p = p[hvg_indices]
-                # with Timer('subsetting X_batch to hvgs', verbose=verbose):
-                X_batch = X_batch[:, hvg_indices]
+                with Timer('hvg_indices and subsetting'):
+                    num_cells = X_batch.shape[0]
+                    p = np.divide(detection_count, num_cells, dtype=np.float32)
+                    hvg_indices = \
+                        np.argsort(p * (1 - p), kind='stable')[-num_genes:]
+                    least_variable_p = p[hvg_indices[-num_genes]]
+                    if least_variable_p == 0 or least_variable_p == 1:
+                        hvg_p = p[hvg_indices]
+                        hvg_indices = hvg_indices[(hvg_p > 0) & (hvg_p < 1)]
+                    hvg_indices.sort()
+                    detection_count = detection_count[hvg_indices]
+                    p = p[hvg_indices]
+                    X_batch = X_batch[:, hvg_indices]
                 
                 # Convert `X_batch` to CSR, if CSC
                 if not is_csr:
-                    # with Timer('converting to CSR', verbose=verbose):
                     X_batch = X_batch.tocsr()
                 
                 # Sort indices, if not already sorted (necessary for
                 # `simulate_doublets`)
-                # with Timer('sorting indices if not already sorted',
-                #            verbose=verbose):
                 if not X.has_sorted_indices:
                     X_batch.sort_indices()
                 
                 # Get `obs`, where `obs[i, j]` is the number of cells that
                 # express exactly one of genes `i` and `j`
-                # with Timer('compute obs', verbose=verbose):
                 compute_obs(detection_count=detection_count,
                             indices=X_batch.indices, indptr=X_batch.indptr,
                             obs=obs, num_threads=num_threads)
-                
+                    
                 # Get `S`, the upper-tail log binomial p-values of `obs`
-                # with Timer('compute S', verbose=verbose):
                 compute_S(obs=obs, p=p, num_cells=num_cells, S=S,
                           num_threads=num_threads)
-                
+                    
                 # Calculate each cell's cxds score: the sum of `-S[i, j]`
                 # across all gene pairs `i` and `j` that are both expressed by
                 # the cell
-                # with Timer('compute cxds', verbose=verbose):
                 cxds_scores_batch = np.empty(num_cells, dtype=np.float32)
                 compute_cxds(indices=X_batch.indices, indptr=X_batch.indptr,
                              S=S, cxds_scores=cxds_scores_batch,
@@ -13969,14 +14441,11 @@ class SingleCell:
                 
                 # Now simulate doublets within the batch and compute their cxds
                 # scores, using the original `S` matrix derived from the real
-                # data
-                # with Timer('simulating doublets', verbose=verbose):
-                sim_indptr = np.empty_like(X_batch.indptr)
-                
-                # Conservatively allocate twice as much memory for the
+                # data. Conservatively allocate twice as much memory for the
                 # indices as the original indices, since in the worst-case
-                # scenario none of the indices will match up and all
-                # coinflips will be 1
+                # scenario none of the indices will match up and all coinflips
+                # will be 1.
+                sim_indptr = np.empty_like(X_batch.indptr)
                 sim_indices = np.empty(2 * len(X_batch.indices),
                                        dtype=X_batch.indices.dtype)
                 simulate_doublets(data=X_batch.data, indices=X_batch.indices,
@@ -13985,14 +14454,12 @@ class SingleCell:
                                   sim_indptr=sim_indptr, num_cells=num_cells,
                                   seed=batch_index)
                 sim_indices = sim_indices[:sim_indptr[-1]]
-                # with Timer('compute cxds simulated', verbose=verbose):
                 cxds_scores_sim = np.empty(num_cells, dtype=np.float32)
                 compute_cxds(indices=sim_indices, indptr=sim_indptr, S=S,
                              cxds_scores=cxds_scores_sim,
                              num_threads=num_threads)
-               
+                   
                 # Call doublets
-                # with Timer('calling doublets', verbose=verbose):
                 if doublet_fraction is None:
                     # Call doublets based on whether their cxds score is
                     # above the median cxds score for simulated doublets
@@ -14003,10 +14470,9 @@ class SingleCell:
                     rank = rankdata(cxds_scores_batch, method='ordinal')
                     singlets_batch = \
                         rank <= (1 - doublet_fraction) * len(rank)
-                
+            
                 # If using multiple batches, map doublet labels and scores back
                 # to the full dataset
-                # with Timer('mapping back to full dataset', verbose=verbose):
                 if batch_column is not None:
                     # noinspection PyUnboundLocalVariable
                     singlets[batch_indices] = singlets_batch
@@ -14024,17 +14490,16 @@ class SingleCell:
         else:
             return singlets
     
-    def find_doublets(self,
-                      batch_column: SingleCellColumn | None,
-                      *,
-                      QC_column: SingleCellColumn | None = 'passed_QC',
-                      doublet_fraction: float | np.floating | None = None,
-                      num_genes: int | np.integer = 500,
-                      doublet_column: str = 'doublet',
-                      doublet_score_column: str = 'doublet_score',
-                      overwrite: bool = False,
-                      # verbose: bool = False,
-                      num_threads: int | np.integer | None = None):
+    def find_doublets_old(self,
+                          batch_column: SingleCellColumn | None,
+                          *,
+                          QC_column: SingleCellColumn | None = 'passed_QC',
+                          doublet_fraction: float | np.floating | None = None,
+                          num_genes: int | np.integer = 500,
+                          doublet_column: str = 'doublet',
+                          doublet_score_column: str = 'doublet_score',
+                          overwrite: bool = False,
+                          num_threads: int | np.integer | None = None):
         """
         Find doublets using cxds (co-expression-based doublet scoring;
         academic.oup.com/bioinformatics/article/36/4/1150/5566507).
@@ -14203,7 +14668,7 @@ class SingleCell:
         num_threads = self._process_num_threads(num_threads)
         
         # Run doublet detection
-        singlets, doublet_scores = SingleCell._find_doublets(
+        singlets, doublet_scores = SingleCell._find_doublets_old(
             X=self._X, batch_column=batch_column, QC_column=QC_column,
             doublet_fraction=doublet_fraction, num_genes=num_genes,
             return_scores=True, num_threads=num_threads)
@@ -14219,6 +14684,1006 @@ class SingleCell:
             return self.with_columns_obs(
                 pl.when(QC_column).then(doublet_column),
                 pl.when(QC_column).then(doublet_score_column))
+    
+    # noinspection PyTypeChecker
+    @staticmethod
+    def _find_doublets(X: csr_array | csc_array,
+                       batch_column: SingleCellColumn | None,
+                       QC_column: SingleCellColumn | None,
+                       doublet_fraction: float | np.floating | None,
+                       num_genes: int | np.integer,
+                       return_scores: bool,
+                       num_threads: int | np.integer | None) -> \
+                np.ndarray[1, np.dtype[np.bool_]] | \
+                tuple[np.ndarray[1, np.dtype[np.bool_]],
+                      np.ndarray[1, np.dtype[np.float32]]]:
+        """
+        Find doublets using cxds (co-expression-based doublet scoring;
+        academic.oup.com/bioinformatics/article/36/4/1150/5566507). Used by
+        `qc()` (when `remove_doublets=True`) and `find_doublets()`.
+
+        Args:
+            X: the count matrix; may be either normalized or unnormalized
+            batch_column: an optional String, Enum, Categorical, or integer
+                          column of `obs` indicating which batch each cell is
+                          from. Can be a column name, a polars expression, a
+                          polars Series, a 1D NumPy array, or a function that
+                          takes in this SingleCell dataset and returns a polars
+                          Series or 1D NumPy array. Doublet detection will be
+                          performed separately for each batch. Set to `None` if
+                          all cells belong to the same sequencing batch.
+            QC_column: an optional Boolean column of `obs` indicating which
+                       cells passed QC. Can be a column name, a polars
+                       expression, a polars Series, a 1D NumPy array, or a
+                       function that takes in this SingleCell dataset and
+                       returns a polars Series or 1D NumPy array. Set to `None`
+                       to include all cells. Cells failing QC will be ignored
+                       and have their doublet labels and doublet scores set to
+                       `null`.
+            doublet_fraction: an optional fraction of cells (within each batch,
+                              if `batch_column` is specified) to be classified
+                              as doublets. If `None`, automatically detect the
+                              threshold via the approach described in
+                              `find_doublets()`.
+            num_genes: the number of highly variable genes, i.e. genes
+                       expressed in as close to 50% of cells as possible, to
+                       use during doublet detection. This parameter usually has
+                       a minimal influence on accuracy as long as it is
+                       sufficiently large (in the hundreds), so increasing it
+                       further will mainly just increase runtime. If
+                       `num_genes` is greater than the number of genes in the
+                       dataset, all genes will be used.
+            num_threads: the number of threads to use when finding doublets.
+                         Set `num_threads=-1` to use all available cores, as
+                         determined by `os.cpu_count()`, or leave unset to use
+                         `self.num_threads` cores.
+
+        Returns:
+            A NumPy array with the binary doublet calls (`True` for singlets,
+            `False` for doublets), or a tuple of two arrays with the doublet
+            calls and doublet scores when `return_scores=True`. Scores will be
+            uninitialized for cells not in any batch.
+        """
+        # Define Cython functions
+        is_csr = isinstance(X, csr_array)
+        cython_functions = cython_inline(_thread_offset_import + _heap_functions + r'''
+        from cython.parallel cimport parallel, prange, threadid
+        from libc.float cimport FLT_MAX
+        from libcpp.algorithm cimport nth_element, sort
+        from libcpp.cmath cimport abs, erfc, exp, floor, log, log1p, sqrt
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+
+        cdef extern from * nogil:
+            """
+            #define atomic_add(x, y) _Pragma("omp atomic") x += y
+            """
+            void atomic_add(unsigned &x, unsigned y)
+
+        cdef double log_one_half = -0.6931471805599453
+        cdef double log_sqrt_2_pi = 0.91893853320467274
+        cdef double one_over_sqrt_2 = 0.70710678118654752
+        cdef double one_over_sqrt_pi = 0.5641895835477563
+
+        cdef double[5] gamma_A = [
+            8.11614167470508450300E-4, -5.95061904284301438324E-4,
+            7.93650340457716943945E-4, -2.77777777730099687205E-3,
+            8.33333333333331927722E-2]
+
+        cdef double[6] gamma_B = [
+            -1.37825152569120859100E3, -3.88016315134637840924E4,
+            -3.31612992738871184744E5, -1.16237097492762307383E6,
+            -1.72173700820839662146E6, -8.53555664245765465627E5]
+
+        cdef double[6] gamma_C = [
+            -3.51815701436523470549E2, -1.70642106651881159223E4,
+            -2.20528590553854454839E5, -1.13933444367982507207E6,
+            -2.53252307177582951285E6, -2.01889141433532773231E6]
+
+        cdef double[6] P = [
+            0.5641895835477550741253201704,
+            1.275366644729965952479585264,
+            5.019049726784267463450058,
+            6.1602098531096305440906,
+            7.409740605964741794425,
+            2.97886562639399288862]
+
+        cdef double[6] Q = [
+            2.260528520767326969591866945,
+            9.396034016235054150430579648,
+            12.0489519278551290360340491,
+            17.08144074746600431571095,
+            9.608965327192787870698,
+            3.3690752069827527677]
+
+        cdef inline double p1evl(const double x,
+                                 const double* coef,
+                                 const unsigned N) noexcept nogil:
+            cdef double ans
+            cdef unsigned i
+
+            ans = x + coef[0]
+            for i in range(1, N):
+                ans = ans * x + coef[i]
+            return ans
+
+        cdef inline double polevl(const double x,
+                                  const double* coef,
+                                  const unsigned N) noexcept nogil:
+            cdef double ans
+            cdef unsigned i
+
+            ans = coef[0]
+            for i in range(1, N):
+                ans = ans * x + coef[i]
+            return ans
+
+        cdef inline double log_erfc(const double x) noexcept nogil:
+            # Based on GSL's gsl_sf_log_erfc_e at
+            # github.com/ampl/gsl/blob/master/specfunc/erfc.c#L306
+
+            cdef double y, series
+
+            if x * x < 0.02460783300575925:
+                y = x * one_over_sqrt_pi
+                series = 0.00048204
+                series = y * series - 0.00142906
+                series = y * series + 0.0013200243174
+                series = y * series + 0.0009461589032
+                series = y * series - 0.0045563339802
+                series = y * series + 0.00556964649138
+                series = y * series + 0.00125993961762116
+                series = y * series - 0.01621575378835404
+                series = y * series + 0.02629651521057465
+                series = y * series - 0.001829764677455021
+                series = y * series - 0.09439510239319526
+                series = y * series + 0.28613578213673563
+                series = y * series + 1
+                series = y * series + 1
+                return -2 * y * series
+            elif x > 8:
+                return log(polevl(x, &P[0], 6) / p1evl(x, &Q[0], 6)) - \
+                    x * x
+            else:
+                return log(erfc(x))
+
+        cdef inline double gammaln(double x) noexcept nogil:
+            # Simplified from github.com/scipy/scipy/blob/main/scipy/
+            # special/xsf/cephes/gamma.h, based on the knowledge that `x`
+            # will always be positive and finite when calculating terms in
+            # the binomial distribution
+
+            cdef double p, q, u, z
+
+            if x < 13:
+                z = 1
+                p = 0
+                u = x
+                while u >= 3:
+                    p -= 1
+                    u = x + p
+                    z *= u
+                while u < 2:
+                    z /= u
+                    p += 1
+                    u = x + p
+                z = abs(z)
+                if u == 2:
+                    return log(z)
+                p -= 2
+                x = x + p
+                p = x * polevl(x, &gamma_B[0], 6) / \
+                    p1evl(x, &gamma_C[0], 6)
+                return log(z) + p
+            elif x >= 1000:
+                q = (x - 0.5) * log(x) - x + log_sqrt_2_pi
+                if x > 1e8:
+                    return q
+                p = 1.0 / (x * x)
+                p = ((7.9365079365079365079365e-4 * p -
+                      2.7777777777777777777778e-3) *
+                     p + 0.0833333333333333333333) / x
+                return q + p
+            else:
+                q = (x - 0.5) * log(x) - x + log_sqrt_2_pi
+                p = 1.0 / (x * x)
+                return q + polevl(p, &gamma_A[0], 5) / x
+
+        cdef inline double binom_logsf_term(
+                const unsigned j,
+                const unsigned n,
+                const double log_p,
+                const double log1p_q,
+                const double gammaln_n_plus_1) noexcept nogil:
+            return gammaln_n_plus_1 - gammaln(j + 1) - \
+                gammaln(n - j + 1) + j * log_p + (n - j) * log1p_q
+
+        cdef inline double binom_logsf(const unsigned k,
+                                       const unsigned n,
+                                       const double p) noexcept nogil:
+            cdef unsigned j, j_max
+            cdef double mu, sigma, z
+            cdef double sum_exp, max_term, term, log_p, log1p_q, \
+                gammaln_n_plus_1
+
+            # Use the normal approximation when n * p and n * (1 - p) are
+            # both greater than 500; add 0.5 for continuity correction
+            if n * p > 500 and n * (1 - p) > 500:
+                mu = n * p
+                sigma = sqrt(mu * (1 - p))
+                z = (k + 0.5 - mu) / sigma
+                return log_erfc(z * one_over_sqrt_2) + log_one_half
+
+            # Otherwise, compute the exact binomial p-value
+            log_p = log(p)
+            log1p_q = log1p(-p)
+            gammaln_n_plus_1 = gammaln(n + 1)
+
+            # Find `j_max`, the value of `j` with the largest binomial term
+            # (the `term` variabel below). For a binomial distribution, the
+            # mode (maximum probability) occurs at `floor((n + 1) * p)`.
+            # However, since we are summing from `k + 1` to `n`, not 0 to
+            # `n`, we need to ensure `j_max` is at least `k + 1`.
+            j_max = <unsigned> floor((n + 1) * p)
+            if j_max <= k:
+                j_max = k + 1
+
+            max_term = binom_logsf_term(j_max, n, log_p, log1p_q,
+                                        gammaln_n_plus_1)
+
+            # Sum the terms of the binomial via the logsumexp trick. This
+            # improves numerical stability by subtracting off the max term
+            # from each term before exponentiation, then adding back the
+            # max term at the end.
+            sum_exp = 0
+            for j in range(k + 1, n + 1):
+                term = binom_logsf_term(j, n, log_p, log1p_q,
+                                        gammaln_n_plus_1)
+                sum_exp += exp(term - max_term)
+
+            return log(sum_exp) + max_term
+
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+
+        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+            cdef unsigned r, threshold = -bound % bound
+            while True:
+                r = rand(state)
+                if r >= threshold:
+                    return r % bound
+                    
+        cdef extern from * nogil:
+            """
+            struct CompareGreater {
+                const float* data;
+                CompareGreater() noexcept {}
+                CompareGreater(const float* d) noexcept : data(d) {}
+                bool operator()(unsigned a, unsigned b) const noexcept {
+                    return data[a] > data[b];
+                }
+            };
+            """
+            cdef cppclass CompareGreater:
+                CompareGreater(const float*) noexcept
+                bint operator()(unsigned, unsigned) noexcept
+        
+        def get_hvgs(unsigned[::1] all_detection_counts,
+                     unsigned[::1] detection_counts,
+                     float[::1] ps,
+                     unsigned[::1] hvgs,
+                     float[::1] distances,
+                     const unsigned num_cells,
+                     const unsigned num_total_genes,
+                     unsigned num_genes):
+            cdef unsigned gene, detection_count, i
+            cdef float p, distance, inverse_num_cells = 1.0 / num_cells
+            
+            # Normalize `detection_count` by `num_cells` to get the detection
+            # rate `p`. Get the `num_genes` most variable genes (those with
+            # detection rates closest to 50%), using a min-heap to keep track
+            # of the `num_genes` smallest "distances" from 50%.
+            for gene in range(num_genes):
+                distances[gene] = FLT_MAX
+            for gene in range(num_total_genes):
+                detection_count = all_detection_counts[gene]
+                p = detection_count * inverse_num_cells
+                distance = abs(p - 0.5)
+                if distance < distances[0]:
+                    max_heap_replace_top(&hvgs[0], &distances[0], gene, distance,
+                                         num_genes)
+            
+            # Exclude genes with detection rates of 0% or 100%, in the rare case
+            # that these make it into the top `num_genes` genes
+            while distances[0] == 0.5:
+                max_heap_pop(&hvgs[0], &distances[0], num_genes)
+                num_genes -= 1
+                if num_genes == 0:
+                    error_message = (
+                        'all genes are present in either 0% or 100% of cells')
+                    raise ValueError(error_message)
+            
+            # Sort the indices of the highly variable genes
+            sort(&hvgs[0], &hvgs[0] + num_genes)
+            
+            # Populate `detection_counts` and `ps` for the highly variable genes
+            for i in range(num_genes):
+                gene = hvgs[i]
+                detection_count = all_detection_counts[gene]
+                detection_counts[i] = detection_count
+                ps[i] = detection_count * inverse_num_cells
+            
+            # Return the number of genes (same as the input `num_genes` except in the
+            # rare case mentioned above)
+            return num_genes
+
+        def compute_obs(const unsigned[::1] detection_counts,
+                        const signed_integer[::1] indices,
+                        const signed_integer[::1] indptr,
+                        unsigned[:, ::1] obs,
+                        unsigned num_threads):
+
+            # obs[i, j] is the number of cells in which exactly one of the
+            # two genes i and j is expressed. If we define:
+            # - (1) as the number of cells where gene i is expressed
+            # - (2) as the number of cells where gene j is expressed
+            # - (3) as the number of cells where both genes i and j are
+            #   expressed
+            # then obs[i, j] = (1) + (2) - 2 * (3)
+            cdef unsigned detection_counts_i, cell, gene_i, gene_j, thread_index, \
+                num_genes = detection_counts.shape[0], \
+                num_cells = indptr.shape[0] - 1
+            cdef unsigned long i, j, i_start, i_end, j_end
+            cdef pair[unsigned, unsigned] row_range
+            cdef signed_integer indices_i
+
+            num_threads = min(num_threads, num_cells)
+            if num_threads == 1:
+                # Initialize the upper diagonal of obs to (1) + (2)
+                for i in range(num_genes):
+                    detection_counts_i = detection_counts[i]
+                    for j in range(i + 1, num_genes):
+                        obs[i, j] = detection_counts_i + detection_counts[j]
+
+                # Now subtract off 2 * (3) for the upper diagonal: iterate
+                # over all pairs of genes i and j within each cell, and
+                # subtract 2 from `obs[i, j]` for each pair
+                for cell in range(num_cells):
+                    for i in range(<unsigned long> indptr[cell],
+                                   <unsigned long> indptr[cell + 1]):
+                        indices_i = indices[i]
+                        for j in range(i + 1,
+                                       <unsigned long> indptr[cell + 1]):
+                            obs[indices_i, indices[j]] -= 2
+            else:
+                with nogil:
+                    for i in prange(num_genes, num_threads=num_threads):
+                        detection_counts_i = detection_counts[i]
+                        for j in range(i + 1, num_genes):
+                            obs[i, j] = detection_counts_i + detection_counts[j]
+
+                    with parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        row_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for cell in range(row_range.first, row_range.second):
+                            for i in range(<unsigned long> indptr[cell],
+                                           <unsigned long> indptr[cell + 1]):
+                                indices_i = indices[i]
+                                for j in range(i + 1,
+                                               <unsigned long> indptr[cell + 1]):
+                                    atomic_add(obs[indices_i, indices[j]], -2)
+
+        def compute_S(const unsigned[:, ::1] obs,
+                      const float[::1] ps,
+                      const unsigned num_cells,
+                      float[:, ::1] S,
+                      const unsigned num_threads):
+
+            cdef unsigned num_genes = ps.shape[0]
+            cdef unsigned i, j
+            cdef float ps_i
+
+            if num_threads == 1:
+                for i in range(num_genes):
+                    ps_i = ps[i]
+                    for j in range(i + 1, num_genes):
+                        S[i, j] = binom_logsf(
+                            k=obs[i, j] - 1, n=num_cells,
+                            p=ps_i * (1 - ps[j]) + (1 - ps_i) * ps[j])
+            else:
+                for i in prange(num_genes, nogil=True,
+                                num_threads=num_threads):
+                    ps_i = ps[i]
+                    for j in range(i + 1, num_genes):
+                        S[i, j] = binom_logsf(
+                            k=obs[i, j] - 1, n=num_cells,
+                            p=ps_i * (1 - ps[j]) + (1 - ps_i) * ps[j])
+
+        def compute_cxds(
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                const float[:, ::1] S,
+                float[::1] cxds_scores,
+                unsigned num_threads):
+
+            cdef unsigned cell, gene_i, gene_j, thread_index, \
+                num_cells = indptr.shape[0] - 1
+            cdef unsigned long i, j, i_start, i_end, j_end
+            cdef float cxds_score
+            cdef pair[unsigned, unsigned] row_range
+
+            # Iterate over all pairs of genes i and j within each cell, and
+            # subtract `S[i, j]` from the cell's cxds score for each pair
+            num_threads = min(num_threads, num_cells)
+            if num_threads == 1:
+                for cell in range(num_cells):
+                    cxds_score = 0
+                    for gene_i in range(<unsigned long> indptr[cell],
+                                        <unsigned long> indptr[cell + 1]):
+                        i = indices[gene_i]
+                        for gene_j in range(gene_i + 1,
+                                            <unsigned long> indptr[cell + 1]):
+                            j = indices[gene_j]
+                            cxds_score = cxds_score - S[i, j]
+                    cxds_scores[cell] = cxds_score
+            else:
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(indptr, thread_index, num_threads)
+                    for cell in range(row_range.first, row_range.second):
+                        cxds_score = 0
+                        for gene_i in range(<unsigned long> indptr[cell],
+                                            <unsigned long> indptr[cell + 1]):
+                            i = indices[gene_i]
+                            for gene_j in range(gene_i + 1,
+                                                <unsigned long> indptr[cell + 1]):
+                                j = indices[gene_j]
+                                cxds_score = cxds_score - S[i, j]
+                        cxds_scores[cell] = cxds_score
+        
+        def simulate_doublets(
+                const numeric[::1] data,
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                signed_integer[::1] sim_indices,
+                signed_integer[::1] sim_indptr,
+                const unsigned num_cells,
+                const unsigned long seed):
+
+            cdef unsigned long i, j, i_end, j_end, nnz = 0, state = srand(seed)
+            cdef unsigned sim_index, cell_i, cell_j
+
+            sim_indptr[0] = 0
+            for sim_index in range(1, num_cells + 1):
+                cell_i = randint(num_cells, &state)
+                cell_j = randint(num_cells, &state)
+                i = indptr[cell_i]
+                i_end = indptr[cell_i + 1]
+                j = indptr[cell_j]
+                j_end = indptr[cell_j + 1]
+                while True:
+                    if indices[i] == indices[j]:
+                        sim_indices[nnz] = indices[i]
+                        nnz = nnz + 1
+                        i = i + 1
+                        j = j + 1
+                        if i == i_end or j == j_end:
+                            break
+                    elif indices[i] < indices[j]:
+                        # `rand(&state) & 1` gives a random Boolean; only
+                        # coin-flip if `data[i] == 1`
+                        if data[i] > 1 or rand(&state) & 1:
+                            sim_indices[nnz] = indices[i]
+                            nnz = nnz + 1
+                        i = i + 1
+                        if i == i_end:
+                            break
+                    else:
+                        if data[j] > 1 or rand(&state) & 1:
+                            sim_indices[nnz] = indices[j]
+                            nnz = nnz + 1
+                        j = j + 1
+                        if j == j_end:
+                            break
+                sim_indptr[sim_index] = nnz
+            
+        def call_doublets(const float[::1] cxds_scores,
+                          const float median_cxds_score_sim,
+                          const unsigned[::1] batch_indices,
+                          unsigned[::1] doublet_indices,
+                          char[::1] singlets,
+                          float[::1] doublet_scores,
+                          const float doublet_fraction,
+                          const unsigned num_threads):
+            cdef unsigned i, num_doublets, num_cells = cxds_scores.shape[0], \
+                parallel_threshold = max(10_000, num_threads)
+            
+            if doublet_fraction == -1:  # `doublet_fraction is None`
+                # Call doublets based on whether their cxds score is
+                # above the median cxds score for simulated doublets;
+                # `doublet_indices` is unused
+            
+                if batch_indices.shape[0] == 0:  # `batch_column is None`
+                    if num_threads == 1 or num_cells < parallel_threshold:
+                        for i in range(num_cells):
+                            singlets[i] = cxds_scores[i] < median_cxds_score_sim
+                    else:
+                        for i in prange(num_cells, nogil=True, num_threads=num_threads):
+                            singlets[i] = cxds_scores[i] < median_cxds_score_sim
+                else:  # `batch_column is not None`
+                    # Same as when `batch_column is None`, but use `batch_indices[i]`
+                    # instead of `i` on the left, and also assign `doublet_scores`
+                    
+                    if doublet_scores.shape[0] == 0:  # `not return_scores`
+                        if num_threads == 1 or num_cells < parallel_threshold:
+                            for i in range(num_cells):
+                                singlets[batch_indices[i]] = cxds_scores[i] < median_cxds_score_sim
+                        else:
+                            for i in prange(num_cells, nogil=True, num_threads=num_threads):
+                                singlets[batch_indices[i]] = cxds_scores[i] < median_cxds_score_sim
+                    else:  # `return scores`
+                        if num_threads == 1 or num_cells < parallel_threshold:
+                            for i in range(num_cells):
+                                singlets[batch_indices[i]] = cxds_scores[i] < median_cxds_score_sim
+                                doublet_scores[batch_indices[i]] = cxds_scores[i]
+                        else:
+                            for i in prange(num_cells, nogil=True, num_threads=num_threads):
+                                singlets[batch_indices[i]] = cxds_scores[i] < median_cxds_score_sim
+                                doublet_scores[batch_indices[i]] = cxds_scores[i]
+            else:  # `doublet_fraction is not None`
+                # Call a fixed fraction of cells as doublets;
+                # `median_cxds_score_sim` is unused
+                
+                num_doublets = <unsigned>(num_cells * doublet_fraction)
+                for i in range(num_cells):
+                    doublet_indices[i] = i
+                nth_element(&doublet_indices[0], &doublet_indices[0] + num_doublets,
+                            &doublet_indices[0] + num_cells,
+                            CompareGreater(&cxds_scores[0]))
+                
+                if batch_indices.shape[0] == 0:  # `batch_column is None`
+                    if num_threads == 1 or num_doublets < parallel_threshold:
+                        for i in range(num_doublets):
+                            singlets[doublet_indices[i]] = False
+                    else:
+                        for i in prange(num_doublets, nogil=True,
+                                        num_threads=num_threads):
+                            singlets[doublet_indices[i]] = False
+                    if num_threads == 1 or num_cells - num_doublets < parallel_threshold:
+                        for i in range(num_doublets, num_cells):
+                            singlets[doublet_indices[i]] = True
+                    else:
+                        for i in prange(num_doublets, num_cells, nogil=True,
+                                        num_threads=num_threads):
+                            singlets[doublet_indices[i]] = True
+                else:  # `batch_column is not None`
+                    # Same as when `batch_column is None`, but use
+                    # `batch_indices[doublet_indices[i]]` instead of
+                    # `doublet_indices[i]` and `batch_indices[i]` instead of `i` on the
+                    # left
+                    
+                    if num_threads == 1 or num_doublets < parallel_threshold:
+                        for i in range(num_doublets):
+                            singlets[batch_indices[doublet_indices[i]]] = False
+                    else:
+                        for i in prange(num_doublets, nogil=True,
+                                        num_threads=num_threads):
+                            singlets[batch_indices[doublet_indices[i]]] = False
+                    if num_threads == 1 or num_cells - num_doublets < parallel_threshold:
+                        for i in range(num_doublets, num_cells):
+                            singlets[batch_indices[doublet_indices[i]]] = True
+                    else:
+                        for i in prange(num_doublets, num_cells, nogil=True,
+                                        num_threads=num_threads):
+                            singlets[batch_indices[doublet_indices[i]]] = True
+                    if doublet_scores.shape[0] > 0:  # `return_scores`
+                        if num_threads == 1 or num_cells < parallel_threshold:
+                            for i in range(num_cells):
+                                doublet_scores[batch_indices[i]] = cxds_scores[i]
+                        else:
+                            for i in prange(num_cells, nogil=True,
+                                            num_threads=num_threads):
+                                doublet_scores[batch_indices[i]] = cxds_scores[i]
+        ''', warn_undeclared=False)
+        get_hvgs = cython_functions['get_hvgs']
+        compute_obs = cython_functions['compute_obs']
+        compute_S = cython_functions['compute_S']
+        compute_cxds = cython_functions['compute_cxds']
+        simulate_doublets = cython_functions['simulate_doublets']
+        call_doublets = cython_functions['call_doublets']
+        
+        # If `batch_column` was specified, get the row indices of each batch,
+        # ignoring cells failing QC when `QC_column` is present in `obs`. If
+        # no batches were specified but `QC_column` is present, use `QC_column`
+        # as the batch labels.
+        if QC_column is not None and batch_column is None:
+            batch_column = QC_column
+        if batch_column is not None:
+            batch_column_name = batch_column.name
+            # noinspection PyTypeChecker
+            batches = (batch_column
+                       .to_frame()
+                       .lazy()
+                       .with_columns(_SingleCell_batch_indices=pl.int_range(
+                           pl.len(), dtype=pl.UInt32))
+                       if QC_column is None else
+                       batch_column
+                       .to_frame()
+                       .lazy()
+                       .with_columns(
+                           _SingleCell_batch_indices=pl.int_range(
+                               pl.len(), dtype=pl.UInt32))
+                       .filter(QC_column)) \
+                .group_by(batch_column_name, maintain_order=True) \
+                .agg('_SingleCell_batch_indices') \
+                .select('_SingleCell_batch_indices') \
+                .collect() \
+                .to_series()
+        else:
+            batches = pl.Series([], dtype=pl.UInt32),
+        
+        # Preallocate
+        singlets = np.empty(X.shape[0], dtype=bool)
+        doublet_scores = np.empty(X.shape[0] if return_scores else 0,
+                                  dtype=np.float32)
+        max_cells = batches.list.len().max() \
+            if batch_column is not None else X.shape[0]
+        if doublet_fraction is not None:
+            doublet_indices = np.empty(max_cells, dtype=np.uint32)
+        else:
+            # Set `doublet_fraction` to `-1` if `None`, so it can be passed to
+            # Cython as a float
+            doublet_fraction = -1
+            doublet_indices = np.array([], dtype=np.uint32)
+        num_total_genes = X.shape[1]
+        all_detection_counts = np.empty(num_total_genes, dtype=np.uint32)
+        detection_counts = np.empty(num_genes, dtype=np.uint32)
+        ps = np.empty(num_genes, dtype=np.float32)
+        hvgs = np.empty(num_genes, dtype=np.uint32)
+        distances = np.empty(num_genes, dtype=np.float32)
+        obs_buffer = np.empty(num_genes * num_genes, dtype=np.uint32)
+        S_buffer = np.empty(num_genes * num_genes, dtype=np.float32)
+        cxds_scores_buffer = np.empty(max_cells, dtype=np.float32)
+        sim_indptr_buffer = np.empty(max_cells + 1, dtype=X.indptr.dtype)
+        cxds_scores_sim_buffer = np.empty(max_cells, dtype=np.float32)
+        
+        # noinspection PyUnresolvedReferences
+        original_num_threads = X._num_threads
+        try:
+            X._num_threads = num_threads
+            # For each batch...
+            for batch_index, batch_indices in enumerate(batches):
+                # Subset to cells in this batch
+                if batch_column is None:
+                    X_batch = X
+                else:
+                    if len(batch_indices) == 1:
+                        continue
+                    X_batch = X[batch_indices]
+                
+                # Get the detection count of each gene
+                getnnz(X_batch, axis=0, num_threads=num_threads,
+                       nnz=all_detection_counts)
+                    
+                # Normalize `detection_counts` by `num_cells` to get the
+                # detection rate `p`. Subset to the `num_genes` genes with
+                # detection rates closest to 50%. Exclude genes with detection
+                # rates of 0% or 100%.
+                num_cells = X_batch.shape[0]
+                
+                batch_num_genes = get_hvgs(
+                    all_detection_counts=all_detection_counts,
+                    detection_counts=detection_counts, ps=ps, hvgs=hvgs,
+                    distances=distances, num_cells=num_cells,
+                    num_total_genes=num_total_genes, num_genes=num_genes)
+                detection_counts = detection_counts[:batch_num_genes]
+                ps = ps[:batch_num_genes]
+                X_batch = X_batch[:, hvgs[:batch_num_genes]]
+                
+                # Convert `X_batch` to CSR, if CSC
+                if not is_csr:
+                    X_batch = X_batch.tocsr()
+                
+                # Sort indices, if not already sorted (necessary for
+                # `simulate_doublets`)
+                if not X.has_sorted_indices:
+                    X_batch.sort_indices()
+                
+                # Get `obs`, where `obs[i, j]` is the number of cells that
+                # express exactly one of genes `i` and `j`
+                obs = obs_buffer[:batch_num_genes * batch_num_genes]\
+                    .reshape((batch_num_genes, batch_num_genes))
+                compute_obs(detection_counts=detection_counts,
+                            indices=X_batch.indices, indptr=X_batch.indptr,
+                            obs=obs, num_threads=num_threads)
+                
+                # Get `S`, the upper-tail log binomial p-values of `obs`
+                S = S_buffer[:batch_num_genes * batch_num_genes]\
+                    .reshape((batch_num_genes, batch_num_genes))
+                compute_S(obs=obs, ps=ps, num_cells=num_cells, S=S,
+                          num_threads=num_threads)
+                
+                # Calculate each cell's cxds score: the sum of `-S[i, j]`
+                # across all gene pairs `i` and `j` that are both expressed by
+                # the cell
+                cxds_scores = cxds_scores_buffer[:num_cells]
+                compute_cxds(indices=X_batch.indices, indptr=X_batch.indptr,
+                             S=S, cxds_scores=cxds_scores,
+                             num_threads=num_threads)
+                
+                # Now simulate doublets within the batch and compute their cxds
+                # scores, using the original `S` matrix derived from the real
+                # data. Conservatively allocate twice as much memory for the
+                # indices as the original indices, since in the worst-case
+                # scenario none of the indices will match up and all coinflips
+                # will be 1.
+                sim_indptr = sim_indptr_buffer[:num_cells + 1]
+                sim_indices = np.empty(2 * len(X_batch.indices),
+                                       dtype=X_batch.indices.dtype)
+                simulate_doublets(data=X_batch.data, indices=X_batch.indices,
+                                  indptr=X_batch.indptr,
+                                  sim_indices=sim_indices,
+                                  sim_indptr=sim_indptr, num_cells=num_cells,
+                                  seed=batch_index)
+                sim_indices = sim_indices[:sim_indptr[-1]]
+                cxds_scores_sim = cxds_scores_sim_buffer[:num_cells]
+                compute_cxds(indices=sim_indices, indptr=sim_indptr, S=S,
+                             cxds_scores=cxds_scores_sim,
+                             num_threads=num_threads)
+                
+                # Call doublets. If using multiple batches, map doublet labels
+                # (and scores, if `return_scores`) back to the full dataset.
+                # noinspection PyUnresolvedReferences
+                call_doublets(cxds_scores=cxds_scores,
+                              median_cxds_score_sim=np.median(cxds_scores_sim)
+                                  if doublet_fraction == -1 else 0,
+                              doublet_indices=doublet_indices,
+                              batch_indices=batch_indices.to_numpy(),
+                              singlets=singlets,
+                              doublet_scores=doublet_scores,
+                              doublet_fraction=doublet_fraction,
+                              num_threads=num_threads)
+        finally:
+            X._num_threads = original_num_threads
+        if return_scores:
+            if batch_column is None:
+                # noinspection PyUnboundLocalVariable
+                doublet_scores = cxds_scores
+            return singlets, doublet_scores
+        else:
+            return singlets
+    
+    def find_doublets(self,
+                      batch_column: SingleCellColumn | None,
+                      *,
+                      QC_column: SingleCellColumn | None = 'passed_QC',
+                      doublet_fraction: float | np.floating | None = None,
+                      num_genes: int | np.integer = 500,
+                      doublet_column: str = 'doublet',
+                      doublet_score_column: str | None = 'doublet_score',
+                      overwrite: bool = False,
+                      num_threads: int | np.integer | None = None):
+        """
+        Find doublets using cxds (co-expression-based doublet scoring;
+        academic.oup.com/bioinformatics/article/36/4/1150/5566507).
+
+        The standard way to filter out doublets is by specifying
+        `remove_doublets=True` in `qc()`. If you did that, do not use this
+        function! This function should only be used in the unusual scenario
+        where you want to find doublets without running any other
+        quality-control steps.
+
+        This function gives the same result regardless of whether it is run
+        before or after normalization. The actual expression value does not
+        matter, only whether or not it is zero.
+
+        Doublets cannot occur across sequencing batches, so make sure to
+        specify `batch_column` if your dataset has multiple batches! Doublet
+        detection will be done independently within each batch.
+
+        Since the cxds score is continuous, it needs to be converted into a
+        binary classification of doublets versus non-doublets. This problem can
+        be framed as finding a cxds score threshold above which a cell is
+        deemed to be a doublet. To determine this threshold, we simulate
+        doublets by combining the counts from randomly selected pairs of cells,
+        via the following steps:
+
+        1) Sample as many random pairs of cells (with replacement) as there are
+           real cells.
+        2) Combine the counts from each pair of cells into a simulated doublet.
+           Because cxds operates on binarized count matrices, we average the
+           two cells' count matrices in a binary sense: if a gene is expressed
+           in either cell, it is deemed to be expressed in the simulated
+           doublet, but if it has a count of 1 in one cell and 0 in the other,
+           it is randomly chosen to be either expressed or not expressed with
+           equal probability (since the average count would be 0.5).
+        3) Calculate cxds scores for these simulated doublets, based on the
+           coexpression patterns (the `S` matrix from cxds) learned from the
+           real data.
+        4) Take the median cxds score of the simulated doublets as the
+           threshold. In other words, if a real cell has a higher doublet score
+           than the average simulated doublet, we call it a doublet.
+
+        Alternatively, specify `doublet_fraction` to force a specific fraction
+        of cells to be classified as doublets.
+
+        Args:
+            batch_column: an optional String, Enum, Categorical, or integer
+                          column of `obs` indicating which batch each cell is
+                          from. Can be a column name, a polars expression, a
+                          polars Series, a 1D NumPy array, or a function that
+                          takes in this SingleCell dataset and returns a polars
+                          Series or 1D NumPy array. Doublet detection will be
+                          performed separately for each batch. Set to `None` if
+                          all cells belong to the same sequencing batch.
+            QC_column: an optional Boolean column of `obs` indicating which
+                       cells passed QC. Can be a column name, a polars
+                       expression, a polars Series, a 1D NumPy array, or a
+                       function that takes in this SingleCell dataset and
+                       returns a polars Series or 1D NumPy array. Set to `None`
+                       to include all cells. Cells failing QC will be ignored
+                       and have their doublet labels and doublet scores set to
+                       `null`.
+            doublet_fraction: an optional fraction of cells (within each batch,
+                              if `batch_column` is specified) to be classified
+                              as doublets. If `None`, automatically detect the
+                              threshold via the approach described above.
+            num_genes: the number of highly variable genes, i.e. genes
+                       expressed in as close to 50% of cells as possible, to
+                       use during doublet detection. This parameter usually has
+                       a minimal influence on accuracy as long as it is
+                       sufficiently large (in the hundreds), so increasing it
+                       further will mainly just increase runtime. If
+                       `num_genes` is greater than the number of genes in the
+                       dataset, all genes will be used.
+            doublet_column: the name of a Boolean column to be added to `obs`
+                            containing the doublet labels, i.e. whether each
+                            cell is predicted to be a doublet
+            doublet_score_column: the name of a column to be added to `obs`
+                                  containing each cell's doublet score. Higher
+                                  scores indicate greater likelihood of being a
+                                  doublet. Scores are not normalized and are
+                                  not comparable across datasets or batches,
+                                  but are guaranteed to be positive (since they
+                                  are sums of log p-values). Set
+                                  `doublet_score_column=None` to not return
+                                  doublet scores, for a slight memory reduction
+                                  and speed increase.
+            overwrite: if `True`, overwrite `doublet_column` and/or
+                       `doublet_score_column` if already present in `obs`,
+                       instead of raising an error
+            num_threads: the number of threads to use when finding doublets.
+                         Set `num_threads=-1` to use all available cores, as
+                         determined by `os.cpu_count()`, or leave unset to use
+                         `self.num_threads` cores.
+
+        Returns:
+            A new SingleCell dataset where `var` contains two additional
+            columns, `doublet_column` (default: `doublet`), indicating whether
+            each cell is predicted to be a doublet, and `doublet_score_column`
+            (default: `'doublet_score'`), containing each cell's doublet score.
+
+        Note:
+            This function's cxds scores are almost exactly half the original
+            implementation's, because it avoids double-counting the two genes
+            in each gene pair. Slight deviations from this one-half (usually
+            by less than one part in a million) may occur because this function
+            uses a normal approximation to the binomial p-value to avoid long
+            runtimes on large datasets.
+
+        Note:
+            This function may give an incorrect output if the count matrix
+            contains explicit zeros (i.e. if `(X.data == 0).any()`): this is
+            not checked for, due to speed considerations. In the unlikely event
+            that your dataset contains explicit zeros, remove them by running
+            `X.eliminate_zeros()` (an in-place operation) first.
+        """
+        # Check that `overwrite` is Boolean
+        check_type(overwrite, 'overwrite', bool, 'Boolean')
+        
+        # Check that `doublet_column` and (if not `None`)
+        # `doublet_score_column` are strings and, unless `overwrite=True`, not
+        # already in `obs`
+        check_type(doublet_column, 'doublet_column', str, 'a string')
+        if not overwrite and doublet_column in self._obs:
+            error_message = (
+                f'doublet_column {doublet_column!r} is already a column of '
+                f'obs; did you already run find_doublets()? Set '
+                f'overwrite=True to overwrite.')
+            raise ValueError(error_message)
+        return_scores = doublet_score_column is not None
+        if return_scores:
+            check_type(doublet_score_column, 'doublet_score_column', str,
+                       'a string')
+            if not overwrite and doublet_score_column in self._obs:
+                error_message = (
+                    f'doublet_score_column {doublet_score_column!r} is '
+                    f'already a column of obs; did you already run '
+                    f'find_doublets()? Set overwrite=True to overwrite.')
+                raise ValueError(error_message)
+        
+        # Check that `X` is present
+        if self._X is None:
+            error_message = 'X is None, so doublet finding is not possible'
+            raise ValueError(error_message)
+        
+        # Check that `self` is QCed
+        if not self._uns['QCed']:
+            error_message = (
+                "uns['QCed'] is False; did you forget to run qc() before "
+                "find_doublets()? Set uns['QCed'] = True or run "
+                "with_uns(QCed=True) to bypass this check.")
+            raise ValueError(error_message)
+        
+        # Get `QC_column` and `batch_column`, if not None
+        if QC_column is not None:
+            QC_column = self._get_column(
+                'obs', QC_column, 'QC_column', pl.Boolean,
+                allow_missing=QC_column == 'passed_QC')
+        if batch_column is not None:
+            batch_column = self._get_column(
+                'obs', batch_column, 'batch_column',
+                (pl.String, pl.Categorical, pl.Enum, 'integer'),
+                QC_column=QC_column)
+        
+        # Check that `doublet_fraction`, if specified, is > 0 and < 1
+        if doublet_fraction is not None:
+            check_type(doublet_fraction, 'doublet_fraction', float,
+                       'a number greater than 0 and less than 1')
+            check_bounds(doublet_fraction, 'doublet_fraction', 0, 1,
+                         left_open=True, right_open=True)
+        
+        # Check that `num_genes` is a positive integer
+        check_type(num_genes, 'num_genes', int, 'a positive integer')
+        check_bounds(num_genes, 'num_genes', 1)
+        
+        # Check that `num_threads` is a positive integer, -1 or `None`; if
+        # `None`, set to `self.num_threads`, and if -1, set to `os.cpu_count()`
+        num_threads = self._process_num_threads(num_threads)
+        
+        # Run doublet detection
+        singlets = SingleCell._find_doublets(
+            X=self._X, batch_column=batch_column, QC_column=QC_column,
+            doublet_fraction=doublet_fraction, num_genes=num_genes,
+            return_scores=return_scores, num_threads=num_threads)
+        
+        # Convert doublet labels (and scores, if `doublet_score_column` is not
+        # `None`) to polars Series to add to `obs`. If `QC_column` exists, set
+        # doublet labels (and scores) to `null` for cells failing QC.
+        if not return_scores:
+            doublet_column = pl.Series(doublet_column, ~singlets)
+            if QC_column is None:
+                return self.with_columns_obs(doublet_column)
+            else:
+                return self.with_columns_obs(
+                    pl.when(QC_column).then(doublet_column))
+        else:
+            singlets, doublet_scores = singlets
+            doublet_column = pl.Series(doublet_column, ~singlets)
+            doublet_score_column = \
+                pl.Series(doublet_score_column, doublet_scores)
+            if QC_column is None:
+                return self.with_columns_obs(doublet_column,
+                                             doublet_score_column)
+            else:
+                return self.with_columns_obs(
+                    pl.when(QC_column).then(doublet_column),
+                    pl.when(QC_column).then(doublet_score_column))
     
     def make_obs_names_unique(self, separator: str = '-') -> SingleCell:
         """
@@ -14512,12 +15977,12 @@ class SingleCell:
         groups = (pl.LazyFrame((cell_type_column, ID_column))
                   .with_columns(
                       _SingleCell_group_indices=pl.int_range(pl.len(),
-                                                             dtype=pl.Int32))
+                                                             dtype=pl.UInt32))
                   if QC_column is None else
                   pl.LazyFrame((cell_type_column, ID_column, QC_column))
                   .with_columns(
                       _SingleCell_group_indices=pl.int_range(pl.len(),
-                                                             dtype=pl.Int32))
+                                                             dtype=pl.UInt32))
                   .filter(QC_column.name))\
             .group_by(cell_type_column_name, ID_column_name)\
             .agg('_SingleCell_group_indices',
@@ -14546,7 +16011,8 @@ class SingleCell:
                 num_both_null = \
                     num_excluded - num_ID_null_only - num_cell_type_null_only
                 if num_excluded > 0:
-                    print(f'Excluding {num_excluded:,} cells when '
+                    print(f'Excluding {num_excluded:,} '
+                          f'{plural("cell", num_excluded)} when '
                           f'pseudobulking: {num_both_null:,} with nulls in '
                           f'both the ID ({ID_column_name!r}) and cell-type '
                           f'({cell_type_column_name!r}) columns, '
@@ -14556,7 +16022,12 @@ class SingleCell:
                     groups = groups.drop_nulls()
             else:
                 groups = groups.drop_nulls()
-        
+            if len(groups) == 0:
+                error_message = (
+                    f'no cells remain after excluding cells with nulls in the '
+                    f'the ID and/or cell-type columns')
+                raise ValueError(error_message)
+                
         # Pseudobulk, storing the result in a preallocated NumPy array
         result = np.empty((len(groups), X.shape[1]), dtype=np.uint32)
         if isinstance(X, csr_array):
@@ -14565,7 +16036,6 @@ class SingleCell:
             group_ends = groups[num_cells_column_name].cum_sum().to_numpy()
             cython_inline(r'''
                 from cython.parallel cimport prange
-                from libcpp.algorithm cimport fill
                 
                 ctypedef fused numeric:
                     int
@@ -14583,13 +16053,12 @@ class SingleCell:
                         const numeric[::1] data,
                         const signed_integer[::1] indices,
                         const signed_integer[::1] indptr,
-                        const int[::1] group_indices,
+                        const unsigned[::1] group_indices,
                         const unsigned[::1] group_ends,
                         unsigned[:, ::1] result,
                         const unsigned num_threads):
-                    cdef unsigned group, cell, num_groups = group_ends.shape[0], \
+                    cdef unsigned group, cell, row, num_groups = group_ends.shape[0], \
                         num_genes = result.shape[1]
-                    cdef int row
                     cdef unsigned long gene
                     
                     if num_threads == 1:
@@ -14616,7 +16085,7 @@ class SingleCell:
                     else:
                         for group in prange(num_groups, nogil=True,
                                             num_threads=num_threads):
-                            fill(&result[group, 0], &result[group, 0] + num_genes, 0)
+                            result[group, :] = 0
                             for cell in range(
                                     0 if group == 0 else group_ends[group - 1],
                                     group_ends[group]):
@@ -14630,7 +16099,7 @@ class SingleCell:
                     group_indices=group_indices, group_ends=group_ends,
                     result=result, num_threads=num_threads)
         else:
-            group_map = pl.int_range(X.shape[0], dtype=pl.Int32, eager=True)\
+            group_map = pl.int_range(X.shape[0], dtype=pl.UInt32, eager=True)\
                 .to_frame('_SingleCell_group_indices')\
                 .join(groups
                       .select('_SingleCell_group_indices',
@@ -14643,70 +16112,74 @@ class SingleCell:
             if has_missing:
                 group_map = group_map.fill_null(-1)
             group_map = group_map.to_numpy()
-            cython_inline('''
-                from cython.parallel cimport prange
-                
-                ctypedef fused numeric:
-                    int
-                    unsigned
-                    long
-                    unsigned long
-                    float
-                    double
-                
-                ctypedef fused signed_integer:
-                    int
-                    long
-                
-                def groupby_sum_csc(
-                        const numeric[::1] data,
-                        const signed_integer[::1] indices,
-                        const signed_integer[::1] indptr,
-                        const int[::1] group_map,
-                        const bint has_missing,
-                        unsigned[:, ::1] result,
-                        const unsigned num_threads):
-                    cdef unsigned gene, num_genes = result.shape[1]
-                    cdef int group
-                    cdef unsigned long cell
-                    
-                    result[:] = 0
-                    if num_threads == 1:
-                        if has_missing:
-                            # For each gene (column of the sparse array)...
-                            for gene in range(num_genes):
-                                # For each cell (row) that's non-zero for this
-                                # gene...
-                                for cell in range(<unsigned long> indptr[gene], <unsigned long> indptr[gene + 1]):
-                                    # Get the group index for this cell (-1 if it
-                                    # failed QC)
-                                    group = group_map[indices[cell]]
-                                    if group == -1:
-                                        continue
-                                    
-                                    # Add the value at this cell and gene to the
-                                    # total for this group and gene
-                                    result[group, gene] += <unsigned> data[cell]
-                        else:
-                            for gene in range(num_genes):
-                                for cell in range(<unsigned long> indptr[gene], <unsigned long> indptr[gene + 1]):
-                                    group = group_map[indices[cell]]
-                                    result[group, gene] += <unsigned> data[cell]
-                    else:
-                        if has_missing:
-                            for gene in prange(num_genes, nogil=True,
-                                               num_threads=num_threads):
-                                for cell in range(<unsigned long> indptr[gene], <unsigned long> indptr[gene + 1]):
-                                    group = group_map[indices[cell]]
-                                    if group == -1:
-                                        continue
-                                    result[group, gene] += <unsigned> data[cell]
-                        else:
-                            for gene in prange(num_genes, nogil=True,
-                                               num_threads=num_threads):
-                                for cell in range(<unsigned long> indptr[gene], <unsigned long> indptr[gene + 1]):
-                                    group = group_map[indices[cell]]
-                                    result[group, gene] += <unsigned> data[cell]
+            cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, threadid
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def groupby_sum_csc(
+                const numeric[::1] data,
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                const int[::1] group_map,
+                const bint has_missing,
+                unsigned[:, ::1] result,
+                unsigned num_threads):
+            cdef unsigned gene, thread_index, num_genes = result.shape[1]
+            cdef int group
+            cdef unsigned long cell
+            cdef pair[unsigned, unsigned] col_range
+            
+            result[:] = 0
+            num_threads = min(num_threads, num_genes)
+            if num_threads == 1:
+                if has_missing:
+                    # For each gene (column of the sparse array)...
+                    for gene in range(num_genes):
+                        # For each cell (row) that's non-zero for this gene...
+                        for cell in range(<unsigned long> indptr[gene],
+                                          <unsigned long> indptr[gene + 1]):
+                            # Get the group index for this cell (-1 if it failed QC)
+                            group = group_map[indices[cell]]
+                            if group == -1:
+                                continue
+                            
+                            # Add the value at this cell and gene to the total for this
+                            # group and gene
+                            result[group, gene] += <unsigned> data[cell]
+                else:
+                    for gene in range(num_genes):
+                        for cell in range(<unsigned long> indptr[gene],
+                                          <unsigned long> indptr[gene + 1]):
+                            group = group_map[indices[cell]]
+                            result[group, gene] += <unsigned> data[cell]
+            else:
+                if has_missing:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            for cell in range(<unsigned long> indptr[gene],
+                                              <unsigned long> indptr[gene + 1]):
+                                group = group_map[indices[cell]]
+                                if group == -1:
+                                    continue
+                                result[group, gene] += <unsigned> data[cell]
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            for cell in range(<unsigned long> indptr[gene],
+                                              <unsigned long> indptr[gene + 1]):
+                                group = group_map[indices[cell]]
+                                result[group, gene] += <unsigned> data[cell]
                     ''', warn_undeclared=False)['groupby_sum_csc'](
                         data=X.data, indices=X.indices, indptr=X.indptr,
                         group_map=group_map, has_missing=has_missing,
@@ -14935,6 +16408,9 @@ class SingleCell:
             selecting the final list of highly variable genes, instead of the
             unstable sort used by Seurat and Scanpy.
         """
+        # noinspection PyUnresolvedReferences
+        from skmisc.loess import loess
+        
         # If `others` was specified, check that all elements of `others` are
         # SingleCell datasets
         if others:
@@ -14964,8 +16440,6 @@ class SingleCell:
                 f'X is None{suffix}, so highly variable gene finding is not '
                 f'possible')
             raise ValueError(error_message)
-        # noinspection PyUnresolvedReferences
-        from skmisc.loess import loess
         
         # Check that all datasets are QCed and not normalized
         if not all(dataset._uns['QCed'] for dataset in datasets):
@@ -14980,12 +16454,12 @@ class SingleCell:
                 f"True{suffix}; did you already run normalize()?")
             raise ValueError(error_message)
         
-        # Check that there are at least three cells in each dataset (since
-        # LOESS seems to need at least three observations to converge)
+        # Check that there are at least 3 cells in each dataset (since LOESS
+        # seems to need at least three observations to converge)
         if any(len(dataset._obs) < 3 for dataset in datasets):
             error_message = (
-                f'there are fewer than three cells{suffix}, so '
-                f'highly variable genes cannot be calculated')
+                f'there are fewer than 3 cells{suffix}, so highly variable '
+                f'genes cannot be calculated')
             raise ValueError(error_message)
         
         # Get `QC_column` and `batch_column` from every dataset, if not `None`
@@ -15008,8 +16482,8 @@ class SingleCell:
         if any(len(dataset._obs) < min_cells for dataset in datasets):
             suffix = ' for at least one dataset' if others else ''
             error_message = (
-                f'the number of cells in this dataset ({len(self._obs)}) '
-                f'is less than min_cells ({min_cells}){suffix}; increase '
+                f'the number of cells in this dataset ({len(self._obs):,}) '
+                f'is less than min_cells ({min_cells:,}){suffix}; increase '
                 f'min_cells')
             raise ValueError(error_message)
         
@@ -15055,7 +16529,7 @@ class SingleCell:
                 .pipe(lambda df: df.filter(~pl.col.gene.str.contains(
                     '(?i)' + '|'.join(exclude)))  # case-insensitive
                     if exclude is not None else df)
-                .with_columns(index=pl.int_range(pl.len(), dtype=pl.Int32))
+                .with_columns(index=pl.int_range(pl.len(), dtype=pl.UInt32))
                 for dataset in datasets), on='gene', how='inner')
             # noinspection PyTypeChecker
             genes_in_all_datasets = genes_and_indices[0]['gene']
@@ -15070,8 +16544,9 @@ class SingleCell:
                         f'exclude argument')
                 raise ValueError(error_message)
             if verbose:
-                print(f'{num_genes_in_all_datasets:,} genes are present in '
-                      f'every dataset.')
+                print(f'{num_genes_in_all_datasets:,} '
+                      f'{plural("gene", num_genes_in_all_datasets)} are '
+                      f'present in every dataset.')
             # noinspection PyTypeChecker
             dataset_gene_indices = [df['index'] for df in genes_and_indices]
             del genes_and_indices
@@ -15123,311 +16598,8 @@ class SingleCell:
                     batches = ((X, batch_column.eq(batch).to_numpy(), None)
                                for batch in batch_column.unique())
         
-        # Get the variance of each gene in each batch across cells passing QC
-        norm_gene_vars = []
-        for X, cell_mask, gene_indices in batches:
-            num_dataset_genes = X.shape[1]
-            mean = np.empty(num_dataset_genes, dtype=np.float32)
-            var = np.empty(num_dataset_genes, dtype=np.float32)
-            nonzero_count = np.empty(num_dataset_genes, dtype=np.uint32)
-            is_CSR = isinstance(X, csr_array)
-            if is_CSR:
-                if cell_mask is None:
-                    cell_indices = np.array([], dtype=np.int64)
-                    num_cells = X.shape[0]
-                else:
-                    cell_indices = np.flatnonzero(cell_mask)
-                    num_cells = len(cell_indices)
-                cython_inline(r'''
-                from cython.parallel cimport parallel, prange, threadid
-                from libcpp.vector cimport vector
-                
-                ctypedef fused numeric:
-                    int
-                    unsigned
-                    long
-                    unsigned long
-                    float
-                    double
-                
-                ctypedef fused signed_integer:
-                    int
-                    long
-                
-                def sparse_mean_var_minor_axis(
-                        const numeric[::1] data,
-                        const signed_integer[::1] indices,
-                        const signed_integer[::1] indptr,
-                        const long[::1] cell_indices,
-                        const unsigned long num_cells,
-                        const unsigned num_dataset_genes,
-                        float[::1] mean,
-                        float[::1] var,
-                        unsigned[::1] nonzero_count,
-                        const unsigned num_threads):
-                        
-                    cdef unsigned long num_elements, i, j, value, start, end, \
-                        chunk_size, total_sum, total_sum_of_squares, \
-                        total_nonzero_count
-                    cdef unsigned gene, cell, thread_index
-                    cdef float inv_num_cells = 1.0 / num_cells, \
-                        inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
-                    
-                    cdef vector[unsigned long] sum, sum_of_squares
-                    cdef vector[vector[unsigned long]] thread_sum, thread_sum_of_squares
-                    cdef vector[vector[unsigned]] thread_nonzero_counts
-                    
-                    if num_threads == 1:
-                        sum.resize(num_dataset_genes)
-                        sum_of_squares.resize(num_dataset_genes)
-                        nonzero_count[:] = 0
-                        if cell_indices.shape[0] == 0:
-                            # Iterate over all elements of the count
-                            # matrix, ignoring which cell they're from
-                            num_elements = indices.shape[0]
-                            for i in range(num_elements):
-                                gene = indices[i]
-                                value = <unsigned long> data[i]
-                                sum[gene] += value
-                                sum_of_squares[gene] += value * value
-                                nonzero_count[gene] += 1
-                        else:
-                            # Only iterate over the elements from cells
-                            # in `cell_indices` (i.e. cells in this
-                            # batch, and/or passing QC)
-                            for j in range(num_cells):
-                                cell = cell_indices[j]
-                                for i in range(<unsigned long> indptr[cell],
-                                               <unsigned long> indptr[cell + 1]):
-                                    gene = indices[i]
-                                    value = <unsigned long> data[i]
-                                    sum[gene] += value
-                                    sum_of_squares[gene] += value * value
-                                    nonzero_count[gene] += 1
-                        
-                        # Calculate means and variances from the sums
-                        # and squared sums
-                        for gene in range(num_dataset_genes):
-                            mean[gene] = sum[gene] * inv_num_cells
-                            var[gene] = inv_num_pairs_of_cells * (
-                                num_cells * sum_of_squares[gene] -
-                                sum[gene] * sum[gene])
-                    else:
-                        thread_sum.resize(num_threads)
-                        thread_sum_of_squares.resize(num_threads)
-                        thread_nonzero_counts.resize(num_threads)
-                        with nogil:
-                            if cell_indices.shape[0] == 0:
-                                # Partition the work by elements, not
-                                # cells, for better load-balancing in
-                                # case cells have substantially
-                                # different library sizes
-                                num_elements = indices.shape[0]
-                                chunk_size = (num_elements + num_threads - 1) / num_threads
-                                with parallel(num_threads=num_threads):
-                                    thread_index = threadid()
-                                    thread_sum[thread_index].resize(num_dataset_genes)
-                                    thread_sum_of_squares[thread_index].resize(num_dataset_genes)
-                                    thread_nonzero_counts[thread_index].resize(num_dataset_genes)
-                                    
-                                    start = thread_index * chunk_size
-                                    end = min(start + chunk_size, num_elements)
-                                    
-                                    for i in range(start, end):
-                                        gene = indices[i]
-                                        value = <unsigned long> data[i]
-                                        thread_sum[thread_index][gene] += value
-                                        thread_sum_of_squares[thread_index][gene] += value * value
-                                        thread_nonzero_counts[thread_index][gene] += 1
-                            else:
-                                # Partition the work by cells
-                                chunk_size = (num_cells + num_threads - 1) / num_threads
-                                with parallel(num_threads=num_threads):
-                                    thread_index = threadid()
-                                    thread_sum[thread_index].resize(num_dataset_genes)
-                                    thread_sum_of_squares[thread_index].resize(num_dataset_genes)
-                                    thread_nonzero_counts[thread_index].resize(num_dataset_genes)
-                                    
-                                    start = thread_index * chunk_size
-                                    end = min(start + chunk_size, num_cells)
-                                    
-                                    for j in range(start, end):
-                                        cell = cell_indices[j]
-                                        for i in range(<unsigned long> indptr[cell],
-                                                       <unsigned long> indptr[cell + 1]):
-                                            gene = indices[i]
-                                            value = <unsigned long> data[i]
-                                            thread_sum[thread_index][gene] += value
-                                            thread_sum_of_squares[thread_index][gene] += value * value
-                                            thread_nonzero_counts[thread_index][gene] += 1
-                            
-                            # Calculate means and variances by aggregating the
-                            # sums and squared sums across threads
-                            for gene in prange(num_dataset_genes, num_threads=num_threads):
-                                total_sum = 0
-                                total_sum_of_squares = 0
-                                total_nonzero_count = 0
-                                for thread_index in range(num_threads):
-                                    total_sum = total_sum + \
-                                        thread_sum[thread_index][gene]
-                                    total_sum_of_squares = total_sum_of_squares + \
-                                        thread_sum_of_squares[thread_index][gene]
-                                    total_nonzero_count = total_nonzero_count + \
-                                        thread_nonzero_counts[thread_index][gene]
-                                mean[gene] = total_sum * inv_num_cells
-                                var[gene] = inv_num_pairs_of_cells * (
-                                    num_cells * total_sum_of_squares -
-                                    total_sum * total_sum)
-                                nonzero_count[gene] = total_nonzero_count
-                    ''', warn_undeclared=False)['sparse_mean_var_minor_axis'](
-                        data=X.data, indices=X.indices, indptr=X.indptr,
-                        cell_indices=cell_indices, num_cells=num_cells,
-                        num_dataset_genes=num_dataset_genes, mean=mean, var=var,
-                        nonzero_count=nonzero_count, num_threads=num_threads)
-            else:
-                if cell_mask is None:
-                    cell_mask = np.array([], dtype=bool)
-                    num_cells = X.shape[0]
-                else:
-                    num_cells = cell_mask.sum()
-                cython_inline(r'''
-                    from cython.parallel cimport prange
-                    
-                    ctypedef fused numeric:
-                        int
-                        unsigned
-                        long
-                        unsigned long
-                        float
-                        double
-                    
-                    ctypedef fused signed_integer:
-                        int
-                        long
-                    
-                    def sparse_mean_var_major_axis(const numeric[::1] data,
-                                                   const signed_integer[::1] indices,
-                                                   const signed_integer[::1] indptr,
-                                                   char[::1] cell_mask,
-                                                   const unsigned long num_cells,
-                                                   const unsigned num_dataset_genes,
-                                                   float[::1] mean,
-                                                   float[::1] var,
-                                                   unsigned[::1] nonzero_count,
-                                                   const unsigned num_threads):
-                    
-                        cdef unsigned long i, value, sum, sum_of_squares, gene
-                        cdef float inv_num_cells = 1.0 / num_cells, \
-                            inv_num_pairs_of_cells = \
-                            1.0 / (num_cells * (num_cells - 1))
-                        
-                        if num_threads == 1:
-                            if cell_mask.shape[0] == 0:
-                                for gene in range(num_dataset_genes):
-                                    # Calculate the sum and squared sum for
-                                    # this gene, across cells with non-zero
-                                    # counts for the gene
-                                    sum = 0
-                                    sum_of_squares = 0
-                                    nonzero_count[gene] = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        value = <unsigned long> data[i]
-                                        sum += value
-                                        sum_of_squares += value * value
-                                        nonzero_count[gene] += 1
-                                    # Calculate the mean and variance from the
-                                    # sum and squared sum
-                                    mean[gene] = sum * inv_num_cells
-                                    var[gene] = inv_num_pairs_of_cells * (
-                                        num_cells * sum_of_squares - sum * sum)
-                            else:
-                                # Same as the version without a cell mask, but only include cells
-                                # where `cell_mask` is `True`
-                                for gene in range(num_dataset_genes):
-                                    sum = 0
-                                    sum_of_squares = 0
-                                    nonzero_count[gene] = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        if cell_mask[indices[i]]:
-                                            value = <unsigned long> data[i]
-                                            sum += value
-                                            sum_of_squares += value * value
-                                            nonzero_count[gene] += 1
-                                    mean[gene] = sum * inv_num_cells
-                                    var[gene] = inv_num_pairs_of_cells * (
-                                        num_cells * sum_of_squares - sum * sum)
-                        else:
-                            if cell_mask.shape[0] == 0:
-                                for gene in prange(num_dataset_genes,
-                                                   nogil=True,
-                                                   num_threads=num_threads):
-                                    sum = 0
-                                    sum_of_squares = 0
-                                    nonzero_count[gene] = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        value = <unsigned long> data[i]
-                                        sum = sum + value
-                                        sum_of_squares = \
-                                            sum_of_squares + value * value
-                                        nonzero_count[gene] += 1
-                                    mean[gene] = sum * inv_num_cells
-                                    var[gene] = inv_num_pairs_of_cells * (
-                                        num_cells * sum_of_squares - sum * sum)
-                            else:
-                                for gene in prange(num_dataset_genes,
-                                                   nogil=True,
-                                                   num_threads=num_threads):
-                                    sum = 0
-                                    sum_of_squares = 0
-                                    nonzero_count[gene] = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        if cell_mask[indices[i]]:
-                                            value = <unsigned long> data[i]
-                                            sum = sum + value
-                                            sum_of_squares = \
-                                                sum_of_squares + value * value
-                                            nonzero_count[gene] += 1
-                                    mean[gene] = sum * inv_num_cells
-                                    var[gene] = inv_num_pairs_of_cells * (
-                                        num_cells * sum_of_squares - sum * sum)
-                    ''', warn_undeclared=False)['sparse_mean_var_major_axis'](
-                        data=X.data, indices=X.indices, indptr=X.indptr,
-                        cell_mask=cell_mask, num_cells=num_cells,
-                        num_dataset_genes=num_dataset_genes, mean=mean,
-                        var=var, nonzero_count=nonzero_count,
-                        num_threads=num_threads)
-            
-            not_constant = var > 0
-            y = np.log10(var[not_constant])
-            x = np.log10(mean[not_constant])
-            model = loess(x, y, span=span)
-            try:
-                model.fit()
-            except ValueError as e:
-                error_message = (
-                    f'LOESS model fitting failed; this is unusual and tends '
-                    f'to only happen when there are very few cells'
-                    f' (e.g. under 500), which '
-                    f'{"is" if num_cells < 500 else "is not"} the case here')
-                raise ValueError(error_message) from e
-            
-            estimated_variance = np.empty(num_dataset_genes, dtype=np.float32)
-            estimated_variance[not_constant] = model.outputs.fitted_values
-            estimated_variance[~not_constant] = 0
-            estimated_stddev = np.sqrt(10 ** estimated_variance)
-            clip_val = mean + estimated_stddev * np.sqrt(num_cells,
-                                                         dtype=np.float32)
-            
-            batch_counts_sum = np.empty(num_dataset_genes, dtype=np.float32)
-            squared_batch_counts_sum = np.empty(num_dataset_genes,
-                                                dtype=np.float32)
-            if is_CSR:
-                # noinspection PyUnboundLocalVariable
-                cython_inline(_uninitialized_vector_import + r'''
+        # Define Cython functions
+        cython_functions = cython_inline(_thread_offset_import + _uninitialized_vector_import + r'''
         from cython.parallel cimport parallel, prange, threadid
         from libcpp.vector cimport vector
         
@@ -15439,39 +16611,269 @@ class SingleCell:
             float
             double
         
-        ctypedef fused signed_integer:
-            int
-            long
+        def gene_mean_and_variance_csr(const numeric[::1] data,
+                                       const signed_integer[::1] indices,
+                                       const signed_integer[::1] indptr,
+                                       const long[::1] cell_indices,
+                                       const unsigned long num_cells,
+                                       const unsigned num_dataset_genes,
+                                       float[::1] mean,
+                                       float[::1] var,
+                                       unsigned[::1] nonzero_count,
+                                       const unsigned num_threads):
+                
+            cdef unsigned gene, cell, thread_index
+            cdef unsigned long num_elements, i, j, value, chunk_size, start, end, \
+                total_sum, total_sum_of_squares, total_nonzero_count
+            cdef float inv_num_cells = 1.0 / num_cells, \
+                inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
+            cdef vector[unsigned long] sum_buffer, sum_of_squares_buffer
+            cdef vector[vector[unsigned long]] thread_sum, thread_sum_of_squares
+            cdef vector[vector[unsigned]] thread_nonzero_counts
+            cdef unsigned long[::1] sum, sum_of_squares
+            
+            if num_threads == 1:
+                sum_buffer.resize(num_dataset_genes)
+                sum = <unsigned long[:num_dataset_genes]> sum_buffer.data()
+                sum_of_squares_buffer.resize(num_dataset_genes)
+                sum_of_squares = <unsigned long[:num_dataset_genes]> \
+                    sum_of_squares_buffer.data()
+                nonzero_count[:] = 0
+                if cell_indices.shape[0] == 0:
+                    # Iterate over all elements of the count
+                    # matrix, ignoring which cell they're from
+                    num_elements = indices.shape[0]
+                    for i in range(num_elements):
+                        gene = indices[i]
+                        value = <unsigned long> data[i]
+                        sum[gene] += value
+                        sum_of_squares[gene] += value * value
+                        nonzero_count[gene] += 1
+                else:
+                    # Only iterate over the elements from cells
+                    # in `cell_indices` (i.e. cells in this
+                    # batch, and/or passing QC)
+                    for j in range(num_cells):
+                        cell = cell_indices[j]
+                        for i in range(<unsigned long> indptr[cell],
+                                       <unsigned long> indptr[cell + 1]):
+                            gene = indices[i]
+                            value = <unsigned long> data[i]
+                            sum[gene] += value
+                            sum_of_squares[gene] += value * value
+                            nonzero_count[gene] += 1
+                
+                # Calculate means and variances from the sums
+                # and squared sums
+                for gene in range(num_dataset_genes):
+                    mean[gene] = sum[gene] * inv_num_cells
+                    var[gene] = inv_num_pairs_of_cells * (
+                        num_cells * sum_of_squares[gene] -
+                        sum[gene] * sum[gene])
+            else:
+                thread_sum.resize(num_threads)
+                thread_sum_of_squares.resize(num_threads)
+                thread_nonzero_counts.resize(num_threads)
+                with nogil:
+                    if cell_indices.shape[0] == 0:
+                        # Partition the work by elements, not
+                        # cells, for better load-balancing in
+                        # case cells have substantially
+                        # different library sizes
+                        num_elements = indices.shape[0]
+                        chunk_size = (num_elements + num_threads - 1) / num_threads
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            thread_sum[thread_index].resize(num_dataset_genes)
+                            thread_sum_of_squares[thread_index].resize(num_dataset_genes)
+                            thread_nonzero_counts[thread_index].resize(num_dataset_genes)
+                            
+                            start = thread_index * chunk_size
+                            end = min(start + chunk_size, num_elements)
+                            for i in range(start, end):
+                                gene = indices[i]
+                                value = <unsigned long> data[i]
+                                thread_sum[thread_index][gene] += value
+                                thread_sum_of_squares[thread_index][gene] += \
+                                    value * value
+                                thread_nonzero_counts[thread_index][gene] += 1
+                    else:
+                        # Partition the work by cells
+                        chunk_size = (num_cells + num_threads - 1) / num_threads
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            thread_sum[thread_index].resize(num_dataset_genes)
+                            thread_sum_of_squares[thread_index].resize(num_dataset_genes)
+                            thread_nonzero_counts[thread_index].resize(num_dataset_genes)
+    
+                            start = thread_index * chunk_size
+                            end = min(start + chunk_size, num_cells)
+                            for j in range(start, end):
+                                cell = cell_indices[j]
+                                for i in range(<unsigned long> indptr[cell],
+                                               <unsigned long> indptr[cell + 1]):
+                                    gene = indices[i]
+                                    value = <unsigned long> data[i]
+                                    thread_sum[thread_index][gene] += value
+                                    thread_sum_of_squares[thread_index][gene] += \
+                                        value * value
+                                    thread_nonzero_counts[thread_index][gene] += 1
+                    
+                    # Calculate means and variances by aggregating the
+                    # sums and squared sums across threads
+                    for gene in prange(num_dataset_genes, num_threads=num_threads):
+                        total_sum = 0
+                        total_sum_of_squares = 0
+                        total_nonzero_count = 0
+                        for thread_index in range(num_threads):
+                            total_sum = total_sum + \
+                                thread_sum[thread_index][gene]
+                            total_sum_of_squares = total_sum_of_squares + \
+                                thread_sum_of_squares[thread_index][gene]
+                            total_nonzero_count = total_nonzero_count + \
+                                thread_nonzero_counts[thread_index][gene]
+                        mean[gene] = total_sum * inv_num_cells
+                        var[gene] = inv_num_pairs_of_cells * (
+                            num_cells * total_sum_of_squares -
+                            total_sum * total_sum)
+                        nonzero_count[gene] = total_nonzero_count
         
-        def clipped_sum(const numeric[::1] data,
-                        const signed_integer[::1] indices,
-                        const signed_integer[::1] indptr,
-                        const unsigned num_cells,
-                        const unsigned num_dataset_genes,
-                        const long[::1] cell_indices,
-                        const float[::1] clip_val,
-                        float[::1] batch_counts_sum,
-                        float[::1] squared_batch_counts_sum,
-                        const unsigned num_threads):
-            cdef unsigned long i, j, value, start, end, chunk_size, \
-                total_batch_counts_sum, \
-                total_squared_batch_counts_sum, \
-                total_num_out_of_range
-            cdef unsigned thread_index, cell, gene
-            cdef vector[unsigned long] batch_counts_sum_int, \
-                squared_batch_counts_sum_int, num_out_of_range
+        def gene_mean_and_variance_csc(const numeric[::1] data,
+                                       const signed_integer[::1] indices,
+                                       const signed_integer[::1] indptr,
+                                       char[::1] cell_mask,
+                                       const unsigned long num_cells,
+                                       const unsigned num_dataset_genes,
+                                       float[::1] mean,
+                                       float[::1] var,
+                                       unsigned[::1] nonzero_count,
+                                       unsigned num_threads):
+            
+            cdef unsigned thread_index
+            cdef unsigned long i, value, sum, sum_of_squares, nnz, gene
+            cdef float inv_num_cells = 1.0 / num_cells, \
+                inv_num_pairs_of_cells = \
+                1.0 / (num_cells * (num_cells - 1))
+            cdef pair[unsigned, unsigned] col_range
+            
+            num_threads = min(num_threads, num_dataset_genes)
+            if num_threads == 1:
+                if cell_mask.shape[0] == 0:
+                    for gene in range(num_dataset_genes):
+                        # Calculate the sum and squared sum for
+                        # this gene, across cells with non-zero
+                        # counts for the gene
+                        sum = 0
+                        sum_of_squares = 0
+                        nnz = 0
+                        for i in range(<unsigned long> indptr[gene],
+                                       <unsigned long> indptr[gene + 1]):
+                            value = <unsigned long> data[i]
+                            sum += value
+                            sum_of_squares += value * value
+                            nnz += 1
+                        nonzero_count[gene] = nnz
+                        # Calculate the mean and variance from the
+                        # sum and squared sum
+                        mean[gene] = sum * inv_num_cells
+                        var[gene] = inv_num_pairs_of_cells * (
+                            num_cells * sum_of_squares - sum * sum)
+                else:
+                    # Same as the version without a cell mask, but only include cells
+                    # where `cell_mask` is `True`
+                    for gene in range(num_dataset_genes):
+                        sum = 0
+                        sum_of_squares = 0
+                        nnz = 0
+                        for i in range(<unsigned long> indptr[gene],
+                                       <unsigned long> indptr[gene + 1]):
+                            if cell_mask[indices[i]]:
+                                value = <unsigned long> data[i]
+                                sum += value
+                                sum_of_squares += value * value
+                                nnz += 1
+                        nonzero_count[gene] = nnz
+                        mean[gene] = sum * inv_num_cells
+                        var[gene] = inv_num_pairs_of_cells * (
+                            num_cells * sum_of_squares - sum * sum)
+            else:
+                if cell_mask.shape[0] == 0:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            sum = 0
+                            sum_of_squares = 0
+                            nnz = 0
+                            for i in range(<unsigned long> indptr[gene],
+                                           <unsigned long> indptr[gene + 1]):
+                                value = <unsigned long> data[i]
+                                sum = sum + value
+                                sum_of_squares = \
+                                    sum_of_squares + value * value
+                                nnz = nnz + 1
+                            nonzero_count[gene] = nnz
+                            mean[gene] = sum * inv_num_cells
+                            var[gene] = inv_num_pairs_of_cells * (
+                                num_cells * sum_of_squares - sum * sum)
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            sum = 0
+                            sum_of_squares = 0
+                            nnz = 0
+                            for i in range(<unsigned long> indptr[gene],
+                                           <unsigned long> indptr[gene + 1]):
+                                if cell_mask[indices[i]]:
+                                    value = <unsigned long> data[i]
+                                    sum = sum + value
+                                    sum_of_squares = \
+                                        sum_of_squares + value * value
+                                    nnz = nnz + 1
+                            nonzero_count[gene] = nnz
+                            mean[gene] = sum * inv_num_cells
+                            var[gene] = inv_num_pairs_of_cells * (
+                                num_cells * sum_of_squares - sum * sum)
+        
+        def clipped_sum_csr(const numeric[::1] data,
+                            const signed_integer[::1] indices,
+                            const signed_integer[::1] indptr,
+                            const unsigned num_cells,
+                            const unsigned num_dataset_genes,
+                            const long[::1] cell_indices,
+                            const float[::1] clip_val,
+                            float[::1] batch_counts_sum,
+                            float[::1] squared_batch_counts_sum,
+                            unsigned num_threads):
+            cdef unsigned cell, gene, thread_index, chunk_size, start, end
+            cdef unsigned long i, j, value, total_batch_counts_sum, \
+                total_squared_batch_counts_sum, total_num_out_of_range
+            cdef vector[unsigned long] batch_counts_sum_int_buffer, \
+                squared_batch_counts_sum_int_buffer, num_out_of_range_buffer
             cdef vector[vector[unsigned long]] thread_batch_counts_sum_int, \
                 thread_squared_batch_counts_sum_int, thread_num_out_of_range
+            cdef pair[unsigned, unsigned] row_range
+            cdef unsigned long[::1] batch_counts_sum_int, \
+                squared_batch_counts_sum_int, num_out_of_range
             
             # Key insight: the things we're summing are integers
             # except when `value > clip_val[gene]`, in which case
             # we are adding a (floating-point) constant, so keep
             # track of this case separately and add it at the end,
             # to minimize floating-point error
+            num_threads = min(num_threads, num_cells)
             if num_threads == 1:
-                batch_counts_sum_int.resize(num_dataset_genes)
-                squared_batch_counts_sum_int.resize(num_dataset_genes)
-                num_out_of_range.resize(num_dataset_genes)
+                batch_counts_sum_int_buffer.resize(num_dataset_genes)
+                batch_counts_sum_int = <unsigned long[:num_dataset_genes]> \
+                    batch_counts_sum_int_buffer.data()
+                squared_batch_counts_sum_int_buffer.resize(num_dataset_genes)
+                squared_batch_counts_sum_int = <unsigned long[:num_dataset_genes]> \
+                    squared_batch_counts_sum_int_buffer.data()
+                num_out_of_range_buffer.resize(num_dataset_genes)
+                num_out_of_range = <unsigned long[:num_dataset_genes]> \
+                    num_out_of_range_buffer.data()
                 if cell_indices.shape[0] == 0:
                     num_cells = indptr.shape[0] - 1
                     for cell in range(num_cells):
@@ -15507,7 +16909,6 @@ class SingleCell:
                         num_out_of_range[gene] * clip_val[gene] * \
                         clip_val[gene]
             else:
-                chunk_size = (num_cells + num_threads - 1) / num_threads
                 thread_batch_counts_sum_int.resize(num_threads)
                 thread_squared_batch_counts_sum_int.resize(num_threads)
                 thread_num_out_of_range.resize(num_threads)
@@ -15515,35 +16916,41 @@ class SingleCell:
                     if cell_indices.shape[0] == 0:
                         with parallel(num_threads=num_threads):
                             thread_index = threadid()
-                            thread_batch_counts_sum_int[thread_index].resize(num_dataset_genes)
-                            thread_squared_batch_counts_sum_int[thread_index].resize(num_dataset_genes)
-                            thread_num_out_of_range[thread_index].resize(num_dataset_genes)
+                            thread_batch_counts_sum_int[thread_index].resize(
+                                num_dataset_genes)
+                            thread_squared_batch_counts_sum_int[thread_index].resize(
+                                num_dataset_genes)
+                            thread_num_out_of_range[thread_index].resize(
+                                num_dataset_genes)
                             
-                            start = thread_index * chunk_size
-                            end = min(start + chunk_size, num_cells)
-
-                            for cell in range(start, end):
+                            row_range = get_thread_offset(indptr, thread_index,
+                                                          num_threads)
+                            for cell in range(row_range.first, row_range.second):
                                 for i in range(<unsigned long> indptr[cell],
                                                <unsigned long> indptr[cell + 1]):
                                     gene = indices[i]
                                     value = <unsigned long> data[i]
                                     if value > clip_val[gene]:
-                                        thread_num_out_of_range[thread_index][gene] += 1
+                                        thread_num_out_of_range[
+                                            thread_index][gene] += 1
                                     else:
-                                        thread_batch_counts_sum_int[thread_index][gene] += value
-                                        thread_squared_batch_counts_sum_int[thread_index][gene] += value * value
+                                        thread_batch_counts_sum_int[
+                                            thread_index][gene] += value
+                                        thread_squared_batch_counts_sum_int[
+                                            thread_index][gene] += value * value
                     else:
+                        chunk_size = (num_cells + num_threads - 1) / num_threads
                         with parallel(num_threads=num_threads):
                             thread_index = threadid()
-                            thread_batch_counts_sum_int[thread_index].resize(num_dataset_genes)
-                            thread_squared_batch_counts_sum_int[thread_index].resize(num_dataset_genes)
-                            thread_num_out_of_range[thread_index].resize(num_dataset_genes)
+                            thread_batch_counts_sum_int[thread_index].resize(
+                                num_dataset_genes)
+                            thread_squared_batch_counts_sum_int[thread_index].resize(
+                                num_dataset_genes)
+                            thread_num_out_of_range[thread_index].resize(
+                                num_dataset_genes)
                             
                             start = thread_index * chunk_size
-                            end = start + chunk_size
-                            if end > num_cells:
-                                end = num_cells
-                                
+                            end = min(start + chunk_size, num_cells)
                             for j in range(start, end):
                                 cell = cell_indices[j]
                                 for i in range(<unsigned long> indptr[cell],
@@ -15551,10 +16958,13 @@ class SingleCell:
                                     gene = indices[i]
                                     value = <unsigned long> data[i]
                                     if value > clip_val[gene]:
-                                        thread_num_out_of_range[thread_index][gene] += 1
+                                        thread_num_out_of_range[
+                                            thread_index][gene] += 1
                                     else:
-                                        thread_batch_counts_sum_int[thread_index][gene] += value
-                                        thread_squared_batch_counts_sum_int[thread_index][gene] += value * value
+                                        thread_batch_counts_sum_int[
+                                            thread_index][gene] += value
+                                        thread_squared_batch_counts_sum_int[
+                                            thread_index][gene] += value * value
                     
                     for gene in prange(num_dataset_genes,
                                        num_threads=num_threads):
@@ -15578,144 +16988,203 @@ class SingleCell:
                             total_squared_batch_counts_sum + \
                             total_num_out_of_range * \
                             clip_val[gene] * clip_val[gene]
-                    ''', warn_undeclared=False)['clipped_sum'](
-                        data=X.data, indices=X.indices, indptr=X.indptr,
-                        num_cells=num_cells,
-                        num_dataset_genes=num_dataset_genes,
-                        cell_indices=cell_indices, clip_val=clip_val,
-                        batch_counts_sum=batch_counts_sum,
-                        squared_batch_counts_sum=squared_batch_counts_sum,
-                        num_threads=num_threads)
+        
+        def clipped_sum_csc(const numeric[::1] data,
+                            const signed_integer[::1] indices,
+                            const signed_integer[::1] indptr,
+                            char[::1] cell_mask,
+                            const float[::1] clip_val,
+                            float[::1] batch_counts_sum,
+                            float[::1] squared_batch_counts_sum,
+                            unsigned num_threads):
+            cdef unsigned cell, gene, thread_index, num_genes = indptr.shape[0] - 1
+            cdef unsigned long i, value, batch_counts_sum_int, \
+                squared_batch_counts_sum_int, num_out_of_range
+            cdef pair[unsigned, unsigned] col_range
+            
+            num_threads = min(num_threads, num_genes)
+            if num_threads == 1:
+                if cell_mask.shape[0] == 0:
+                    for gene in range(num_genes):
+                        batch_counts_sum_int = 0
+                        squared_batch_counts_sum_int = 0
+                        num_out_of_range = 0
+                        for i in range(<unsigned long> indptr[gene],
+                                       <unsigned long> indptr[gene + 1]):
+                            value = <unsigned long> data[i]
+                            if value > clip_val[gene]:
+                                num_out_of_range += 1
+                            else:
+                                batch_counts_sum_int += value
+                                squared_batch_counts_sum_int += \
+                                    value * value
+                        batch_counts_sum[gene] = \
+                            batch_counts_sum_int + \
+                            num_out_of_range * clip_val[gene]
+                        squared_batch_counts_sum[gene] = \
+                            squared_batch_counts_sum_int + \
+                            num_out_of_range * \
+                            clip_val[gene] * clip_val[gene]
+                else:
+                    for gene in range(num_genes):
+                        batch_counts_sum_int = 0
+                        squared_batch_counts_sum_int = 0
+                        num_out_of_range = 0
+                        for i in range(<unsigned long> indptr[gene],
+                                       <unsigned long> indptr[gene + 1]):
+                            cell = indices[i]
+                            if cell_mask[cell]:
+                                value = <unsigned long> data[i]
+                                if value > clip_val[gene]:
+                                    num_out_of_range += 1
+                                else:
+                                    batch_counts_sum_int += value
+                                    squared_batch_counts_sum_int += \
+                                        value * value
+                        batch_counts_sum[gene] = \
+                            batch_counts_sum_int + \
+                            num_out_of_range * clip_val[gene]
+                        squared_batch_counts_sum[gene] = \
+                            squared_batch_counts_sum_int + \
+                            num_out_of_range * \
+                            clip_val[gene] * clip_val[gene]
             else:
-                cython_inline(r'''
-                    from cython.parallel cimport prange
-                    
-                    ctypedef fused numeric:
-                        int
-                        unsigned
-                        long
-                        unsigned long
-                        float
-                        double
-                    
-                    ctypedef fused signed_integer:
-                        int
-                        long
-                    
-                    def clipped_sum(const numeric[::1] data,
-                                    const signed_integer[::1] indices,
-                                    const signed_integer[::1] indptr,
-                                    char[::1] cell_mask,
-                                    const float[::1] clip_val,
-                                    float[::1] batch_counts_sum,
-                                    float[::1] squared_batch_counts_sum,
-                                    const unsigned num_threads):
-                        cdef unsigned cell, gene, num_genes = indptr.shape[0] - 1
-                        cdef unsigned long i, value, batch_counts_sum_int, \
-                            squared_batch_counts_sum_int, num_out_of_range
-                        
-                        if num_threads == 1:
-                            if cell_mask.shape[0] == 0:
-                                for gene in range(num_genes):
-                                    batch_counts_sum_int = 0
-                                    squared_batch_counts_sum_int = 0
-                                    num_out_of_range = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        value = <unsigned long> data[i]
-                                        if value > clip_val[gene]:
-                                            num_out_of_range += 1
-                                        else:
-                                            batch_counts_sum_int += value
-                                            squared_batch_counts_sum_int += \
-                                                value * value
-                                    batch_counts_sum[gene] = \
-                                        batch_counts_sum_int + \
-                                        num_out_of_range * clip_val[gene]
-                                    squared_batch_counts_sum[gene] = \
+                if cell_mask.shape[0] == 0:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index,
+                                                      num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            batch_counts_sum_int = 0
+                            squared_batch_counts_sum_int = 0
+                            num_out_of_range = 0
+                            for i in range(<unsigned long> indptr[gene],
+                                           <unsigned long> indptr[gene + 1]):
+                                value = <unsigned long> data[i]
+                                if value > clip_val[gene]:
+                                    num_out_of_range = num_out_of_range + 1
+                                else:
+                                    batch_counts_sum_int = \
+                                        batch_counts_sum_int + value
+                                    squared_batch_counts_sum_int = \
                                         squared_batch_counts_sum_int + \
-                                        num_out_of_range * \
-                                        clip_val[gene] * clip_val[gene]
-                            else:
-                                for gene in range(num_genes):
-                                    batch_counts_sum_int = 0
-                                    squared_batch_counts_sum_int = 0
-                                    num_out_of_range = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        cell = indices[i]
-                                        if cell_mask[cell]:
-                                            value = <unsigned long> data[i]
-                                            if value > clip_val[gene]:
-                                                num_out_of_range += 1
-                                            else:
-                                                batch_counts_sum_int += value
-                                                squared_batch_counts_sum_int += \
-                                                    value * value
-                                    batch_counts_sum[gene] = \
-                                        batch_counts_sum_int + \
-                                        num_out_of_range * clip_val[gene]
-                                    squared_batch_counts_sum[gene] = \
-                                        squared_batch_counts_sum_int + \
-                                        num_out_of_range * \
-                                        clip_val[gene] * clip_val[gene]
-                        else:
-                            if cell_mask.shape[0] == 0:
-                                for gene in prange(num_genes, nogil=True,
-                                                   num_threads=num_threads):
-                                    batch_counts_sum_int = 0
-                                    squared_batch_counts_sum_int = 0
-                                    num_out_of_range = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        value = <unsigned long> data[i]
-                                        if value > clip_val[gene]:
-                                            num_out_of_range = num_out_of_range + 1
-                                        else:
-                                            batch_counts_sum_int = \
-                                                batch_counts_sum_int + value
-                                            squared_batch_counts_sum_int = \
-                                                squared_batch_counts_sum_int + \
-                                                value * value
-                                    batch_counts_sum[gene] = \
-                                        batch_counts_sum_int + \
-                                        num_out_of_range * clip_val[gene]
-                                    squared_batch_counts_sum[gene] = \
-                                        squared_batch_counts_sum_int + \
-                                        num_out_of_range * \
-                                        clip_val[gene] * clip_val[gene]
-                            else:
-                                for gene in prange(num_genes, nogil=True,
-                                                   num_threads=num_threads):
-                                    batch_counts_sum_int = 0
-                                    squared_batch_counts_sum_int = 0
-                                    num_out_of_range = 0
-                                    for i in range(<unsigned long> indptr[gene],
-                                                   <unsigned long> indptr[gene + 1]):
-                                        cell = indices[i]
-                                        if cell_mask[cell]:
-                                            value = <unsigned long> data[i]
-                                            if value > clip_val[gene]:
-                                                num_out_of_range = num_out_of_range + 1
-                                            else:
-                                                batch_counts_sum_int = \
-                                                    batch_counts_sum_int + value
-                                                squared_batch_counts_sum_int = \
-                                                    squared_batch_counts_sum_int + \
-                                                    value * value
-                                    batch_counts_sum[gene] = \
-                                        batch_counts_sum_int + \
-                                        num_out_of_range * clip_val[gene]
-                                    squared_batch_counts_sum[gene] = \
-                                        squared_batch_counts_sum_int + \
-                                        num_out_of_range * \
-                                        clip_val[gene] * clip_val[gene]
-                    ''', warn_undeclared=False)['clipped_sum'](
-                        data=X.data, indices=X.indices, indptr=X.indptr,
-                        cell_mask=cell_mask, clip_val=clip_val,
-                        batch_counts_sum=batch_counts_sum,
-                        squared_batch_counts_sum=squared_batch_counts_sum,
-                        num_threads=num_threads)
+                                        value * value
+                            batch_counts_sum[gene] = \
+                                batch_counts_sum_int + \
+                                num_out_of_range * clip_val[gene]
+                            squared_batch_counts_sum[gene] = \
+                                squared_batch_counts_sum_int + \
+                                num_out_of_range * \
+                                clip_val[gene] * clip_val[gene]
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index,
+                                                      num_threads)
+                        for gene in range(col_range.first, col_range.second):
+                            batch_counts_sum_int = 0
+                            squared_batch_counts_sum_int = 0
+                            num_out_of_range = 0
+                            for i in range(<unsigned long> indptr[gene],
+                                           <unsigned long> indptr[gene + 1]):
+                                cell = indices[i]
+                                if cell_mask[cell]:
+                                    value = <unsigned long> data[i]
+                                    if value > clip_val[gene]:
+                                        num_out_of_range = num_out_of_range + 1
+                                    else:
+                                        batch_counts_sum_int = \
+                                            batch_counts_sum_int + value
+                                        squared_batch_counts_sum_int = \
+                                            squared_batch_counts_sum_int + \
+                                            value * value
+                            batch_counts_sum[gene] = \
+                                batch_counts_sum_int + \
+                                num_out_of_range * clip_val[gene]
+                            squared_batch_counts_sum[gene] = \
+                                squared_batch_counts_sum_int + \
+                                num_out_of_range * \
+                                clip_val[gene] * clip_val[gene]
+        ''', warn_undeclared=False)
+        gene_mean_and_variance_csr = \
+            cython_functions['gene_mean_and_variance_csr']
+        gene_mean_and_variance_csc = \
+            cython_functions['gene_mean_and_variance_csc']
+        clipped_sum_csr = cython_functions['clipped_sum_csr']
+        clipped_sum_csc = cython_functions['clipped_sum_csc']
+        
+        # Get the variance of each gene in each batch across cells passing QC
+        norm_gene_vars = []
+        for X, cell_mask, gene_indices in batches:
+            num_dataset_genes = X.shape[1]
+            mean = np.empty(num_dataset_genes, dtype=np.float32)
+            var = np.empty(num_dataset_genes, dtype=np.float32)
+            nonzero_count = np.empty(num_dataset_genes, dtype=np.uint32)
+            is_csr = isinstance(X, csr_array)
+            if is_csr:
+                if cell_mask is None:
+                    cell_indices = np.array([], dtype=np.int64)
+                    num_cells = X.shape[0]
+                else:
+                    cell_indices = np.flatnonzero(cell_mask)
+                    num_cells = len(cell_indices)
+                gene_mean_and_variance_csr(
+                    data=X.data, indices=X.indices, indptr=X.indptr,
+                    cell_indices=cell_indices, num_cells=num_cells,
+                    num_dataset_genes=num_dataset_genes, mean=mean, var=var,
+                    nonzero_count=nonzero_count, num_threads=num_threads)
+            else:
+                if cell_mask is None:
+                    cell_mask = np.array([], dtype=bool)
+                    num_cells = X.shape[0]
+                else:
+                    num_cells = cell_mask.sum()
+                gene_mean_and_variance_csc(
+                    data=X.data, indices=X.indices, indptr=X.indptr,
+                    cell_mask=cell_mask, num_cells=num_cells,
+                    num_dataset_genes=num_dataset_genes, mean=mean,
+                    var=var, nonzero_count=nonzero_count,
+                    num_threads=num_threads)
+            
+            not_constant = var > 0
+            y = np.log10(var[not_constant])
+            x = np.log10(mean[not_constant])
+            model = loess(x, y, span=span)
+            try:
+                model.fit()
+            except ValueError as e:
+                error_message = (
+                    f'LOESS model fitting failed; this is unusual and tends '
+                    f'to only happen when there are very few cells'
+                    f' (e.g. under 500), which '
+                    f'{"is" if num_cells < 500 else "is not"} the case here')
+                raise ValueError(error_message) from e
+            
+            estimated_variance = np.empty(num_dataset_genes, dtype=np.float32)
+            estimated_variance[not_constant] = model.outputs.fitted_values
+            estimated_variance[~not_constant] = 0
+            estimated_stddev = np.sqrt(10 ** estimated_variance)
+            clip_val = mean + estimated_stddev * np.sqrt(num_cells,
+                                                         dtype=np.float32)
+            batch_counts_sum = np.empty(num_dataset_genes, dtype=np.float32)
+            squared_batch_counts_sum = np.empty(num_dataset_genes,
+                                                dtype=np.float32)
+            if is_csr:
+                # noinspection PyUnboundLocalVariable
+                clipped_sum_csr(
+                    data=X.data, indices=X.indices, indptr=X.indptr,
+                    num_cells=num_cells, num_dataset_genes=num_dataset_genes,
+                    cell_indices=cell_indices, clip_val=clip_val,
+                    batch_counts_sum=batch_counts_sum,
+                    squared_batch_counts_sum=squared_batch_counts_sum,
+                    num_threads=num_threads)
+            else:
+                clipped_sum_csc(
+                    data=X.data, indices=X.indices, indptr=X.indptr,
+                    cell_mask=cell_mask, clip_val=clip_val,
+                    batch_counts_sum=batch_counts_sum,
+                    squared_batch_counts_sum=squared_batch_counts_sum,
+                    num_threads=num_threads)
             norm_gene_var = pl.Series(
                 (1 / ((num_cells - 1) * np.square(estimated_stddev))) *
                 ((num_cells * np.square(mean)) + squared_batch_counts_sum -
@@ -15751,7 +17220,7 @@ class SingleCell:
                           median_rank=pl.concat_list(pl.exclude('gene'))
                                       .explode()
                                       .median().over(pl.int_range(
-                                          pl.len(), dtype=pl.Int32)))\
+                                          pl.len(), dtype=pl.UInt32)))\
             .select('gene', (final_rank <= num_genes).alias(hvg_column),
                     pl.when(final_rank <= num_genes).then(final_rank)
                     .alias(rank_column))\
@@ -16284,7 +17753,7 @@ class SingleCell:
             raise TypeError(error_message)
         
         # Define Cython functions
-        cython_functions = cython_inline(_uninitialized_vector_import + r'''
+        cython_functions = cython_inline(_thread_offset_import + _uninitialized_vector_import + r'''
         from cython.parallel cimport parallel, prange, threadid
         from libcpp.cmath cimport log1p
         from libcpp.vector cimport vector
@@ -16297,10 +17766,6 @@ class SingleCell:
             float
             double
         
-        ctypedef fused signed_integer:
-            int
-            long
-        
         def normalize_csr(const numeric[::1] data,
                           const signed_integer[::1] indices,
                           const signed_integer[::1] indptr,
@@ -16308,19 +17773,24 @@ class SingleCell:
                           float[::1] normalized_data,
                           const unsigned num_cells,
                           const unsigned method_number,
-                          const unsigned num_threads):
+                          unsigned num_threads):
             
             cdef bint has_QC_column = QC_column.shape[0] != 0
-            cdef unsigned i, num_QCed_cells
-            cdef unsigned long row_sum, j, total_sum = 0
+            cdef unsigned i, num_QCed_cells, thread_index, thread_num_QCed_cells
+            cdef unsigned long row_sum, j, thread_total_sum, total_sum = 0
             cdef float normalization_factor, inverse_size_factor, \
                 new_normalization_factor, new_inverse_size_factor, \
                 new_row_sum, new_total_sum = 0
             cdef volatile float new_normalization_factor_volatile
-            cdef uninitialized_vector[unsigned long] row_sums
+            cdef pair[unsigned, unsigned] row_range
+            cdef uninitialized_vector[unsigned] thread_nums_QCed_cells
+            cdef uninitialized_vector[unsigned long] row_sums_buffer, thread_total_sums
             cdef uninitialized_vector[float] new_row_sums, new_row_sums_contiguous
+            row_sums_buffer.resize(num_cells)
+            cdef unsigned long[::1] row_sums = \
+                <unsigned long[:num_cells]> row_sums_buffer.data()
             
-            row_sums.resize(num_cells)
+            num_threads = min(num_threads, num_cells)
             if num_threads == 1:
                 # Step 1a and 1b: calculate row sums and the normalization
                 # factor for the size factor calculation
@@ -16420,46 +17890,72 @@ class SingleCell:
                     if method_number == 0:  # 'logCP10k'
                         # Just calculate the row sums, and use a constant normalization factor
                         # of 10,000
-                        for i in prange(num_cells, num_threads=num_threads):
-                            row_sum = 0
-                            for j in range(<unsigned long> indptr[i],
-                                           <unsigned long> indptr[i + 1]):
-                                row_sum = row_sum + <unsigned long> data[j]
-                            row_sums[i] = row_sum
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            row_range = get_thread_offset(indptr, thread_index, num_threads)
+                            for i in range(row_range.first, row_range.second):
+                                row_sum = 0
+                                for j in range(<unsigned long> indptr[i],
+                                               <unsigned long> indptr[i + 1]):
+                                    row_sum = row_sum + <unsigned long> data[j]
+                                row_sums[i] = row_sum
                         normalization_factor = 10000
                     else:
                         # Same as the logCP10k version, but take the mean of the row sums
                         # (across cells passing QC, if `QC_column` was specified) as the
                         # size factor
+                        thread_total_sums.resize(num_threads)
                         if not has_QC_column:
-                            for i in prange(num_cells, num_threads=num_threads):
-                                row_sum = 0
-                                for j in range(<unsigned long> indptr[i],
-                                               <unsigned long> indptr[i + 1]):
-                                    row_sum = row_sum + <unsigned long> data[j]
-                                row_sums[i] = row_sum
-                                total_sum += row_sum
+                            with parallel(num_threads=num_threads):
+                                thread_index = threadid()
+                                row_range = get_thread_offset(indptr, thread_index, num_threads)
+                                thread_total_sum = 0
+                                for i in range(row_range.first, row_range.second):
+                                    row_sum = 0
+                                    for j in range(<unsigned long> indptr[i],
+                                                   <unsigned long> indptr[i + 1]):
+                                        row_sum = row_sum + <unsigned long> data[j]
+                                    row_sums[i] = row_sum
+                                    thread_total_sum = thread_total_sum + row_sum
+                                thread_total_sums[thread_index] = thread_total_sum
+                            for thread_index in range(num_threads):
+                                total_sum += thread_total_sums[thread_index]
                             num_QCed_cells = num_cells
                         else:
                             num_QCed_cells = 0
-                            for i in prange(num_cells, num_threads=num_threads):
-                                row_sum = 0
-                                for j in range(<unsigned long> indptr[i],
-                                               <unsigned long> indptr[i + 1]):
-                                    row_sum = row_sum + <unsigned long> data[j]
-                                row_sums[i] = row_sum
-                                if QC_column[i]:
-                                    total_sum += row_sum
-                                    num_QCed_cells += 1
+                            thread_nums_QCed_cells.resize(num_threads)
+                            with parallel(num_threads=num_threads):
+                                thread_index = threadid()
+                                row_range = get_thread_offset(indptr, thread_index, num_threads)
+                                thread_total_sum = 0
+                                thread_num_QCed_cells = 0
+                                for i in range(row_range.first, row_range.second):
+                                    row_sum = 0
+                                    for j in range(<unsigned long> indptr[i],
+                                                   <unsigned long> indptr[i + 1]):
+                                        row_sum = row_sum + <unsigned long> data[j]
+                                    row_sums[i] = row_sum
+                                    if QC_column[i]:
+                                        thread_total_sum = thread_total_sum + row_sum
+                                        thread_num_QCed_cells = thread_num_QCed_cells + 1
+                                thread_total_sums[thread_index] = thread_total_sum
+                                thread_nums_QCed_cells[thread_index] = \
+                                    thread_num_QCed_cells
+                            for thread_index in range(num_threads):
+                                total_sum += thread_total_sums[thread_index]
+                                num_QCed_cells += thread_nums_QCed_cells[thread_index]
                         normalization_factor = <float> total_sum / num_QCed_cells
                     if method_number != 2:  # 'PFlog1pPF'
                         # Step 1c and 2: calculate each cell's inverse size factor and
                         # multiply all counts for that cell by it, then log1p-transform
-                        for i in prange(num_cells, num_threads=num_threads):
-                            inverse_size_factor = normalization_factor / row_sums[i]
-                            for j in range(<unsigned long> indptr[i],
-                                           <unsigned long> indptr[i + 1]):
-                                normalized_data[j] = log1p(data[j] * inverse_size_factor)
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            row_range = get_thread_offset(indptr, thread_index, num_threads)
+                            for i in range(row_range.first, row_range.second):
+                                inverse_size_factor = normalization_factor / row_sums[i]
+                                for j in range(<unsigned long> indptr[i],
+                                               <unsigned long> indptr[i + 1]):
+                                    normalized_data[j] = log1p(data[j] * inverse_size_factor)
                     else:
                         # Step 1c, 2, and 3a: in addition to calculating each cell's
                         # size factor and multiplying the counts by it, also calculate
@@ -16473,14 +17969,17 @@ class SingleCell:
                         # 3) Launder `new_normalization_factor` through an intermediate variable
                         #    declared as volatile, to force it to be calculated explicitly.
                         new_row_sums.resize(num_cells)
-                        for i in prange(num_cells, num_threads=num_threads):
-                            new_row_sum = 0
-                            inverse_size_factor = normalization_factor / row_sums[i]
-                            for j in range(<unsigned long> indptr[i],
-                                           <unsigned long> indptr[i + 1]):
-                                normalized_data[j] = log1p(data[j] * inverse_size_factor)
-                                new_row_sum = new_row_sum + normalized_data[j]
-                            new_row_sums[i] = new_row_sum
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            row_range = get_thread_offset(indptr, thread_index, num_threads)
+                            for i in range(row_range.first, row_range.second):
+                                new_row_sum = 0
+                                inverse_size_factor = normalization_factor / row_sums[i]
+                                for j in range(<unsigned long> indptr[i],
+                                               <unsigned long> indptr[i + 1]):
+                                    normalized_data[j] = log1p(data[j] * inverse_size_factor)
+                                    new_row_sum = new_row_sum + normalized_data[j]
+                                new_row_sums[i] = new_row_sum
                         if not has_QC_column:
                             for i in range(num_cells):
                                 new_total_sum += new_row_sums[i]
@@ -16499,12 +17998,15 @@ class SingleCell:
                         
                         # Step 3b: calculate each cell's new inverse size factor
                         # and multiply all normalized counts for that cell by it
-                        for i in prange(num_cells, num_threads=num_threads):
-                            new_inverse_size_factor = \
-                                new_normalization_factor / new_row_sums[i]
-                            for j in range(<unsigned long> indptr[i],
-                                           <unsigned long> indptr[i + 1]):
-                                normalized_data[j] *= new_inverse_size_factor
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            row_range = get_thread_offset(indptr, thread_index, num_threads)
+                            for i in range(row_range.first, row_range.second):
+                                new_inverse_size_factor = \
+                                    new_normalization_factor / new_row_sums[i]
+                                for j in range(<unsigned long> indptr[i],
+                                               <unsigned long> indptr[i + 1]):
+                                    normalized_data[j] *= new_inverse_size_factor
         
         def normalize_csc(const numeric[::1] data,
                           const signed_integer[::1] indices,
@@ -16708,7 +18210,7 @@ class SingleCell:
         return sc
     
     # noinspection PyTypeChecker
-    def PCA_old(self,
+    def PCA_even_older(self,
             *others: SingleCell,
             QC_column: SingleCellColumn | None |
                        Sequence[SingleCellColumn | None] = 'passed_QC',
@@ -16994,7 +18496,7 @@ class SingleCell:
         return tuple(datasets) if others else datasets[0]
     
     # noinspection PyTypeChecker
-    def PCA(self,
+    def PCA_older(self,
             *others: SingleCell,
             QC_column: SingleCellColumn | None |
                        Sequence[SingleCellColumn | None] = 'passed_QC',
@@ -17238,8 +18740,8 @@ class SingleCell:
             # total cells in that format, to reduce the number of datasets that
             # need to be flipped
             total_cells = num_cells_per_dataset.sum()
-            total_CSR = sum(X.shape[0] for X in Xs if isinstance(X, csr_array))
-            if total_CSR / total_cells > 0.5:  # more CSR than CSC
+            total_csr = sum(X.shape[0] for X in Xs if isinstance(X, csr_array))
+            if total_csr / total_cells > 0.5:  # more CSR than CSC
                 X = sparse_major_stack([
                     X.tocsr() if isinstance(X, csc_array) else X for X in Xs],
                     num_threads=num_threads)
@@ -17729,7 +19231,7 @@ class SingleCell:
         original_num_threads = X._num_threads
         X._num_threads = num_threads
         try:
-            with threadpool_limits(num_threads):
+            with threadpool_limits(num_threads, user_api='blas'):
                 # noinspection PyTypeChecker
                 U, s = svds(op, num_PCs, solver='propack', tol=1e-5,
                             random_state=seed)[:2]
@@ -17761,7 +19263,7 @@ class SingleCell:
         return tuple(datasets) if others else datasets[0]
     
     # noinspection PyTypeChecker
-    def PCA_new(self,
+    def PCA_old(self,
             *others: SingleCell,
             QC_column: SingleCellColumn | None |
                        Sequence[SingleCellColumn | None] = 'passed_QC',
@@ -18045,8 +19547,8 @@ class SingleCell:
             # total cells in that format, to reduce the number of datasets that
             # need to be flipped
             total_cells = num_cells_per_dataset.sum()
-            total_CSR = sum(X.shape[0] for X in Xs if isinstance(X, csr_array))
-            if total_CSR / total_cells > 0.5:  # more CSR than CSC
+            total_csr = sum(X.shape[0] for X in Xs if isinstance(X, csr_array))
+            if total_csr / total_cells > 0.5:  # more CSR than CSC
                 X = sparse_major_stack([
                     X.tocsr() if isinstance(X, csc_array) else X for X in Xs],
                     num_threads=num_threads)
@@ -18059,328 +19561,8 @@ class SingleCell:
         # Check that `num_PCs` is at most the width of this matrix
         check_bounds(num_PCs, 'num_PCs', upper_bound=X.shape[1])
         
-        # Define Cython functions
-        cython_functions = cython_inline(r'''
-    from cython.parallel cimport parallel, prange, threadid
-    from libcpp.cmath cimport sqrt
-    from libcpp.vector cimport vector
-    
-    ctypedef fused signed_integer:
-        int
-        long
-        
-    def clipped_stddev_csr(const float[::1] data,
-                           const signed_integer[::1] indices,
-                           const signed_integer[::1] indptr,
-                           const unsigned long num_cells,
-                           const unsigned num_genes,
-                           float clip_val,
-                           float[::1] clipped_stddev):
-        # Compute `X.std(axis=0)` where `X` is CSR, clipping to a minimum of
-        # `clip_val`. Only used when `num_threads=1` and
-        # `faster_single_threading=True`.
-        
-        cdef unsigned long num_elements, i, j, start, end, \
-            chunk_size
-        cdef unsigned gene, cell, thread_index
-        cdef float value, total_sum, total_sum_of_squares, \
-            inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
-        cdef vector[float] sum, sum_of_squares
-        sum.resize(num_genes)
-        sum_of_squares.resize(num_genes)
-        
-        # Iterate over all elements of the count matrix, ignoring which cell
-        # they're from
-        num_elements = indices.shape[0]
-        for i in range(num_elements):
-            gene = indices[i]
-            value = data[i]
-            sum[gene] += value
-            sum_of_squares[gene] += value * value
-        
-        # Calculate standard deviations from the sums and squared sums
-        for gene in range(num_genes):
-            clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
-                num_cells * sum_of_squares[gene] - sum[gene] * sum[gene]))
-            if clipped_stddev[gene] < clip_val:
-                clipped_stddev[gene] = clip_val
-    
-    def clipped_stddev_csc(const float[::1] data,
-                           const signed_integer[::1] indices,
-                           const signed_integer[::1] indptr,
-                           const unsigned long num_cells,
-                           const unsigned num_genes,
-                           float clip_val,
-                           float[::1] clipped_stddev,
-                           const unsigned num_threads):
-        # Compute `X.std(axis=0)` where `X` is CSC, clipping to a minimum of
-        # `clip_val`.
-        
-        cdef unsigned long i, gene
-        cdef float value, sum, sum_of_squares, \
-            inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
-        
-        if num_threads == 1:
-            for gene in range(num_genes):
-                # Calculate the sum and squared sum for this gene, across cells
-                # with non-zero counts for the gene
-                sum = 0
-                sum_of_squares = 0
-                for i in range(<unsigned long> indptr[gene],
-                               <unsigned long> indptr[gene + 1]):
-                    value = data[i]
-                    sum += value
-                    sum_of_squares += value * value
-    
-                # Calculate the scaled variance from the sum and squared sum
-                clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
-                    num_cells * sum_of_squares - sum * sum))
-                if clipped_stddev[gene] < clip_val:
-                    clipped_stddev[gene] = clip_val
-        else:
-            for gene in prange(num_genes, nogil=True, num_threads=num_threads):
-                sum = 0
-                sum_of_squares = 0
-                for i in range(<unsigned long> indptr[gene],
-                               <unsigned long> indptr[gene + 1]):
-                    value = data[i]
-                    sum = sum + value
-                    sum_of_squares = sum_of_squares + value * value
-                clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
-                    num_cells * sum_of_squares - sum * sum))
-                if clipped_stddev[gene] < clip_val:
-                    clipped_stddev[gene] = clip_val
-        
-    def matvec_csr(const float[::1] data,
-                   const signed_integer[::1] indices,
-                   const signed_integer[::1] indptr,
-                   const float[::1] V,
-                   const float[::1] clipped_stddev,
-                   float[::1] num_cells_buffer,
-                   float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
-        # and `num_cells_buffer` are vectors. Also has a parallel version,
-        # `matvec_csr_parallel()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] = V[i] / clipped_stddev[i]
-            
-        # Matrix-vector multiplication and mean calculation
-        for i in range(num_cells):
-            num_cells_buffer[i] = 0
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_cells_buffer[i] += data[j] * num_genes_buffer[indices[j]]
-            mean += num_cells_buffer[i]
-        mean /= num_cells
-        
-        # Mean scaling
-        for i in range(num_cells):
-            num_cells_buffer[i] -= mean
-    
-    def matvec_csr_parallel(const float[::1] data,
-                            const signed_integer[::1] indices,
-                            const signed_integer[::1] indptr,
-                            const float[::1] V,
-                            const float[::1] clipped_stddev,
-                            float[::1] num_cells_buffer,
-                            float[::1] num_genes_buffer,
-                            const unsigned num_threads):
-        # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
-        # and `num_cells_buffer` are vectors. Also has a single-threaded
-        # version, `matvec_csr()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Variance scaling (single-threaded since `num_genes` is just 2000
-        # by default)
-        for i in range(num_genes):
-            num_genes_buffer[i] = V[i] / clipped_stddev[i]
-        
-        with nogil:
-            # Matrix-vector multiplication
-            for i in prange(num_cells, num_threads=num_threads):
-                num_cells_buffer[i] = 0
-                for j in range(<unsigned long> indptr[i],
-                               <unsigned long> indptr[i + 1]):
-                    num_cells_buffer[i] += \
-                        data[j] * num_genes_buffer[indices[j]]
-            
-            # Mean calculation (must be done single-threaded to be
-            # deterministic, due to floating-point error)
-            for i in range(num_cells):
-                mean += num_cells_buffer[i]
-            mean /= num_cells
-            
-            # Mean scaling
-            for i in prange(num_cells, num_threads=num_threads):
-                num_cells_buffer[i] -= mean
-    
-    def matvec_csc(const float[::1] data,
-                   const signed_integer[::1] indices,
-                   const signed_integer[::1] indptr,
-                   const float[::1] V,
-                   const float[::1] clipped_stddev,
-                   float[::1] num_cells_buffer,
-                   float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSC and `V`
-        # and `num_cells_buffer` are vectors. Does not have a parallel version.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] = V[i] / clipped_stddev[i]
-        
-        # Matrix-vector multiplication
-        num_cells_buffer[:] = 0
-        for i in range(num_genes):
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_cells_buffer[indices[j]] += data[j] * num_genes_buffer[i]
-                
-        # Mean calculation
-        for i in range(num_cells):
-            mean += num_cells_buffer[i]
-        mean /= num_cells
-        
-        # Mean scaling
-        for i in range(num_cells):
-            num_cells_buffer[i] -= mean
-    
-    def rmatvec_csr(const float[::1] data,
-                    const signed_integer[::1] indices,
-                    const signed_integer[::1] indptr,
-                    const float[::1] V,
-                    const float[::1] clipped_stddev,
-                    float[::1] num_cells_buffer,
-                    float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSR and `V`
-        # and `num_cells_buffer` are vectors. Does not have a parallel version.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Mean scaling
-        for i in range(num_cells):
-            mean += V[i]
-        mean /= num_cells
-        for i in range(num_cells):
-            num_cells_buffer[i] = V[i] - mean
-        
-        # Matrix-vector multiplication
-        num_genes_buffer[:] = 0
-        for i in range(num_cells):
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_genes_buffer[indices[j]] += data[j] * num_cells_buffer[i]
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] /= clipped_stddev[i]
-    
-    def rmatvec_csc(const float[::1] data,
-                    const signed_integer[::1] indices,
-                    const signed_integer[::1] indptr,
-                    const float[::1] V,
-                    const float[::1] clipped_stddev,
-                    float[::1] num_cells_buffer,
-                    float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
-        # and `num_cells_buffer` are vectors. Also has a parallel version,
-        # `rmatvec_csc_parallel()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Mean calculation
-        for i in range(num_cells):
-            mean += V[i]
-        mean /= num_cells
-        
-        # Mean scaling
-        for i in range(num_cells):
-            num_cells_buffer[i] = V[i] - mean
-        
-        # Matrix-vector multiplication
-        for i in range(num_genes):
-            num_genes_buffer[i] = 0
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_genes_buffer[i] += data[j] * num_cells_buffer[indices[j]]
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] /= clipped_stddev[i]
-    
-    def rmatvec_csc_parallel(const float[::1] data,
-                             const signed_integer[::1] indices,
-                             const signed_integer[::1] indptr,
-                             const float[::1] V,
-                             const float[::1] clipped_stddev,
-                             float[::1] num_cells_buffer,
-                             float[::1] num_genes_buffer,
-                             const unsigned num_threads):
-        # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
-        # and `num_cells_buffer` are vectors. Also has a single-threaded
-        # version, `rmatvec_csc()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        with nogil:
-            # Mean calculation (must be done single-threaded to be
-            # deterministic, due to floating-point error)
-            for i in range(num_cells):
-                mean += V[i]
-            mean /= num_cells
-            
-            # Mean scaling
-            for i in prange(num_cells, num_threads=num_threads):
-                num_cells_buffer[i] = V[i] - mean
-            
-            # Matrix-vector multiplication
-            for i in prange(num_genes, num_threads=num_threads):
-                num_genes_buffer[i] = 0
-                for j in range(<unsigned long> indptr[i],
-                               <unsigned long> indptr[i + 1]):
-                    num_genes_buffer[i] += \
-                        data[j] * num_cells_buffer[indices[j]]
-        
-        # Variance scaling (single-threaded since `num_genes` is just 2000
-        # by default)
-        for i in range(num_genes):
-            num_genes_buffer[i] /= clipped_stddev[i]
-        ''', warn_undeclared=False)
-        clipped_stddev_csr = cython_functions['clipped_stddev_csr']
-        clipped_stddev_csc = cython_functions['clipped_stddev_csc']
-        matvec_csr = cython_functions['matvec_csr']
-        matvec_csr_parallel = cython_functions['matvec_csr_parallel']
-        matvec_csc = cython_functions['matvec_csc']
-        rmatvec_csr = cython_functions['rmatvec_csr']
-        rmatvec_csc = cython_functions['rmatvec_csc']
-        rmatvec_csc_parallel = cython_functions['rmatvec_csc_parallel']
-        
-        # Define the linear operator to be SVDed: `X` scaled to zero mean and
-        # unit variance.
+        # Define Cython functions. We want to perform SVD on `X`, scaled to
+        # zero mean and unit variance.
         # Key ideas:
         # 1. Because `X` is a sparse matrix, mean-centering cannot be done
         #    without converting to a dense matrix. So scaling `X` cannot be
@@ -18442,171 +19624,689 @@ class SingleCell:
         # 8. When calculating the scaled variance for each gene, use the CSC
         #    version of `X` if available, for speed. Clip tiny standard
         #    deviations (less than 1e-8) to 1e-8, like Seurat.
-        num_cells, num_genes = X.shape
-        clipped_stddev = np.empty(num_genes, dtype=np.float32)
-        num_genes_buffer = np.empty(num_genes, dtype=np.float32)
-        num_cells_buffer = np.empty(num_cells, dtype=np.float32)
-        clip_val = 1e-8
-        if faster_single_threading:
-            data = X.data
-            indices = X.indices
-            indptr = X.indptr
-            if isinstance(X, csr_array):
-                clipped_stddev_csr(
-                    data=data, indices=indices, indptr=indptr,
-                    num_cells=num_cells, num_genes=num_genes,
-                    clip_val=clip_val, clipped_stddev=clipped_stddev)
-                
-                def matvec(V):
-                    matvec_csr(data=data, indices=indices, indptr=indptr, V=V,
-                               clipped_stddev=clipped_stddev,
-                               num_cells_buffer=num_cells_buffer,
-                               num_genes_buffer=num_genes_buffer)
-                    return num_cells_buffer
-                
-                def rmatvec(V):
-                    rmatvec_csr(data=data, indices=indices, indptr=indptr, V=V,
-                                clipped_stddev=clipped_stddev,
-                                num_cells_buffer=num_cells_buffer,
-                                num_genes_buffer=num_genes_buffer)
-                    return num_genes_buffer
+        cython_functions = cython_inline(_uninitialized_vector_import + r'''
+        cimport numpy as np
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libc.limits cimport UINT_MAX
+        from libc.math cimport M_PI
+        from libcpp.algorithm cimport fill
+        from libcpp.cmath cimport abs, sqrt, log, cos
+        from libcpp.vector cimport vector
+        from scipy.linalg.cython_blas cimport sgemm as sgemm_, sgemv as sgemv_
+        from scipy.linalg.cython_lapack cimport sgesdd
+        
+        ctypedef fused signed_integer:
+            int
+            long
+        
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+        
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+        
+        cdef inline float random_uniform(unsigned long* state) noexcept nogil:
+            # Returns a random number in U(0, 1)
+            return <float> rand(state) / UINT_MAX
+        
+        cdef inline float random_normal(unsigned long* state) noexcept nogil:
+            # Samples a random number from the standard normal distribution
+            # using the Box-Muller transform
             
+            cdef double r, theta
+            
+            r = sqrt(-2 * log(random_uniform(state)))
+            theta = 2 * M_PI * random_uniform(state)
+            return r * cos(theta)
+        
+        cdef inline float norm(float[::1] array) noexcept nogil:
+            cdef unsigned i
+            cdef float norm = 0
+            for i in range(array.shape[0]):
+                norm += array[i] * array[i]
+            return sqrt(norm)
+        
+        cdef inline void sgemv(const char trans,
+                               const int m,
+                               const int n,
+                               const float alpha,
+                               const float* a,
+                               const int lda,
+                               const float* x,
+                               const int incx,
+                               const float beta,
+                               float* y,
+                               const int incy) noexcept nogil:
+            # Matrix multiplication wrapper that accepts scalars by value and
+            # provides const-correctness
+            
+            sgemv_(<char*> &trans, <int*> &m, <int*> &n, <float*> &alpha,
+                   <float*> a, <int*> &lda, <float*> x, <int*> &incx,
+                   <float*> &beta, y, <int*> &incy)
+        
+        cdef inline void sgemm(const char transa,
+                               const char transb,
+                               const int m,
+                               const int n,
+                               const int k,
+                               const float alpha,
+                               const float* a,
+                               const int lda,
+                               const float* b,
+                               const int ldb,
+                               const float beta,
+                               float* c,
+                               const int ldc) noexcept nogil:
+            # Matrix multiplication wrapper that accepts scalars by value and
+            # provides const-correctness
+            
+            sgemm_(<char*> &transa, <char*> &transb, <int*> &m, <int*> &n, <int*> &k,
+                   <float*> &alpha, <float*> a, <int*> &lda, <float*> b, <int*> &ldb,
+                   <float*> &beta, c, <int*> &ldc)
+        
+        def clipped_stddev_csr(const float[::1] data,
+                               const signed_integer[::1] indices,
+                               const signed_integer[::1] indptr,
+                               const unsigned long num_cells,
+                               const unsigned num_genes,
+                               float clip_val,
+                               float[::1] clipped_stddev):
+            # Compute `X.std(axis=0)` where `X` is CSR, clipping to a minimum of
+            # `clip_val`. Only used when `num_threads=1` and
+            # `faster_single_threading=True`.
+            
+            cdef unsigned long num_elements, i, j, start, end, \
+                chunk_size
+            cdef unsigned gene, cell, thread_index
+            cdef float value, total_sum, total_sum_of_squares, \
+                inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
+            cdef vector[float] sum, sum_of_squares
+            sum.resize(num_genes)
+            sum_of_squares.resize(num_genes)
+            
+            # Iterate over all elements of the count matrix, ignoring which cell
+            # they're from
+            num_elements = indices.shape[0]
+            for i in range(num_elements):
+                gene = indices[i]
+                value = data[i]
+                sum[gene] += value
+                sum_of_squares[gene] += value * value
+            
+            # Calculate standard deviations from the sums and squared sums
+            for gene in range(num_genes):
+                clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
+                    num_cells * sum_of_squares[gene] - sum[gene] * sum[gene]))
+                if clipped_stddev[gene] < clip_val:
+                    clipped_stddev[gene] = clip_val
+        
+        def clipped_stddev_csc(const float[::1] data,
+                               const signed_integer[::1] indices,
+                               const signed_integer[::1] indptr,
+                               const unsigned long num_cells,
+                               const unsigned num_genes,
+                               float clip_val,
+                               float[::1] clipped_stddev,
+                               const unsigned num_threads):
+            # Compute `X.std(axis=0)` where `X` is CSC, clipping to a minimum of
+            # `clip_val`.
+            
+            cdef unsigned long i, gene
+            cdef float value, sum, sum_of_squares, \
+                inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
+            
+            if num_threads == 1:
+                for gene in range(num_genes):
+                    # Calculate the sum and squared sum for this gene, across cells
+                    # with non-zero counts for the gene
+                    sum = 0
+                    sum_of_squares = 0
+                    for i in range(<unsigned long> indptr[gene],
+                                   <unsigned long> indptr[gene + 1]):
+                        value = data[i]
+                        sum += value
+                        sum_of_squares += value * value
+        
+                    # Calculate the scaled variance from the sum and squared sum
+                    clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
+                        num_cells * sum_of_squares - sum * sum))
+                    if clipped_stddev[gene] < clip_val:
+                        clipped_stddev[gene] = clip_val
             else:
-                clipped_stddev_csc(
-                    data=data, indices=indices, indptr=indptr,
-                    num_cells=num_cells, num_genes=num_genes,
-                    clip_val=clip_val, clipped_stddev=clipped_stddev,
-                    num_threads=num_threads)
+                for gene in prange(num_genes, nogil=True, num_threads=num_threads):
+                    sum = 0
+                    sum_of_squares = 0
+                    for i in range(<unsigned long> indptr[gene],
+                                   <unsigned long> indptr[gene + 1]):
+                        value = data[i]
+                        sum = sum + value
+                        sum_of_squares = sum_of_squares + value * value
+                    clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
+                        num_cells * sum_of_squares - sum * sum))
+                    if clipped_stddev[gene] < clip_val:
+                        clipped_stddev[gene] = clip_val
+            
+        cdef void matvec_csr(const float[::1] data,
+                             const signed_integer[::1] indices,
+                             const signed_integer[::1] indptr,
+                             const float[::1] V,
+                             const float[::1] clipped_stddev,
+                             float* num_cells_buffer,
+                             float* num_genes_buffer,
+                             const unsigned num_cells,
+                             const unsigned num_genes,
+                             const unsigned num_threads) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Also has a parallel version,
+            # `matvec_csr_parallel()`. `num_threads` is unused, but needed to
+            # match the signature of `matvec_csr_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float mean = 0
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
                 
-                def matvec(V):
-                    matvec_csc(data=data, indices=indices, indptr=indptr, V=V,
-                               clipped_stddev=clipped_stddev,
-                               num_cells_buffer=num_cells_buffer,
-                               num_genes_buffer=num_genes_buffer)
-                    return num_cells_buffer
+            # Matrix-vector multiplication and mean calculation
+            for i in range(num_cells):
+                num_cells_buffer[i] = 0
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    num_cells_buffer[i] += data[j] * num_genes_buffer[indices[j]]
+                mean += num_cells_buffer[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] -= mean
+        
+        cdef void matvec_csr_parallel(const float[::1] data,
+                                      const signed_integer[::1] indices,
+                                      const signed_integer[::1] indptr,
+                                      const float[::1] V,
+                                      const float[::1] clipped_stddev,
+                                      float* num_cells_buffer,
+                                      float* num_genes_buffer,
+                                      const unsigned num_cells,
+                                      const unsigned num_genes,
+                                      const unsigned num_threads) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Also has a single-threaded
+            # version, `matvec_csr()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float mean = 0
+            
+            # Variance scaling (single-threaded since `num_genes` is just 2000
+            # by default)
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
+            
+            with nogil:
+                # Matrix-vector multiplication
+                for i in prange(num_cells, num_threads=num_threads):
+                    num_cells_buffer[i] = 0
+                    for j in range(<unsigned long> indptr[i],
+                                   <unsigned long> indptr[i + 1]):
+                        num_cells_buffer[i] += \
+                            data[j] * num_genes_buffer[indices[j]]
                 
-                def rmatvec(V):
-                    rmatvec_csc(data=data, indices=indices, indptr=indptr, V=V,
-                                clipped_stddev=clipped_stddev,
-                                num_cells_buffer=num_cells_buffer,
-                                num_genes_buffer=num_genes_buffer)
-                    return num_genes_buffer
-        else:
-            if isinstance(X, csr_array):
-                X_csr = X
-                X_csc = X.tocsc()
+                # Mean calculation (must be done single-threaded to be
+                # deterministic, due to floating-point error)
+                for i in range(num_cells):
+                    mean += num_cells_buffer[i]
+                mean /= num_cells
+                
+                # Mean scaling
+                for i in prange(num_cells, num_threads=num_threads):
+                    num_cells_buffer[i] -= mean
+        
+        cdef void matvec_csc(const float[::1] data,
+                             const signed_integer[::1] indices,
+                             const signed_integer[::1] indptr,
+                             const float[::1] V,
+                             const float[::1] clipped_stddev,
+                             float* num_cells_buffer,
+                             float* num_genes_buffer,
+                             const unsigned num_cells,
+                             const unsigned num_genes,
+                             const unsigned num_threads) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSC and `V`
+            # and `num_cells_buffer` are vectors. Does not have a parallel version.
+            # `num_threads` is unused, but needed to match the signature of
+            # `matvec_csr_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float mean = 0
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
+            
+            # Matrix-vector multiplication
+            fill(num_cells_buffer, num_cells_buffer + num_cells, 0)
+            for i in range(num_genes):
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    num_cells_buffer[indices[j]] += data[j] * num_genes_buffer[i]
+                    
+            # Mean calculation
+            for i in range(num_cells):
+                mean += num_cells_buffer[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] -= mean
+        
+        cdef void rmatvec_csr(const float[::1] data,
+                              const signed_integer[::1] indices,
+                              const signed_integer[::1] indptr,
+                              const float[::1] V,
+                              const float[::1] clipped_stddev,
+                              float* num_cells_buffer,
+                              float* num_genes_buffer,
+                              const unsigned num_cells,
+                              const unsigned num_genes,
+                              const unsigned num_threads) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Does not have a parallel version.
+            # `num_threads` is unused, but needed to match the signature of
+            # `rmatvec_csc_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float mean = 0
+            
+            # Mean scaling
+            for i in range(num_cells):
+                mean += V[i]
+            mean /= num_cells
+            for i in range(num_cells):
+                num_cells_buffer[i] = V[i] - mean
+            
+            # Matrix-vector multiplication
+            fill(num_genes_buffer, num_genes_buffer + num_genes, 0)
+            for i in range(num_cells):
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    num_genes_buffer[indices[j]] += data[j] * num_cells_buffer[i]
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] /= clipped_stddev[i]
+        
+        cdef void rmatvec_csc(const float[::1] data,
+                              const signed_integer[::1] indices,
+                              const signed_integer[::1] indptr,
+                              const float[::1] V,
+                              const float[::1] clipped_stddev,
+                              float* num_cells_buffer,
+                              float* num_genes_buffer,
+                              const unsigned num_cells,
+                              const unsigned num_genes,
+                              const unsigned num_threads) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
+            # and `num_cells_buffer` are vectors. Also has a parallel version,
+            # `rmatvec_csc_parallel()`. `num_threads` is unused, but needed to match
+            # the signature of `rmatvec_csc_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float mean = 0
+            
+            # Mean calculation
+            for i in range(num_cells):
+                mean += V[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] = V[i] - mean
+            
+            # Matrix-vector multiplication
+            for i in range(num_genes):
+                num_genes_buffer[i] = 0
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    num_genes_buffer[i] += data[j] * num_cells_buffer[indices[j]]
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] /= clipped_stddev[i]
+        
+        cdef void rmatvec_csc_parallel(const float[::1] data,
+                                       const signed_integer[::1] indices,
+                                       const signed_integer[::1] indptr,
+                                       const float[::1] V,
+                                       const float[::1] clipped_stddev,
+                                       float* num_cells_buffer,
+                                       float* num_genes_buffer,
+                                       const unsigned num_cells,
+                                       const unsigned num_genes,
+                                       const unsigned num_threads) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
+            # and `num_cells_buffer` are vectors. Also has a single-threaded
+            # version, `rmatvec_csc()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float mean = 0
+            
+            with nogil:
+                # Mean calculation (must be done single-threaded to be
+                # deterministic, due to floating-point error)
+                for i in range(num_cells):
+                    mean += V[i]
+                mean /= num_cells
+                
+                # Mean scaling
+                for i in prange(num_cells, num_threads=num_threads):
+                    num_cells_buffer[i] = V[i] - mean
+                
+                # Matrix-vector multiplication
+                for i in prange(num_genes, num_threads=num_threads):
+                    num_genes_buffer[i] = 0
+                    for j in range(<unsigned long> indptr[i],
+                                   <unsigned long> indptr[i + 1]):
+                        num_genes_buffer[i] += \
+                            data[j] * num_cells_buffer[indices[j]]
+            
+            # Variance scaling (single-threaded since `num_genes` is just 2000
+            # by default)
+            for i in range(num_genes):
+                num_genes_buffer[i] /= clipped_stddev[i]
+
+        cdef inline int svd_workspace_size(float[::1, :] B,
+                                           float[::1, :] U,
+                                           float[::1] S,
+                                           float[::1, :] Vt,
+                                           int* iwork) noexcept nogil:
+            # Get the optimal workspace size for SVD with `sgesdd()`. Assumes `m < n`,
+            # which it is for `B`.
+            
+            cdef char jobz = b'S'
+            cdef int info, m = B.shape[0], n = B.shape[1], lwork = -1
+            cdef float workspace_size
+            
+            sgesdd(&jobz, &m, &n, &B[0, 0], &m, &S[0], &U[0, 0], &m, &Vt[0, 0], &m,
+                   &workspace_size, &lwork, iwork, &info)
+            return <int> workspace_size
+
+        cdef inline void svd(float[::1, :] B,
+                             float[::1, :] U,
+                             float[::1] S,
+                             float[::1, :] Vt,
+                             float* work,
+                             int* iwork,
+                             const int lwork) noexcept nogil:
+            # SVD for the case where `m < n`, which it is for `B`. Uses the optimal
+            # workspace size computed by `svd_workspace_size()`.
+            
+            cdef char jobz = b'S'
+            cdef int info, m = B.shape[0], n = B.shape[1]
+            
+            sgesdd(&jobz, &m, &n, &B[0, 0], &m, &S[0], &U[0, 0], &m, &Vt[0, 0], &m,
+                   work, <int*> &lwork, iwork, &info)
+        
+        ctypedef void (*matvec_function)(const float[::1] data,
+                                         const signed_integer[::1] indices,
+                                         const signed_integer[::1] indptr,
+                                         const float[::1] V,
+                                         const float[::1] clipped_stddev,
+                                         float* num_cells_buffer,
+                                         float* num_genes_buffer,
+                                         const unsigned num_cells,
+                                         const unsigned num_genes,
+                                         const unsigned num_threads) noexcept nogil
+        
+        def irlba(const float[::1] data_matvec,
+                  const signed_integer[::1] indices_matvec,
+                  const signed_integer[::1] indptr_matvec,
+                  const float[::1] data_rmatvec,
+                  const signed_integer[::1] indices_rmatvec,
+                  const signed_integer[::1] indptr_rmatvec,
+                  const float[::1] clipped_stddev,
+                  const unsigned num_cells,
+                  const unsigned num_genes,
+                  const unsigned k,
+                  const unsigned subspace_size,
+                  const float tolerance,
+                  const unsigned max_iterations,
+                  const unsigned long seed,
+                  const bint faster_single_threading,
+                  const bint is_csr,
+                  const unsigned num_threads):
+            
+            cdef unsigned iteration, i, j, row, col, num_converged, k_current = 0
+            cdef unsigned long state = srand(seed)
+            cdef float inverse_norm, dot_product, alpha, inverse_alpha, beta, \
+                inverse_beta, remainder_norm, residual, \
+                Smax = 2.4221817809573368e-05  # (float32 eps) ** (2 / 3)
+            cdef int lwork
+            cdef bint converged = False
+            cdef uninitialized_vector[float] U_buffer, U_new_buffer, V_buffer, \
+                V_new_buffer, B_buffer, Ub_buffer, Sb_buffer, Vbt_buffer, \
+                remainder_buffer, work
+            cdef uninitialized_vector[int] iwork
+            cdef float[::1, :] U, U_new, V, V_new, B, Ub, Vbt, temp
+            cdef float[::1] work2, Sb
+            cdef matvec_function matvec, rmatvec
+            cdef np.ndarray[np.float32_t, ndim=2] PCs
+            cdef np.npy_intp dims[2]
+            dims[0] = num_cells
+            dims[1] = k
+            
+            # Allocate workspace arrays:
+            
+            # `U` and `U_new`: left singular vectors
+            U_buffer.resize(num_cells * subspace_size)
+            U = <float[:num_cells:1, :subspace_size]> U_buffer.data()
+            U_new_buffer.resize(num_cells * subspace_size)
+            U_new = <float[:num_cells:1, :subspace_size]> U_new_buffer.data()
+            
+            # `V` and `V_new`: right singular vectors
+            V_buffer.resize(num_genes * subspace_size)
+            V = <float[:num_genes:1, :subspace_size]> V_buffer.data()
+            V_new_buffer.resize(num_genes * subspace_size)
+            V_new = <float[:num_genes:1, :subspace_size]> V_new_buffer.data()
+            
+            # The bidiagonal matrix (`B`) and its left singular vectors (`Ub`),
+            # singular values (`Sb`), and transposed right singular vectors (`Vbt`)
+            B_buffer.resize(subspace_size * (subspace_size + 1))
+            B = <float[:subspace_size:1, :subspace_size + 1]> B_buffer.data()
+            Ub_buffer.resize(subspace_size * subspace_size)
+            Ub = <float[:subspace_size:1, :subspace_size]> Ub_buffer.data()
+            Sb_buffer.resize(subspace_size)
+            Sb = <float[:subspace_size]> Sb_buffer.data()
+            Vbt_buffer.resize(subspace_size * (subspace_size + 1))
+            Vbt = <float[:subspace_size:1, :subspace_size + 1]> Vbt_buffer.data()
+            
+            # The remainder from the Lanczos bidiagonalization (`remainder`)
+            remainder_buffer.resize(num_genes)
+            cdef float[::1] remainder = <float[:num_genes]> remainder_buffer.data()
+            
+            # The temporary buffers used by `sgesdd()` to perform SVD of `B`
+            # (`iwork` and `work`). The optimal size of the latter is
+            # determined programmatically via `svd_workspace_size()`.
+            iwork.resize(8 * subspace_size)
+            lwork = svd_workspace_size(B, Ub, Sb, Vbt, iwork.data())
+            work.resize(lwork)
+            
+            # Decide which function to use for matvec and rmatvec
+            if faster_single_threading:
+                if is_csr:
+                    matvec = matvec_csr
+                    rmatvec = rmatvec_csr
+                else:
+                    matvec = matvec_csc
+                    rmatvec = rmatvec_csc
             else:
-                X_csr = X.tocsr()
-                X_csc = X
-            csr_data = X_csr.data
-            csr_indices = X_csr.indices
-            csr_indptr = X_csr.indptr
-            csc_data = X_csc.data
-            csc_indices = X_csc.indices
-            csc_indptr = X_csc.indptr
-            clipped_stddev_csc(
-                data=csc_data, indices=csc_indices, indptr=csc_indptr,
-                num_cells=num_cells, num_genes=num_genes, clip_val=clip_val,
-                clipped_stddev=clipped_stddev, num_threads=num_threads)
+                matvec = matvec_csr_parallel
+                rmatvec = rmatvec_csc_parallel
             
-            def matvec(V):
-                matvec_csr_parallel(data=csr_data, indices=csr_indices,
-                                    indptr=csr_indptr, V=V,
-                                    clipped_stddev=clipped_stddev,
-                                    num_cells_buffer=num_cells_buffer,
-                                    num_genes_buffer=num_genes_buffer,
-                                    num_threads=num_threads)
-                return num_cells_buffer
+            # Initialize the first column of `V` with a random normal vector
+            for i in range(num_genes):
+                V[i, 0] = random_normal(&state)
+            inverse_norm = 1 / norm(V[:, 0])
+            for i in range(num_genes):
+                V[i, 0] *= inverse_norm
             
-            def rmatvec(V):
-                rmatvec_csc_parallel(data=csc_data, indices=csc_indices,
-                                     indptr=csc_indptr, V=V,
-                                     clipped_stddev=clipped_stddev,
-                                     num_cells_buffer=num_cells_buffer,
-                                     num_genes_buffer=num_genes_buffer,
-                                     num_threads=num_threads)
-                return num_genes_buffer
-        # noinspection PyArgumentList
-        op = LinearOperator(matvec=matvec, rmatvec=rmatvec, dtype=X.dtype,
-                            shape=(X.shape[0], X.shape[1]))
-        
-        # Allocate workspace arrays: left vectors (`U`), right vectors + one
-        # column of scratch space (`V`), bidiagonal matrix (`B`)
-        U = np.empty((num_cells, subspace_size), dtype=np.float32, order='F')
-        V = np.empty((num_genes, subspace_size + 1), dtype=np.float32,
-                     order='F')
-        B = np.zeros((subspace_size, subspace_size + 1), dtype=np.float32,
-                     order='F')
-        
-        # Allocate space for the PCs
-        PCs = np.empty((num_cells, num_PCs), dtype=np.float32)
-        
-        # Initialize the first column of `V` with a random normal vector
-        V[:, 0] = np.random.default_rng(seed).standard_normal(num_genes,
-                                                              dtype=np.float32)
-        V[:, 0] /= np.linalg.norm(V[:, 0])
-        
-        # Run PCA with irlba
-        original_num_threads = X._num_threads
-        X._num_threads = num_threads
-        try:
-            with threadpool_limits(num_threads):
-                irlba = cython_inline(r'''
-            import numpy as np
-            cimport numpy as np
+            # Initialize `B` with zeros
+            B[:] = 0
             
-            def irlba(operator,
-                      # float[::1, :] U,
-                      # float[::1, :] V,
-                      # float[::1, :] B,
-                      # float[:, ::1] PCs,
-                      np.ndarray[np.float32_t, ndim=2, mode='fortran'] U,
-                      np.ndarray[np.float32_t, ndim=2, mode='fortran'] V,
-                      np.ndarray[np.float32_t, ndim=2, mode='fortran'] B,
-                      np.ndarray[np.float32_t, ndim=2] PCs,
-                      const float tolerance,
-                      const unsigned max_iterations):
-                
-                cdef unsigned iteration, i, num_converged, \
-                    k = PCs.shape[1], k_current = 0, subspace_size = U.shape[1]
-                cdef float alpha, beta, remainder_norm, \
-                     Smax = 2.4221817809573368e-05  # (float32 eps) ** (2 / 3)
-                cdef bint converged = False
-                cdef np.ndarray[np.float32_t, ndim=1] Sb, residuals, S
-                cdef np.ndarray[np.float32_t, ndim=2] Ub, VbT
-                
+            # Now that setup is done, run the IRLBA iterations
+            if num_threads == 1:
                 for iteration in range(max_iterations):
-                    # Perform Lanczos bidiagonalization with reorthogonalization
-                    i = k_current
+                    # Perform Lanczos bidiagonalization with reorthogonalization;
+                    # use for loops instead of `sgemv()` for matrix-vector
+                    # multiplication to ensure deterministic parallelism
+                    j = k_current
                     while True:
-                        U[:, i] = operator.matvec(V[:, i])
-                        if i > 0:
-                            U[:, i] -= U[:, :i] @ (U[:, :i].T @ U[:, i])
-                        alpha = np.linalg.norm(U[:, i])
-                        U[:, i] /= alpha
-                        B[i, i] = alpha
+                        # `U[:, j] = X_scaled @ V[:, j]`; use `remainder` as a
+                        # temporary buffer (it happens to have the correct type, float,
+                        # and length, `num_genes`)
+                        matvec(data_matvec, indices_matvec, indptr_matvec, V[:, j],
+                               clipped_stddev, &U[0, j], &remainder[0], num_cells,
+                               num_genes, num_threads)
+                        
+                        if j > 0:
+                            # U[:, j] -= U[:, :j] @ (U[:, :j].T @ U[:, j])
+                            # Use `work` to store the intermediate product
+                            # `U[:, :j].T @ U[:, j]`, which has length `j`. This is
+                            # guaranteed to fit since `sgesdd()` guarantees that `work` has
+                            # at least `4 * subspace_size ** 2 + 7 * subspace_size`
+                            # elements, and we only need `j`, which is less than
+                            # `subspace_size`.
+                            
+                            # `work = U[:, :j].T @ U[:, j]`
+                            # sgemv(b'T', num_cells, j, 1, &U[0, 0], num_cells, &U[0, j], 1, 0,
+                            #       work.data(), 1)
+                            for col in range(j):
+                                dot_product = 0
+                                for row in range(num_cells):
+                                    dot_product = dot_product + U[row, col] * U[row, j]
+                                work[col] = dot_product
+                            
+                            # `U[:, j] -= U[:, :j] @ work`
+                            # sgemv(b'N', num_cells, j, -1, &U[0, 0], num_cells,
+                            #       work.data(), 1, 1, &U[0, j], 1)
+                            for row in range(num_cells):
+                                dot_product = 0
+                                for col in range(j):
+                                    dot_product = dot_product + U[row, col] * work[col]
+                                U[row, j] -= dot_product
+                            
+                        alpha = norm(U[:, j])
+                        inverse_alpha = 1 / alpha
+                        for i in range(num_cells):
+                            U[i, j] *= inverse_alpha
+                        B[j, j] = alpha
             
-                        V[:, i + 1] = operator.rmatvec(U[:, i])
-                        V[:, i + 1] -= alpha * V[:, i]
-                        V[:, i + 1] -= V[:, :i + 1] @ (V[:, :i + 1].T @ V[:, i + 1])
-                        if i == subspace_size - 1:
+                        if j < subspace_size - 1:
+                            # `V[:, j + 1] = X_scaled.T @ U[:, j]`; use `U_new` as a
+                            # temporary buffer (it happens to have the correct type, float,
+                            # and length, at least `num_cells`)
+                            rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                    U[:, j], clipped_stddev, &U_new[0, 0], &V[0, j + 1],
+                                    num_cells, num_genes, num_threads)
+                            
+                            # `V[:, j + 1] -= alpha * V[:, j]`
+                            for i in range(num_genes):
+                                V[i, j + 1] -= alpha * V[i, j]
+                            
+                            # `V[:, j + 1] -= V[:, :j + 1] @ (V[:, :j + 1].T @ V[:, j + 1])`;
+                            # use `work` to store the intermediate product, which has length
+                            # `j + 1` and is guaranteed to fit: as mentioned above, `work` has
+                            # at least `4 * subspace_size ** 2 + 7 * subspace_size` elements
+                            
+                            # `work = V[:, :j + 1].T @ V[:, j + 1]`
+                            # sgemv(b'T', num_genes, j + 1, 1, &V[0, 0], num_genes,
+                            #       &V[0, j + 1], 1, 0, work.data(), 1)
+                            for col in range(j + 1):
+                                dot_product = 0
+                                for row in range(num_genes):
+                                    dot_product = dot_product + V[row, col] * V[row, j + 1]
+                                work[col] = dot_product
+                            
+                            # `V[:, j + 1] -= V[:, :j + 1] @ work`
+                            # sgemv(b'N', num_genes, j + 1, -1, &V[0, 0], num_genes,
+                            #       work.data(), 1, 1, &V[0, j + 1], 1)
+                            for row in range(num_genes):
+                                dot_product = 0
+                                for col in range(j + 1):
+                                    dot_product = dot_product + V[row, col] * work[col]
+                                V[row, j + 1] -= dot_product
+                        else:
+                            # `j == subspace_size - 1` so `V[:, j + 1]` would overwrite
+                            # the end of the array. Do the same computation, but store the
+                            # results in the `remainder` vector instead of `V[:, j + 1]`.
+                            # `remainder = X_scaled.T @ U[:, j]`
+                            rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                    U[:, j], clipped_stddev, &U_new[0, 0], &remainder[0],
+                                    num_cells, num_genes, num_threads)
+                            
+                            # `remainder -= alpha * V[:, j]`
+                            for i in range(num_genes):
+                                remainder[i] -= alpha * V[i, j]
+                            
+                            # `work = V.T @ remainder`
+                            # sgemv(b'T', num_genes, subspace_size, 1, &V[0, 0], num_genes,
+                            #       &remainder[0], 1, 0, &work[0], 1)
+                            for col in range(subspace_size):
+                                dot_product = 0
+                                for row in range(num_genes):
+                                    dot_product = dot_product + V[row, col] * remainder[row]
+                                work[col] = dot_product
+                            
+                            # `remainder -= V @ work`
+                            # sgemv(b'N', num_genes, subspace_size, -1, &V[0, 0], num_genes,
+                            #       &work[0], 1, 1, &remainder[0], 1)
+                            for row in range(num_genes):
+                                dot_product = 0
+                                for col in range(subspace_size):
+                                    dot_product = dot_product + V[row, col] * work[col]
+                                remainder[row] -= dot_product
+                            
                             break
-                        beta = np.linalg.norm(V[:, i + 1])
-                        B[i, i + 1] = beta
-                        V[:, i + 1] /= beta
-                        i += 1
+                            
+                        beta = norm(V[:, j + 1])
+                        inverse_beta = 1 / beta
+                        for i in range(num_genes):
+                            V[i, j + 1] *= inverse_beta
+                        B[j, j + 1] = beta
+                        j += 1
+                        if j % 10 == 9:
+                            PyErr_CheckSignals()
+                        
+                    # Compute the SVD of the bidiagonal matrix `B`, equivalent to
+                    # `Ub, Sb, Vbt = np.linalg.svd(B, full_matrices=False)`
+                    svd(B, Ub, Sb, Vbt, work.data(), iwork.data(), lwork)
                     
-                    # Compute the SVD of the bidiagonal matrix `B`
-                    Ub, Sb, VbT = np.linalg.svd(B, full_matrices=False)  # use sgesdd
+                    # Normalize the `remainder` vector
+                    remainder_norm = norm(remainder)
+                    for i in range(num_genes):
+                        remainder[i] /= remainder_norm
                     
-                    # Normalize the remainder vector; get the residuals
-                    remainder_norm = np.linalg.norm(V[:, subspace_size])
-                    V[:, subspace_size] /= remainder_norm
-                    residuals = remainder_norm * Ub[subspace_size - 1, :]
-                    
-                    # Update `Smax`; check convergence of singular values via residuals
+                    # Update `Smax`, the largest singular value of `B` we've seen so far
                     Smax = max(Sb[0], Smax)
-                    num_converged = (np.abs(residuals[:k]) < tolerance * Smax).sum()
+                    
+                    # Check convergence of singular values via residuals
+                    num_converged = 0
+                    for i in range(k):
+                        residual = remainder_norm * Ub[subspace_size - 1, i]
+                        num_converged += abs(residual) < tolerance * Smax
                     if num_converged == k:
                         converged = True
                         break
@@ -18615,23 +20315,322 @@ class SingleCell:
                     # converged singular values, ensuring it stays under the subspace size
                     k_current = min(max(k_current, k + num_converged), subspace_size - 1)
                     
-                    # Restart with new subspace
-                    U[:, :k_current] = U[:, :subspace_size] @ Ub[:, :k_current]
-                    V[:, :k_current] = V[:, :subspace_size] @ VbT.T[:subspace_size, :k_current]
-                    V[:, k_current] = V[:, subspace_size]
+                    # Restart with new subspace: update `U`, `V` and `B`. The `U` and `V`
+                    # updates are in-place, but `sgemm()` doesn't support in-place matrix
+                    # multiplication, so use `U_new` and `V_new` as the output arrays and
+                    # then swap the pointers so that `U` and `V` point to the output.
+                    
+                    # U[:, :k_current] = U @ Ub[:, :k_current]
+                    sgemm(b'N', b'N', num_cells, k_current, subspace_size, 1, &U[0, 0],
+                          num_cells, &Ub[0, 0], subspace_size, 0, &U_new[0, 0], num_cells)
+                    temp = U
+                    U = U_new
+                    U_new = temp
+                    
+                    # V[:, :k_current] = V @ Vbt.T[:subspace_size, :k_current]
+                    sgemm(b'N', b'T', num_genes, k_current, subspace_size, 1, &V[0, 0],
+                          num_genes, &Vbt[0, 0], subspace_size, 0, &V_new[0, 0], num_genes)
+                    temp = V
+                    V = V_new
+                    V_new = temp
+                    
+                    for i in range(num_genes):
+                        V[i, k_current] = remainder[i]
                     B[:] = 0
-                    B[:k_current, :k_current] = np.diag(Sb[:k_current])
-                    B[:k_current, k_current] = residuals[:k_current]
+                    for i in range(k_current):
+                        B[i, i] = Sb[i]
+                        residual = remainder_norm * Ub[subspace_size - 1, i]
+                        B[i, k_current] = residual
+            else:
+                # Same as the single-threaded version, except for `nogil` and `prange()`
+                with nogil:
+                    for iteration in range(max_iterations):
+                        # Perform Lanczos bidiagonalization with reorthogonalization
+                        j = k_current
+                        while True:
+                            # `U[:, j] = X_scaled @ V[:, j]`; use `remainder` as a
+                            # temporary buffer (it happens to have the correct type, float,
+                            # and length, `num_genes`)
+                            matvec(data_matvec, indices_matvec, indptr_matvec, V[:, j],
+                                   clipped_stddev, &U[0, j], &remainder[0], num_cells,
+                                   num_genes, num_threads)
+                            
+                            if j > 0:
+                                # U[:, j] -= U[:, :j] @ (U[:, :j].T @ U[:, j])
+                                # Use `work` to store the intermediate product
+                                # `U[:, :j].T @ U[:, j]`, which has length `j`. This is
+                                # guaranteed to fit since `sgesdd()` guarantees that `work` has
+                                # at least `4 * subspace_size ** 2 + 7 * subspace_size`
+                                # elements, and we only need `j`, which is less than
+                                # `subspace_size`.
+                                
+                                # `work = U[:, :j].T @ U[:, j]`
+                                # sgemv(b'T', num_cells, j, 1, &U[0, 0], num_cells, &U[0, j], 1, 0,
+                                #       work.data(), 1)
+                                for col in prange(j, num_threads=num_threads):
+                                    dot_product = 0
+                                    for row in range(num_cells):
+                                        dot_product = dot_product + U[row, col] * U[row, j]
+                                    work[col] = dot_product
+                                
+                                # `U[:, j] -= U[:, :j] @ work`
+                                # sgemv(b'N', num_cells, j, -1, &U[0, 0], num_cells,
+                                #       work.data(), 1, 1, &U[0, j], 1)
+                                for row in prange(num_cells, num_threads=num_threads):
+                                    dot_product = 0
+                                    for col in range(j):
+                                        dot_product = dot_product + U[row, col] * work[col]
+                                    U[row, j] -= dot_product
+                                
+                            alpha = norm(U[:, j])
+                            inverse_alpha = 1 / alpha
+                            for i in prange(num_cells, num_threads=num_threads):
+                                U[i, j] *= inverse_alpha
+                            B[j, j] = alpha
                 
-                # Construct final PCs from the top `k` components of `U` and `S`
-                PCs[:] = (U[:, :subspace_size] @ Ub[:, :k]) * Sb[:k]
+                            if j < subspace_size - 1:
+                                # `V[:, j + 1] = X_scaled.T @ U[:, j]`; use `U_new` as a
+                                # temporary buffer (it happens to have the correct type, float,
+                                # and length, at least `num_cells`)
+                                rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                        U[:, j], clipped_stddev, &U_new[0, 0], &V[0, j + 1],
+                                        num_cells, num_genes, num_threads)
+                                
+                                # `V[:, j + 1] -= alpha * V[:, j]`
+                                for i in prange(num_genes, num_threads=num_threads):
+                                    V[i, j + 1] -= alpha * V[i, j]
+                                
+                                # `V[:, j + 1] -= V[:, :j + 1] @ (V[:, :j + 1].T @ V[:, j + 1])`;
+                                # use `work` to store the intermediate product, which has length
+                                # `j + 1` and is guaranteed to fit: as mentioned above, `work` has
+                                # at least `4 * subspace_size ** 2 + 7 * subspace_size` elements
+                                
+                                # `work = V[:, :j + 1].T @ V[:, j + 1]`
+                                # sgemv(b'T', num_genes, j + 1, 1, &V[0, 0], num_genes,
+                                #       &V[0, j + 1], 1, 0, work.data(), 1)
+                                for col in prange(j + 1, num_threads=num_threads):
+                                    dot_product = 0
+                                    for row in range(num_genes):
+                                        dot_product = dot_product + V[row, col] * V[row, j + 1]
+                                    work[col] = dot_product
+                                
+                                # `V[:, j + 1] -= V[:, :j + 1] @ work`
+                                # sgemv(b'N', num_genes, j + 1, -1, &V[0, 0], num_genes,
+                                #       work.data(), 1, 1, &V[0, j + 1], 1)
+                                for row in prange(num_genes, num_threads=num_threads):
+                                    dot_product = 0
+                                    for col in range(j + 1):
+                                        dot_product = dot_product + V[row, col] * work[col]
+                                    V[row, j + 1] -= dot_product
+                            else:
+                                # `j == subspace_size - 1` so `V[:, j + 1]` would overwrite
+                                # the end of the array. Do the same computation, but store the
+                                # results in the `remainder` vector instead of `V[:, j + 1]`.
+                                # `remainder = X_scaled.T @ U[:, j]`
+                                rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                        U[:, j], clipped_stddev, &U_new[0, 0], &remainder[0],
+                                        num_cells, num_genes, num_threads)
+                                
+                                # `remainder -= alpha * V[:, j]`
+                                for i in prange(num_genes, num_threads=num_threads):
+                                    remainder[i] -= alpha * V[i, j]
+                                
+                                # `work = V.T @ remainder`
+                                # sgemv(b'T', num_genes, subspace_size, 1, &V[0, 0], num_genes,
+                                #       &remainder[0], 1, 0, &work[0], 1)
+                                for col in prange(subspace_size, num_threads=num_threads):
+                                    dot_product = 0
+                                    for row in range(num_genes):
+                                        dot_product = dot_product + V[row, col] * remainder[row]
+                                    work[col] = dot_product
+                                
+                                # `remainder -= V @ work`
+                                # sgemv(b'N', num_genes, subspace_size, -1, &V[0, 0], num_genes,
+                                #       &work[0], 1, 1, &remainder[0], 1)
+                                for row in prange(num_genes, num_threads=num_threads):
+                                    dot_product = 0
+                                    for col in range(subspace_size):
+                                        dot_product = dot_product + V[row, col] * work[col]
+                                    remainder[row] -= dot_product
+                                
+                                break
+                                
+                            beta = norm(V[:, j + 1])
+                            inverse_beta = 1 / beta
+                            for i in range(num_genes):
+                                V[i, j + 1] *= inverse_beta
+                            B[j, j + 1] = beta
+                            j += 1
+                            if j % 10 == 9:
+                                with gil:
+                                    PyErr_CheckSignals()
+                            
+                        # Compute the SVD of the bidiagonal matrix `B`, equivalent to
+                        # `Ub, Sb, Vbt = np.linalg.svd(B, full_matrices=False)`
+                        svd(B, Ub, Sb, Vbt, work.data(), iwork.data(), lwork)
+                        
+                        # Normalize the `remainder` vector
+                        remainder_norm = norm(remainder)
+                        for i in range(num_genes):
+                            remainder[i] /= remainder_norm
+                        
+                        # Update `Smax`, the largest singular value of `B` we've seen so far
+                        Smax = max(Sb[0], Smax)
+                        
+                        # Check convergence of singular values via residuals
+                        num_converged = 0
+                        for i in range(k):
+                            residual = remainder_norm * Ub[subspace_size - 1, i]
+                            num_converged += abs(residual) < tolerance * Smax
+                        if num_converged == k:
+                            converged = True
+                            break
+                        
+                        # For the next iteration, increase `k_current` to `k` + the number of
+                        # converged singular values, ensuring it stays under the subspace size
+                        k_current = min(max(k_current, k + num_converged), subspace_size - 1)
+                        
+                        # Restart with new subspace: update `U`, `V` and `B`. The `U` and `V`
+                        # updates are in-place, but `sgemm()` doesn't support in-place matrix
+                        # multiplication, so use `U_new` and `V_new` as the output arrays and
+                        # then swap the pointers so that `U` and `V` point to the output.
+                        
+                        # U[:, :k_current] = U @ Ub[:, :k_current]
+                        sgemm(b'N', b'N', num_cells, k_current, subspace_size, 1, &U[0, 0],
+                              num_cells, &Ub[0, 0], subspace_size, 0, &U_new[0, 0], num_cells)
+                        temp = U
+                        U = U_new
+                        U_new = temp
+                        
+                        # V[:, :k_current] = V @ Vbt.T[:subspace_size, :k_current]
+                        sgemm(b'N', b'T', num_genes, k_current, subspace_size, 1, &V[0, 0],
+                              num_genes, &Vbt[0, 0], subspace_size, 0, &V_new[0, 0], num_genes)
+                        temp = V
+                        V = V_new
+                        V_new = temp
+                        
+                        for i in range(num_genes):
+                            V[i, k_current] = remainder[i]
+                        B[:] = 0
+                        for i in range(k_current):
+                            B[i, i] = Sb[i]
+                            residual = remainder_norm * Ub[subspace_size - 1, i]
+                            B[i, k_current] = residual
                 
-                # Return whether IRLBA converged
-                return converged
-                ''', warn_undeclared=False)['irlba']
-                converged = irlba(op, U=U, V=V, B=B, PCs=PCs,
-                                  tolerance=tolerance,
-                                  max_iterations=max_iterations)
+            # Free all no-longer-needed memory, then allocate the final NumPy array
+            # for the PCs
+            if &U_new[0, 0] == U_buffer.data():
+                U_new_buffer.clear()
+            else:
+                U_buffer.clear()
+            V_buffer.clear()
+            V_new_buffer.clear()
+            B_buffer.clear()
+            Vbt_buffer.clear()
+            remainder_buffer.clear()
+            work.clear()
+            np.import_array()
+            # PCs = np.empty((num_cells, k), dtype=np.float32)
+            PCs = np.PyArray_EMPTY(2, dims, np.NPY_FLOAT32, 0)
+        
+            # Construct final PCs from the top `k` components of `U` and `S`:
+            # U[:, :k] = U[:, :subspace_size] @ Ub[:, :k]
+            # PCs[:] = U[:, :k] * Sb[:k]
+            # As an optimization, due to linearity we can switch the order of
+            # operations to:
+            # Ub[:, :k] *= Sb[:k]
+            for j in range(k):
+                for i in range(subspace_size):
+                    Ub[i, j] *= Sb[j]
+            # followed by:
+            # PCs[:] = U[:, :subspace_size] @ Ub[:, :k]
+            # However, since `PCs` is C-contiguous whereas `U` and `Ub` are
+            # Fortran-contiguous, we actually compute:
+            # PCs.T[:] = Ub[:, :k].T @ U[:, :subspace_size].T
+            # and then reinterpret PCs as C-contiguous
+            sgemm(b'T', b'T', k, num_cells, subspace_size, 1, &Ub[0, 0],
+                  subspace_size, &U[0, 0], num_cells, 0, &PCs[0, 0], k)
+            
+            # Return the PCs, and whether IRLBA converged
+            return PCs, converged
+            ''', warn_undeclared=False)
+        clipped_stddev_csr = cython_functions['clipped_stddev_csr']
+        clipped_stddev_csc = cython_functions['clipped_stddev_csc']
+        irlba = cython_functions['irlba']
+        
+        # Get the data, indices and indptr to be used for the matvec and for
+        # the rmatvec. When `faster_single_threading=False`, this requires
+        # calculating the "opposite" version of the array (CSC if `X` is CSR,
+        # CSR if `X` is CSC). Also, get the clipped standard deviation of each
+        # gene, for variance scaling; use CSC for this if available.
+        num_cells, num_genes = X.shape
+        clipped_stddev = np.empty(num_genes, dtype=np.float32)
+        clip_val = 1e-8
+        is_csr = isinstance(X, csr_array)
+        if is_csr:
+            # `X` is CSR, so always use CSR for the matvec. If
+            # `faster_single_threading`, use CSR for the rmatvec as well,
+            # otherwise use CSC for the rmatvec to enable paralellism.
+            data_matvec = X.data
+            indices_matvec = X.indices
+            indptr_matvec = X.indptr
+            if faster_single_threading:
+                data_rmatvec = data_matvec
+                indices_rmatvec = indices_matvec
+                indptr_rmatvec = indptr_matvec
+                clipped_stddev_csr(
+                    data=data_matvec, indices=indices_matvec,
+                    indptr=indptr_matvec, num_cells=num_cells,
+                    num_genes=num_genes, clip_val=clip_val,
+                    clipped_stddev=clipped_stddev)
+            else:
+                X_csc = X.tocsc()
+                data_rmatvec = X_csc.data
+                indices_rmatvec = X_csc.indices
+                indptr_rmatvec = X_csc.indptr
+                clipped_stddev_csc(
+                    data=data_rmatvec, indices=indices_rmatvec,
+                    indptr=indptr_rmatvec, num_cells=num_cells,
+                    num_genes=num_genes, clip_val=clip_val,
+                    clipped_stddev=clipped_stddev, num_threads=num_threads)
+        else:
+            # `X` is CSC, so always use CSC for the rmatvec. If
+            # `faster_single_threading`, use CSC for the matvec as well,
+            # otherwise use CSR for the matvec to enable paralellism.
+            data_rmatvec = X.data
+            indices_rmatvec = X.indices
+            indptr_rmatvec = X.indptr
+            if faster_single_threading:
+                data_matvec = data_rmatvec
+                indices_matvec = indices_rmatvec
+                indptr_matvec = indptr_rmatvec
+            else:
+                X_csr = X.tocsr()
+                data_matvec = X_csr.data
+                indices_matvec = X_csr.indices
+                indptr_matvec = X_csr.indptr
+            clipped_stddev_csc(
+                data=data_rmatvec, indices=indices_rmatvec,
+                indptr=indptr_rmatvec, num_cells=num_cells,
+                num_genes=num_genes, clip_val=clip_val,
+                clipped_stddev=clipped_stddev, num_threads=num_threads)
+        
+        # Run PCA with irlba
+        original_num_threads = X._num_threads
+        X._num_threads = num_threads
+        try:
+            with threadpool_limits(num_threads, user_api='blas'):
+                PCs, converged = irlba(
+                    data_matvec=data_matvec, indices_matvec=indices_matvec,
+                    indptr_matvec=indptr_matvec, data_rmatvec=data_rmatvec,
+                    indices_rmatvec=indices_rmatvec,
+                    indptr_rmatvec=indptr_rmatvec,
+                    clipped_stddev=clipped_stddev, num_cells=num_cells,
+                    num_genes=num_genes, k=num_PCs,
+                    subspace_size=subspace_size, tolerance=tolerance,
+                    max_iterations=max_iterations, seed=seed,
+                    faster_single_threading=faster_single_threading,
+                    is_csr=is_csr, num_threads=num_threads)
         finally:
             X._num_threads = original_num_threads
         
@@ -18664,19 +20663,19 @@ class SingleCell:
         return tuple(datasets) if others else datasets[0]
     
     # noinspection PyTypeChecker
-    def PCA_newest(self,
+    def PCA(self,
             *others: SingleCell,
             QC_column: SingleCellColumn | None |
                        Sequence[SingleCellColumn | None] = 'passed_QC',
             hvg_column: SingleCellColumn |
-                        Sequence[SingleCellColumn] = 'highly_variable',
+                        Sequence[SingleCellColumn] | None = 'highly_variable',
             PC_key: str = 'PCs',
             num_PCs: int | np.integer = 50,
             subspace_size: int | np.integer = 100,
             tolerance: int | np.integer | float | np.floating = 1e-6,
-            max_iterations: int | np.integer = 1000,
+            max_iterations: int | np.integer = 100,
             seed: int | np.integer = 0,
-            faster_single_threading: bool = False,
+            match_parallel: bool = False,
             overwrite: bool = False,
             verbose: bool = True,
             num_threads: int | np.integer | None = None) -> \
@@ -18707,15 +20706,16 @@ class SingleCell:
                        `None` for each dataset (for `self`, followed by each
                        dataset in `others`).
             hvg_column: an optional Boolean column of `var` indicating the
-                        highly variable genes. Can be a column name, a polars
-                        expression, a polars Series, a 1D NumPy array, or a
-                        function that takes in this SingleCell dataset and
-                        returns a polars Series or 1D NumPy array. Set to
-                        `None` to use all genes. When `others` is specified,
-                        `hvg_column` can be a length-`1 + len(others)` sequence
-                        of columns, expressions, Series, functions, or `None`
-                        for each dataset (for `self`, followed by each dataset
-                        in `others`).
+                        highly variable genes. Set to `None` to include all
+                        genes. Can be a column name, a polars expression, a
+                        polars Series, a 1D NumPy array, or a function that
+                        takes in this SingleCell dataset and returns a polars
+                        Series or 1D NumPy array. Set to `None` to use all
+                        genes. When `others` is specified, `hvg_column` can be
+                        a length-`1 + len(others)` sequence of columns,
+                        expressions, Series, functions, or `None` for each
+                        dataset (for `self`, followed by each dataset in
+                        `others`).
             PC_key: the key of `obsm` where the principal components will be
                     stored
             num_PCs: the number of top principal components to calculate
@@ -18732,27 +20732,22 @@ class SingleCell:
                             converged (see `tolerance`)
             seed: the random seed to use when initializing the PCs, via R's
                   `set.seed()` function
-            faster_single_threading: if `True`, use a different order of
-                                     operations for single-threaded PCA. This
-                                     gives a modest (~15-20%) boost in
-                                     single-threaded performance, and lower
-                                     memory usage, at the cost of no longer
-                                     exactly matching the PCs produced by the
-                                     multithreaded version (due to differences
-                                     in floating-point error arising from the
-                                     different order of operations). When
-                                     `faster_single_threading=True`, `PCA()`
-                                     will also give slightly different results
-                                     when run with CSR vs CSC input; when
-                                     multiple datasets are provided with a mix
-                                     of CSR and CSC formats, all datasets are
-                                     converted to the format shared by the most
-                                     total cells across datasets. Must be
-                                     `False` unless `num_threads=1`. If you are
-                                     always going to run single-threaded and do
-                                     not care about exactly matching the
-                                     multithreaded version, there is no reason
-                                     not to set `faster_single_threading=True`.
+            match_parallel: if `False`, use a different order of operations for
+                            single-threaded PCA. This gives a modest (~15-20%)
+                            boost in single-threaded performance, and lower
+                            memory usage, at the cost of no longer exactly
+                            matching the PCs produced by the multithreaded
+                            version (due to differences in floating-point error
+                            arising from the different order of operations).
+                            When `match_parallel=False`, `PCA()` will also give
+                            slightly different results when run with CSR vs CSC
+                            input; when multiple datasets are provided with a
+                            mix of CSR and CSC formats, all datasets are
+                            converted to the format shared by the most total
+                            cells across datasets. If `True`, exactly match the
+                            results of the multithreaded version when
+                            `num_threads=1`. Must be `False` unless
+                            `num_threads=1`.
             overwrite: if `True`, overwrite `PC_key` if already present in
                        obsm, instead of raising an error
             verbose: whether to print a message when the singular values did
@@ -18806,14 +20801,13 @@ class SingleCell:
                 f'X is None{suffix}, so finding principal components is not '
                 f'possible')
             raise ValueError(error_message)
-        
-        # Get `QC_column` (if not `None`) and `hvg_column` from every dataset
+            
+        # Get `QC_column` and `hvg_column` (if not `None`) from every dataset
         QC_columns = SingleCell._get_columns(
             'obs', datasets, QC_column, 'QC_column', pl.Boolean,
             allow_missing=True)
         hvg_columns = SingleCell._get_columns(
             'var', datasets, hvg_column, 'hvg_column', pl.Boolean,
-            allow_None=False,
             custom_error=f'hvg_column {{}} is not a column of var{suffix}; '
                          f'did you forget to run hvg() (and possibly '
                          f'normalize()) before PCA()?')
@@ -18866,13 +20860,12 @@ class SingleCell:
         # `None`, set to `self.num_threads`, and if -1, set to `os.cpu_count()`.
         num_threads = self._process_num_threads(num_threads)
         
-        # Check that `faster_single_threading` is Boolean, and `False` unless
+        # Check that `match_parallel` is Boolean, and `False` unless
         # `num_threads=1`
-        check_type(faster_single_threading, 'faster_single_threading', bool,
-                   'Boolean')
-        if faster_single_threading and num_threads != 1:
+        check_type(match_parallel, 'match_parallel', bool, 'Boolean')
+        if match_parallel and num_threads != 1:
             error_message = \
-                'faster_single_threading must be False unless num_threads is 1'
+                'match_parallel must be False unless num_threads is 1'
             raise ValueError(error_message)
         
         # Get the matrix to compute PCA across: a sparse matrix of counts for
@@ -18889,10 +20882,15 @@ class SingleCell:
                                 .is_in(pl.concat([dataset.var_names
                                                   for dataset in others])))
                 else:
-                    hvg_in_self = self._var.filter(hvg_columns[0]).to_series()
+                    hvg_in_self = \
+                        self._var.filter(hvg_columns[0]).to_series() \
+                            if hvg_columns[0] is not None else \
+                            self._var.to_series()
                     genes_in_all_datasets = hvg_in_self\
                         .filter(hvg_in_self.is_in(pl.concat([
                             dataset._var.filter(hvg_col).to_series()
+                            if hvg_col is not None else
+                            dataset._var.to_series()
                             for dataset, hvg_col in
                             zip(others, hvg_columns[1:])])))
                 gene_indices = (
@@ -18920,6 +20918,7 @@ class SingleCell:
                         Xs = [dataset._X for dataset in datasets]
                     else:
                         Xs = [dataset._X[:, hvg_col.to_numpy()]
+                              if hvg_col is not None else dataset._X
                               for dataset, hvg_col in
                               zip(datasets, hvg_columns)]
                 else:
@@ -18928,10 +20927,13 @@ class SingleCell:
                               if QC_col is not None else dataset._X
                               for dataset, QC_col in zip(datasets, QC_columns)]
                     else:
-                        Xs = [dataset._X[np.ix_(QC_col.to_numpy(),
-                                                hvg_col.to_numpy())]
-                              if QC_col is not None else
-                              dataset._X[:, hvg_col.to_numpy()]
+                        Xs = [(dataset._X[np.ix_(QC_col.to_numpy(),
+                                                 hvg_col.to_numpy())]
+                               if QC_col is not None else
+                               dataset._X[:, hvg_col.to_numpy()])
+                              if hvg_col is not None else
+                              (dataset._X[QC_col.to_numpy()]
+                               if QC_col is not None else dataset._X)
                               for dataset, QC_col, hvg_col in
                               zip(datasets, QC_columns, hvg_columns)]
         finally:
@@ -18948,8 +20950,8 @@ class SingleCell:
             # total cells in that format, to reduce the number of datasets that
             # need to be flipped
             total_cells = num_cells_per_dataset.sum()
-            total_CSR = sum(X.shape[0] for X in Xs if isinstance(X, csr_array))
-            if total_CSR / total_cells > 0.5:  # more CSR than CSC
+            total_csr = sum(X.shape[0] for X in Xs if isinstance(X, csr_array))
+            if total_csr / total_cells > 0.5:  # more CSR than CSC
                 X = sparse_major_stack([
                     X.tocsr() if isinstance(X, csc_array) else X for X in Xs],
                     num_threads=num_threads)
@@ -18962,328 +20964,15 @@ class SingleCell:
         # Check that `num_PCs` is at most the width of this matrix
         check_bounds(num_PCs, 'num_PCs', upper_bound=X.shape[1])
         
-        # Define Cython functions
-        cython_functions = cython_inline(r'''
-    from cython.parallel cimport parallel, prange, threadid
-    from libcpp.cmath cimport sqrt
-    from libcpp.vector cimport vector
-    
-    ctypedef fused signed_integer:
-        int
-        long
+        # Check that there are at least two cells in total
+        if X.shape[0] == 1:
+            error_message = (
+                f'there is only one cell, so principal components cannot be '
+                f'calculated')
+            raise ValueError(error_message)
         
-    def clipped_stddev_csr(const float[::1] data,
-                           const signed_integer[::1] indices,
-                           const signed_integer[::1] indptr,
-                           const unsigned long num_cells,
-                           const unsigned num_genes,
-                           float clip_val,
-                           float[::1] clipped_stddev):
-        # Compute `X.std(axis=0)` where `X` is CSR, clipping to a minimum of
-        # `clip_val`. Only used when `num_threads=1` and
-        # `faster_single_threading=True`.
-        
-        cdef unsigned long num_elements, i, j, start, end, \
-            chunk_size
-        cdef unsigned gene, cell, thread_index
-        cdef float value, total_sum, total_sum_of_squares, \
-            inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
-        cdef vector[float] sum, sum_of_squares
-        sum.resize(num_genes)
-        sum_of_squares.resize(num_genes)
-        
-        # Iterate over all elements of the count matrix, ignoring which cell
-        # they're from
-        num_elements = indices.shape[0]
-        for i in range(num_elements):
-            gene = indices[i]
-            value = data[i]
-            sum[gene] += value
-            sum_of_squares[gene] += value * value
-        
-        # Calculate standard deviations from the sums and squared sums
-        for gene in range(num_genes):
-            clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
-                num_cells * sum_of_squares[gene] - sum[gene] * sum[gene]))
-            if clipped_stddev[gene] < clip_val:
-                clipped_stddev[gene] = clip_val
-    
-    def clipped_stddev_csc(const float[::1] data,
-                           const signed_integer[::1] indices,
-                           const signed_integer[::1] indptr,
-                           const unsigned long num_cells,
-                           const unsigned num_genes,
-                           float clip_val,
-                           float[::1] clipped_stddev,
-                           const unsigned num_threads):
-        # Compute `X.std(axis=0)` where `X` is CSC, clipping to a minimum of
-        # `clip_val`.
-        
-        cdef unsigned long i, gene
-        cdef float value, sum, sum_of_squares, \
-            inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
-        
-        if num_threads == 1:
-            for gene in range(num_genes):
-                # Calculate the sum and squared sum for this gene, across cells
-                # with non-zero counts for the gene
-                sum = 0
-                sum_of_squares = 0
-                for i in range(<unsigned long> indptr[gene],
-                               <unsigned long> indptr[gene + 1]):
-                    value = data[i]
-                    sum += value
-                    sum_of_squares += value * value
-    
-                # Calculate the scaled variance from the sum and squared sum
-                clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
-                    num_cells * sum_of_squares - sum * sum))
-                if clipped_stddev[gene] < clip_val:
-                    clipped_stddev[gene] = clip_val
-        else:
-            for gene in prange(num_genes, nogil=True, num_threads=num_threads):
-                sum = 0
-                sum_of_squares = 0
-                for i in range(<unsigned long> indptr[gene],
-                               <unsigned long> indptr[gene + 1]):
-                    value = data[i]
-                    sum = sum + value
-                    sum_of_squares = sum_of_squares + value * value
-                clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
-                    num_cells * sum_of_squares - sum * sum))
-                if clipped_stddev[gene] < clip_val:
-                    clipped_stddev[gene] = clip_val
-        
-    def matvec_csr(const float[::1] data,
-                   const signed_integer[::1] indices,
-                   const signed_integer[::1] indptr,
-                   const float[::1] V,
-                   const float[::1] clipped_stddev,
-                   float[::1] num_cells_buffer,
-                   float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
-        # and `num_cells_buffer` are vectors. Also has a parallel version,
-        # `matvec_csr_parallel()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] = V[i] / clipped_stddev[i]
-            
-        # Matrix-vector multiplication and mean calculation
-        for i in range(num_cells):
-            num_cells_buffer[i] = 0
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_cells_buffer[i] += data[j] * num_genes_buffer[indices[j]]
-            mean += num_cells_buffer[i]
-        mean /= num_cells
-        
-        # Mean scaling
-        for i in range(num_cells):
-            num_cells_buffer[i] -= mean
-    
-    def matvec_csr_parallel(const float[::1] data,
-                            const signed_integer[::1] indices,
-                            const signed_integer[::1] indptr,
-                            const float[::1] V,
-                            const float[::1] clipped_stddev,
-                            float[::1] num_cells_buffer,
-                            float[::1] num_genes_buffer,
-                            const unsigned num_threads):
-        # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
-        # and `num_cells_buffer` are vectors. Also has a single-threaded
-        # version, `matvec_csr()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Variance scaling (single-threaded since `num_genes` is just 2000
-        # by default)
-        for i in range(num_genes):
-            num_genes_buffer[i] = V[i] / clipped_stddev[i]
-        
-        with nogil:
-            # Matrix-vector multiplication
-            for i in prange(num_cells, num_threads=num_threads):
-                num_cells_buffer[i] = 0
-                for j in range(<unsigned long> indptr[i],
-                               <unsigned long> indptr[i + 1]):
-                    num_cells_buffer[i] += \
-                        data[j] * num_genes_buffer[indices[j]]
-            
-            # Mean calculation (must be done single-threaded to be
-            # deterministic, due to floating-point error)
-            for i in range(num_cells):
-                mean += num_cells_buffer[i]
-            mean /= num_cells
-            
-            # Mean scaling
-            for i in prange(num_cells, num_threads=num_threads):
-                num_cells_buffer[i] -= mean
-    
-    def matvec_csc(const float[::1] data,
-                   const signed_integer[::1] indices,
-                   const signed_integer[::1] indptr,
-                   const float[::1] V,
-                   const float[::1] clipped_stddev,
-                   float[::1] num_cells_buffer,
-                   float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSC and `V`
-        # and `num_cells_buffer` are vectors. Does not have a parallel version.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] = V[i] / clipped_stddev[i]
-        
-        # Matrix-vector multiplication
-        num_cells_buffer[:] = 0
-        for i in range(num_genes):
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_cells_buffer[indices[j]] += data[j] * num_genes_buffer[i]
-                
-        # Mean calculation
-        for i in range(num_cells):
-            mean += num_cells_buffer[i]
-        mean /= num_cells
-        
-        # Mean scaling
-        for i in range(num_cells):
-            num_cells_buffer[i] -= mean
-    
-    def rmatvec_csr(const float[::1] data,
-                    const signed_integer[::1] indices,
-                    const signed_integer[::1] indptr,
-                    const float[::1] V,
-                    const float[::1] clipped_stddev,
-                    float[::1] num_cells_buffer,
-                    float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSR and `V`
-        # and `num_cells_buffer` are vectors. Does not have a parallel version.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Mean scaling
-        for i in range(num_cells):
-            mean += V[i]
-        mean /= num_cells
-        for i in range(num_cells):
-            num_cells_buffer[i] = V[i] - mean
-        
-        # Matrix-vector multiplication
-        num_genes_buffer[:] = 0
-        for i in range(num_cells):
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_genes_buffer[indices[j]] += data[j] * num_cells_buffer[i]
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] /= clipped_stddev[i]
-    
-    def rmatvec_csc(const float[::1] data,
-                    const signed_integer[::1] indices,
-                    const signed_integer[::1] indptr,
-                    const float[::1] V,
-                    const float[::1] clipped_stddev,
-                    float[::1] num_cells_buffer,
-                    float[::1] num_genes_buffer):
-        # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
-        # and `num_cells_buffer` are vectors. Also has a parallel version,
-        # `rmatvec_csc_parallel()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        # Mean calculation
-        for i in range(num_cells):
-            mean += V[i]
-        mean /= num_cells
-        
-        # Mean scaling
-        for i in range(num_cells):
-            num_cells_buffer[i] = V[i] - mean
-        
-        # Matrix-vector multiplication
-        for i in range(num_genes):
-            num_genes_buffer[i] = 0
-            for j in range(<unsigned long> indptr[i],
-                           <unsigned long> indptr[i + 1]):
-                num_genes_buffer[i] += data[j] * num_cells_buffer[indices[j]]
-        
-        # Variance scaling
-        for i in range(num_genes):
-            num_genes_buffer[i] /= clipped_stddev[i]
-    
-    def rmatvec_csc_parallel(const float[::1] data,
-                             const signed_integer[::1] indices,
-                             const signed_integer[::1] indptr,
-                             const float[::1] V,
-                             const float[::1] clipped_stddev,
-                             float[::1] num_cells_buffer,
-                             float[::1] num_genes_buffer,
-                             const unsigned num_threads):
-        # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
-        # and `num_cells_buffer` are vectors. Also has a single-threaded
-        # version, `rmatvec_csc()`.
-        
-        cdef unsigned i, num_cells = num_cells_buffer.shape[0], \
-            num_genes = num_genes_buffer.shape[0]
-        cdef unsigned long j
-        cdef float mean = 0
-        
-        with nogil:
-            # Mean calculation (must be done single-threaded to be
-            # deterministic, due to floating-point error)
-            for i in range(num_cells):
-                mean += V[i]
-            mean /= num_cells
-            
-            # Mean scaling
-            for i in prange(num_cells, num_threads=num_threads):
-                num_cells_buffer[i] = V[i] - mean
-            
-            # Matrix-vector multiplication
-            for i in prange(num_genes, num_threads=num_threads):
-                num_genes_buffer[i] = 0
-                for j in range(<unsigned long> indptr[i],
-                               <unsigned long> indptr[i + 1]):
-                    num_genes_buffer[i] += \
-                        data[j] * num_cells_buffer[indices[j]]
-        
-        # Variance scaling (single-threaded since `num_genes` is just 2000
-        # by default)
-        for i in range(num_genes):
-            num_genes_buffer[i] /= clipped_stddev[i]
-        ''', warn_undeclared=False)
-        clipped_stddev_csr = cython_functions['clipped_stddev_csr']
-        clipped_stddev_csc = cython_functions['clipped_stddev_csc']
-        matvec_csr = cython_functions['matvec_csr']
-        matvec_csr_parallel = cython_functions['matvec_csr_parallel']
-        matvec_csc = cython_functions['matvec_csc']
-        rmatvec_csr = cython_functions['rmatvec_csr']
-        rmatvec_csc = cython_functions['rmatvec_csc']
-        rmatvec_csc_parallel = cython_functions['rmatvec_csc_parallel']
-        
-        # Define the linear operator to be SVDed: `X` scaled to zero mean and
-        # unit variance.
+        # Define Cython functions. We want to perform SVD on `X`, scaled to
+        # zero mean and unit variance.
         # Key ideas:
         # 1. Because `X` is a sparse matrix, mean-centering cannot be done
         #    without converting to a dense matrix. So scaling `X` cannot be
@@ -19345,176 +21034,964 @@ class SingleCell:
         # 8. When calculating the scaled variance for each gene, use the CSC
         #    version of `X` if available, for speed. Clip tiny standard
         #    deviations (less than 1e-8) to 1e-8, like Seurat.
-        num_cells, num_genes = X.shape
-        clipped_stddev = np.empty(num_genes, dtype=np.float32)
-        num_genes_buffer = np.empty(num_genes, dtype=np.float32)
-        num_cells_buffer = np.empty(num_cells, dtype=np.float32)
-        clip_val = 1e-8
-        if faster_single_threading:
-            data = X.data
-            indices = X.indices
-            indptr = X.indptr
-            if isinstance(X, csr_array):
-                clipped_stddev_csr(
-                    data=data, indices=indices, indptr=indptr,
-                    num_cells=num_cells, num_genes=num_genes,
-                    clip_val=clip_val, clipped_stddev=clipped_stddev)
-                
-                def matvec(V):
-                    matvec_csr(data=data, indices=indices, indptr=indptr, V=V,
-                               clipped_stddev=clipped_stddev,
-                               num_cells_buffer=num_cells_buffer,
-                               num_genes_buffer=num_genes_buffer)
-                    return num_cells_buffer
-                
-                def rmatvec(V):
-                    rmatvec_csr(data=data, indices=indices, indptr=indptr, V=V,
-                                clipped_stddev=clipped_stddev,
-                                num_cells_buffer=num_cells_buffer,
-                                num_genes_buffer=num_genes_buffer)
-                    return num_genes_buffer
+        irlba = cython_inline(_uninitialized_vector_import + _thread_offset_import + r'''
+        cimport numpy as np
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libc.limits cimport UINT_MAX
+        from libc.math cimport M_PI
+        from libcpp.algorithm cimport fill
+        from libcpp.cmath cimport abs, sqrt, log, cos
+        from libcpp.vector cimport vector
+        from scipy.linalg.cython_blas cimport sgemm as sgemm_, sgemv as sgemv_
+        from scipy.linalg.cython_lapack cimport sgesdd
+        
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+        
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+        
+        cdef inline float random_uniform(unsigned long* state) noexcept nogil:
+            # Returns a random number in U(0, 1)
+            return <float> rand(state) / UINT_MAX
+        
+        cdef inline float random_normal(unsigned long* state) noexcept nogil:
+            # Samples a random number from the standard normal distribution
+            # using the Box-Muller transform
             
+            cdef double r, theta
+            
+            r = sqrt(-2 * log(random_uniform(state)))
+            theta = 2 * M_PI * random_uniform(state)
+            return r * cos(theta)
+        
+        cdef inline float norm(float[::1] array) noexcept nogil:
+            cdef unsigned i
+            cdef float norm = 0
+            for i in range(array.shape[0]):
+                norm += array[i] * array[i]
+            return sqrt(norm)
+        
+        cdef inline void sgemv(const char trans,
+                               const int m,
+                               const int n,
+                               const float alpha,
+                               const float* a,
+                               const int lda,
+                               const float* x,
+                               const int incx,
+                               const float beta,
+                               float* y,
+                               const int incy) noexcept nogil:
+            # Matrix multiplication wrapper that accepts scalars by value and
+            # provides const-correctness
+            
+            sgemv_(<char*> &trans, <int*> &m, <int*> &n, <float*> &alpha,
+                   <float*> a, <int*> &lda, <float*> x, <int*> &incx,
+                   <float*> &beta, y, <int*> &incy)
+        
+        cdef inline void sgemm(const char transa,
+                               const char transb,
+                               const int m,
+                               const int n,
+                               const int k,
+                               const float alpha,
+                               const float* a,
+                               const int lda,
+                               const float* b,
+                               const int ldb,
+                               const float beta,
+                               float* c,
+                               const int ldc) noexcept nogil:
+            # Matrix multiplication wrapper that accepts scalars by value and
+            # provides const-correctness
+            
+            sgemm_(<char*> &transa, <char*> &transb, <int*> &m, <int*> &n, <int*> &k,
+                   <float*> &alpha, <float*> a, <int*> &lda, <float*> b, <int*> &ldb,
+                   <float*> &beta, c, <int*> &ldc)
+            
+        cdef inline void clipped_stddev_csr(const float[::1] data,
+                                            const signed_integer[::1] indices,
+                                            const signed_integer[::1] indptr,
+                                            const unsigned long num_cells,
+                                            const unsigned num_genes,
+                                            float clip_val,
+                                            float[::1] clipped_stddev):
+            # Compute `X.std(axis=0)` where `X` is CSR, clipping to a minimum of
+            # `clip_val`. Only used when `num_threads=1` and `match_parallel=False`.
+            
+            cdef unsigned long num_elements, i, j, start, end, \
+                chunk_size
+            cdef unsigned gene, cell, thread_index
+            cdef float value, total_sum, total_sum_of_squares, \
+                inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
+            cdef vector[float] sum_buffer, sum_of_squares_buffer
+            sum_buffer.resize(num_genes)
+            sum_of_squares_buffer.resize(num_genes)
+            cdef float[::1] sum = <float[:num_genes]> sum_buffer.data(), \
+                sum_of_squares = <float[:num_genes]> sum_of_squares_buffer.data()
+            
+            # Iterate over all elements of the count matrix, ignoring which cell
+            # they're from
+            num_elements = indices.shape[0]
+            for i in range(num_elements):
+                gene = indices[i]
+                value = data[i]
+                sum[gene] += value
+                sum_of_squares[gene] += value * value
+            
+            # Calculate standard deviations from the sums and squared sums
+            for gene in range(num_genes):
+                clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
+                    num_cells * sum_of_squares[gene] - sum[gene] * sum[gene]))
+                if clipped_stddev[gene] < clip_val:
+                    clipped_stddev[gene] = clip_val
+        
+        cdef inline void clipped_stddev_csc(const float[::1] data,
+                                            const signed_integer[::1] indices,
+                                            const signed_integer[::1] indptr,
+                                            const unsigned long num_cells,
+                                            const unsigned num_genes,
+                                            float clip_val,
+                                            float[::1] clipped_stddev,
+                                            const unsigned num_threads,
+                                            const unsigned* thread_offsets) \
+                noexcept nogil:
+            # Compute `X.std(axis=0)` where `X` is CSC, clipping to a minimum of
+            # `clip_val`.
+            
+            cdef unsigned gene, thread_index, start_col, end_col
+            cdef unsigned long i
+            cdef float value, sum, sum_of_squares, \
+                inv_num_pairs_of_cells = 1.0 / (num_cells * (num_cells - 1))
+            
+            if num_threads == 1:
+                for gene in range(num_genes):
+                    # Calculate the sum and squared sum for this gene, across cells
+                    # with non-zero counts for the gene
+                    sum = 0
+                    sum_of_squares = 0
+                    for i in range(<unsigned long> indptr[gene],
+                                   <unsigned long> indptr[gene + 1]):
+                        value = data[i]
+                        sum += value
+                        sum_of_squares += value * value
+        
+                    # Calculate the scaled variance from the sum and squared sum
+                    clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
+                        num_cells * sum_of_squares - sum * sum))
+                    if clipped_stddev[gene] < clip_val:
+                        clipped_stddev[gene] = clip_val
             else:
-                clipped_stddev_csc(
-                    data=data, indices=indices, indptr=indptr,
-                    num_cells=num_cells, num_genes=num_genes,
-                    clip_val=clip_val, clipped_stddev=clipped_stddev,
-                    num_threads=num_threads)
+                with parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    start_col = thread_offsets[thread_index]
+                    end_col = thread_offsets[thread_index + 1]
+                    for gene in range(start_col, end_col):
+                        sum = 0
+                        sum_of_squares = 0
+                        for i in range(<unsigned long> indptr[gene],
+                                       <unsigned long> indptr[gene + 1]):
+                            value = data[i]
+                            sum = sum + value
+                            sum_of_squares = sum_of_squares + value * value
+                        clipped_stddev[gene] = sqrt(inv_num_pairs_of_cells * (
+                            num_cells * sum_of_squares - sum * sum))
+                        if clipped_stddev[gene] < clip_val:
+                            clipped_stddev[gene] = clip_val
+        
+        cdef void matvec_csr_fast(const float[::1] data,
+                                  const signed_integer[::1] indices,
+                                  const signed_integer[::1] indptr,
+                                  const float[::1] V,
+                                  const float[::1] clipped_stddev,
+                                  float* num_cells_buffer,
+                                  float* num_genes_buffer,
+                                  const unsigned num_cells,
+                                  const unsigned num_genes,
+                                  const unsigned num_threads,
+                                  const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Also has a parallel version,
+            # `matvec_csr_parallel()`. `num_threads` and `thread_offsets` are unused,
+            # but needed to match the signature of `matvec_csr_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float dot_product, mean = 0
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
                 
-                def matvec(V):
-                    matvec_csc(data=data, indices=indices, indptr=indptr, V=V,
-                               clipped_stddev=clipped_stddev,
-                               num_cells_buffer=num_cells_buffer,
-                               num_genes_buffer=num_genes_buffer)
-                    return num_cells_buffer
+            # Matrix-vector multiplication and mean calculation
+            for i in range(num_cells):
+                dot_product = 0
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    dot_product += data[j] * num_genes_buffer[indices[j]]
+                num_cells_buffer[i] = dot_product
+                mean += dot_product
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] -= mean
+        
+        cdef void matvec_csr(const float[::1] data,
+                             const signed_integer[::1] indices,
+                             const signed_integer[::1] indptr,
+                             const float[::1] V,
+                             const float[::1] clipped_stddev,
+                             float* num_cells_buffer,
+                             float* num_genes_buffer,
+                             const unsigned num_cells,
+                             const unsigned num_genes,
+                             const unsigned num_threads,
+                             const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Also has a parallel version,
+            # `matvec_csr_parallel()`. `num_threads` and `thread_offsets` are unused,
+            # but needed to match the signature of `matvec_csr_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float dot_product, mean = 0
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
                 
-                def rmatvec(V):
-                    rmatvec_csc(data=data, indices=indices, indptr=indptr, V=V,
-                                clipped_stddev=clipped_stddev,
-                                num_cells_buffer=num_cells_buffer,
-                                num_genes_buffer=num_genes_buffer)
-                    return num_genes_buffer
-        else:
-            if isinstance(X, csr_array):
-                X_csr = X
-                X_csc = X.tocsc()
+            # Matrix-vector multiplication
+            for i in range(num_cells):
+                dot_product = 0
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    dot_product += data[j] * num_genes_buffer[indices[j]]
+                num_cells_buffer[i] = dot_product
+            
+            # Mean calculation; unlike `matvec_csr_fast()`, this is a separate
+            # loop to maintain the parallel version's floating-point behavior.
+            for i in range(num_cells):
+                mean += num_cells_buffer[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] -= mean
+        
+        cdef void matvec_csr_parallel(const float[::1] data,
+                                      const signed_integer[::1] indices,
+                                      const signed_integer[::1] indptr,
+                                      const float[::1] V,
+                                      const float[::1] clipped_stddev,
+                                      float* num_cells_buffer,
+                                      float* num_genes_buffer,
+                                      const unsigned num_cells,
+                                      const unsigned num_genes,
+                                      const unsigned num_threads,
+                                      const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Also has a single-threaded
+            # version, `matvec_csr()`.
+            
+            cdef unsigned i, thread_index, start_row, end_row
+            cdef unsigned long j
+            cdef float dot_product, mean = 0
+            
+            # Variance scaling (single-threaded since `num_genes` is just 2000
+            # by default)
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
+            
+            # Matrix-vector multiplication
+            with parallel(num_threads=num_threads):
+                thread_index = threadid()
+                start_row = thread_offsets[thread_index]
+                end_row = thread_offsets[thread_index + 1]
+                for i in range(start_row, end_row):
+                    dot_product = 0
+                    for j in range(<unsigned long> indptr[i],
+                                   <unsigned long> indptr[i + 1]):
+                        dot_product = \
+                            dot_product + data[j] * num_genes_buffer[indices[j]]
+                    num_cells_buffer[i] = dot_product
+            
+            # Mean calculation (must be done single-threaded to be
+            # deterministic, due to floating-point error)
+            for i in range(num_cells):
+                mean += num_cells_buffer[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in prange(num_cells, num_threads=num_threads):
+                num_cells_buffer[i] -= mean
+        
+        cdef void matvec_csc(const float[::1] data,
+                             const signed_integer[::1] indices,
+                             const signed_integer[::1] indptr,
+                             const float[::1] V,
+                             const float[::1] clipped_stddev,
+                             float* num_cells_buffer,
+                             float* num_genes_buffer,
+                             const unsigned num_cells,
+                             const unsigned num_genes,
+                             const unsigned num_threads,
+                             const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X) @ V`, where `X` is CSC and `V`
+            # and `num_cells_buffer` are vectors. Does not have a parallel version.
+            # `num_threads` and `thread_offsets` are unused, but needed to match the
+            # signature of `matvec_csr_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float num_genes_buffer_i, mean = 0
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] = V[i] / clipped_stddev[i]
+            
+            # Matrix-vector multiplication
+            fill(num_cells_buffer, num_cells_buffer + num_cells, 0)
+            for i in range(num_genes):
+                num_genes_buffer_i = num_genes_buffer[i]
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    num_cells_buffer[indices[j]] += data[j] * num_genes_buffer_i
+                    
+            # Mean calculation
+            for i in range(num_cells):
+                mean += num_cells_buffer[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] -= mean
+        
+        cdef void rmatvec_csr(const float[::1] data,
+                              const signed_integer[::1] indices,
+                              const signed_integer[::1] indptr,
+                              const float[::1] V,
+                              const float[::1] clipped_stddev,
+                              float* num_cells_buffer,
+                              float* num_genes_buffer,
+                              const unsigned num_cells,
+                              const unsigned num_genes,
+                              const unsigned num_threads,
+                              const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSR and `V`
+            # and `num_cells_buffer` are vectors. Does not have a parallel version.
+            # `num_threads` and `thread_offsets` are unused, but needed to match the
+            # signature of `rmatvec_csc_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float num_cells_buffer_i, mean = 0
+            
+            # Mean scaling
+            for i in range(num_cells):
+                mean += V[i]
+            mean /= num_cells
+            for i in range(num_cells):
+                num_cells_buffer[i] = V[i] - mean
+            
+            # Matrix-vector multiplication
+            fill(num_genes_buffer, num_genes_buffer + num_genes, 0)
+            for i in range(num_cells):
+                num_cells_buffer_i = num_cells_buffer[i]
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    num_genes_buffer[indices[j]] += data[j] * num_cells_buffer_i
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] /= clipped_stddev[i]
+        
+        cdef void rmatvec_csc(const float[::1] data,
+                              const signed_integer[::1] indices,
+                              const signed_integer[::1] indptr,
+                              const float[::1] V,
+                              const float[::1] clipped_stddev,
+                              float* num_cells_buffer,
+                              float* num_genes_buffer,
+                              const unsigned num_cells,
+                              const unsigned num_genes,
+                              const unsigned num_threads,
+                              const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
+            # and `num_cells_buffer` are vectors. Also has a parallel version,
+            # `rmatvec_csc_parallel()`. `num_threads` and `thread_offsets` are unused,
+            # but needed to match the signature of `rmatvec_csc_parallel()`.
+            
+            cdef unsigned i
+            cdef unsigned long j
+            cdef float dot_product, mean = 0
+            
+            # Mean calculation
+            for i in range(num_cells):
+                mean += V[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in range(num_cells):
+                num_cells_buffer[i] = V[i] - mean
+            
+            # Matrix-vector multiplication
+            for i in range(num_genes):
+                dot_product = 0
+                for j in range(<unsigned long> indptr[i],
+                               <unsigned long> indptr[i + 1]):
+                    dot_product += data[j] * num_cells_buffer[indices[j]]
+                num_genes_buffer[i] = dot_product
+            
+            # Variance scaling
+            for i in range(num_genes):
+                num_genes_buffer[i] /= clipped_stddev[i]
+        
+        cdef void rmatvec_csc_parallel(const float[::1] data,
+                                       const signed_integer[::1] indices,
+                                       const signed_integer[::1] indptr,
+                                       const float[::1] V,
+                                       const float[::1] clipped_stddev,
+                                       float* num_cells_buffer,
+                                       float* num_genes_buffer,
+                                       const unsigned num_cells,
+                                       const unsigned num_genes,
+                                       const unsigned num_threads,
+                                       const unsigned* thread_offsets) noexcept nogil:
+            # Compute `num_cells_buffer = scale(X).T @ V`, where `X` is CSC and `V`
+            # and `num_cells_buffer` are vectors. Also has a single-threaded
+            # version, `rmatvec_csc()`.
+            
+            cdef unsigned i, thread_index, start_col, end_col
+            cdef unsigned long j
+            cdef float dot_product, mean = 0
+            
+            # Mean calculation (must be done single-threaded to be
+            # deterministic, due to floating-point error)
+            for i in range(num_cells):
+                mean += V[i]
+            mean /= num_cells
+            
+            # Mean scaling
+            for i in prange(num_cells, num_threads=num_threads):
+                num_cells_buffer[i] = V[i] - mean
+            
+            # Matrix-vector multiplication
+            with parallel(num_threads=num_threads):
+                thread_index = threadid()
+                start_col = thread_offsets[thread_index]
+                end_col = thread_offsets[thread_index + 1]
+                for i in range(start_col, end_col):
+                    dot_product = 0
+                    for j in range(<unsigned long> indptr[i],
+                                   <unsigned long> indptr[i + 1]):
+                        dot_product = \
+                            dot_product + data[j] * num_cells_buffer[indices[j]]
+                    num_genes_buffer[i] = dot_product
+            
+            # Variance scaling (single-threaded since `num_genes` is just 2000
+            # by default)
+            for i in range(num_genes):
+                num_genes_buffer[i] /= clipped_stddev[i]
+
+        cdef inline int svd_workspace_size(float[::1, :] B,
+                                           float[::1, :] U,
+                                           float[::1] S,
+                                           float[::1, :] Vt,
+                                           int* iwork) noexcept nogil:
+            # Get the optimal workspace size for SVD with `sgesdd()`. Assumes `m < n`,
+            # which it is for `B`.
+            
+            cdef char jobz = b'S'
+            cdef int info, m = B.shape[0], n = B.shape[1], lwork = -1
+            cdef float workspace_size
+            
+            sgesdd(&jobz, &m, &n, &B[0, 0], &m, &S[0], &U[0, 0], &m, &Vt[0, 0], &m,
+                   &workspace_size, &lwork, iwork, &info)
+            return <int> workspace_size
+
+        cdef inline void svd(float[::1, :] B,
+                             float[::1, :] U,
+                             float[::1] S,
+                             float[::1, :] Vt,
+                             float* work,
+                             int* iwork,
+                             const int lwork) noexcept nogil:
+            # SVD for the case where `m < n`, which it is for `B`. Uses the optimal
+            # workspace size computed by `svd_workspace_size()`.
+            
+            cdef char jobz = b'S'
+            cdef int info, m = B.shape[0], n = B.shape[1]
+            
+            sgesdd(&jobz, &m, &n, &B[0, 0], &m, &S[0], &U[0, 0], &m, &Vt[0, 0], &m,
+                   work, <int*> &lwork, iwork, &info)
+        
+        ctypedef void (*matvec_function)(const float[::1] data,
+                                         const signed_integer[::1] indices,
+                                         const signed_integer[::1] indptr,
+                                         const float[::1] V,
+                                         const float[::1] clipped_stddev,
+                                         float* num_cells_buffer,
+                                         float* num_genes_buffer,
+                                         const unsigned num_cells,
+                                         const unsigned num_genes,
+                                         const unsigned num_threads,
+                                         const unsigned* thread_offsets) noexcept nogil
+        
+        def irlba(const float[::1] data_matvec,
+                  const signed_integer[::1] indices_matvec,
+                  const signed_integer[::1] indptr_matvec,
+                  const float[::1] data_rmatvec,
+                  const signed_integer[::1] indices_rmatvec,
+                  const signed_integer[::1] indptr_rmatvec,
+                  const unsigned num_cells,
+                  const unsigned num_genes,
+                  const unsigned k,
+                  const unsigned subspace_size,
+                  const float tolerance,
+                  const unsigned max_iterations,
+                  const unsigned long seed,
+                  const bint match_parallel,
+                  const bint is_csr,
+                  const unsigned num_threads):
+            
+            cdef unsigned iteration, i, j, row, col, num_converged, k_current = 0
+            cdef unsigned long state = srand(seed)
+            cdef float inverse_norm, dot_product, alpha, inverse_alpha, beta, \
+                inverse_beta, remainder_norm, residual, Sbj, clip_val = 1e-8, \
+                Smax = 2.4221817809573368e-05  # (float32 eps) ** (2 / 3)
+            cdef int lwork
+            cdef bint converged = False
+            cdef uninitialized_vector[float] clipped_stddev_buffer, U_buffer, \
+                U_new_buffer, V_buffer, V_new_buffer, B_buffer, Ub_buffer, Sb_buffer, \
+                Vbt_buffer, remainder_buffer, work
+            cdef uninitialized_vector[int] iwork
+            cdef uninitialized_vector[unsigned] matvec_thread_offsets_buffer, \
+                rmatvec_thread_offsets_buffer
+            cdef float[::1, :] U, U_new, V, V_new, B, Ub, Vbt, temp
+            cdef float[::1] clipped_stddev, work2, Sb
+            cdef unsigned* matvec_thread_offsets
+            cdef unsigned* rmatvec_thread_offsets
+            cdef matvec_function matvec, rmatvec
+            cdef np.ndarray[np.float32_t, ndim=2] PCs
+            cdef np.npy_intp dims[2]
+            dims[0] = num_cells
+            dims[1] = k
+            
+            # Allocate workspace arrays:
+            
+            # The clipped standard deviation of each gene
+            clipped_stddev_buffer.resize(num_genes)
+            clipped_stddev = <float[:num_genes]> clipped_stddev_buffer.data()
+            
+            # `U` and `U_new`: left singular vectors
+            U_buffer.resize(num_cells * subspace_size)
+            U = <float[:num_cells:1, :subspace_size]> U_buffer.data()
+            U_new_buffer.resize(num_cells * subspace_size)
+            U_new = <float[:num_cells:1, :subspace_size]> U_new_buffer.data()
+            
+            # `V` and `V_new`: right singular vectors
+            V_buffer.resize(num_genes * subspace_size)
+            V = <float[:num_genes:1, :subspace_size]> V_buffer.data()
+            V_new_buffer.resize(num_genes * subspace_size)
+            V_new = <float[:num_genes:1, :subspace_size]> V_new_buffer.data()
+            
+            # The bidiagonal matrix (`B`) and its left singular vectors (`Ub`),
+            # singular values (`Sb`), and transposed right singular vectors (`Vbt`)
+            B_buffer.resize(subspace_size * (subspace_size + 1))
+            B = <float[:subspace_size:1, :subspace_size + 1]> B_buffer.data()
+            Ub_buffer.resize(subspace_size * subspace_size)
+            Ub = <float[:subspace_size:1, :subspace_size]> Ub_buffer.data()
+            Sb_buffer.resize(subspace_size)
+            Sb = <float[:subspace_size]> Sb_buffer.data()
+            Vbt_buffer.resize(subspace_size * (subspace_size + 1))
+            Vbt = <float[:subspace_size:1, :subspace_size + 1]> Vbt_buffer.data()
+            
+            # The remainder from the Lanczos bidiagonalization (`remainder`)
+            remainder_buffer.resize(num_genes)
+            cdef float[::1] remainder = <float[:num_genes]> remainder_buffer.data()
+            
+            # The temporary buffers used by `sgesdd()` to perform SVD of `B`
+            # (`iwork` and `work`). The optimal size of the latter is
+            # determined programmatically via `svd_workspace_size()`.
+            iwork.resize(8 * subspace_size)
+            lwork = svd_workspace_size(B, Ub, Sb, Vbt, iwork.data())
+            work.resize(lwork)
+            
+            # The row offset of the start of each thread when performing the
+            # matvec and rmatvec. This allows for load-balancing: each thread
+            # handles about the same number of elements, even if different
+            # cells express different numbers of highly variable genes.
+            if num_threads > 1:
+                matvec_thread_offsets_buffer.resize(num_threads + 1)
+                rmatvec_thread_offsets_buffer.resize(num_threads + 1)
+                matvec_thread_offsets = matvec_thread_offsets_buffer.data()
+                rmatvec_thread_offsets = rmatvec_thread_offsets_buffer.data()
+                get_thread_offsets(indptr_matvec, matvec_thread_offsets, num_threads)
+                get_thread_offsets(indptr_rmatvec, rmatvec_thread_offsets, num_threads)
             else:
-                X_csr = X.tocsr()
-                X_csc = X
-            csr_data = X_csr.data
-            csr_indices = X_csr.indices
-            csr_indptr = X_csr.indptr
-            csc_data = X_csc.data
-            csc_indices = X_csc.indices
-            csc_indptr = X_csc.indptr
-            clipped_stddev_csc(
-                data=csc_data, indices=csc_indices, indptr=csc_indptr,
-                num_cells=num_cells, num_genes=num_genes, clip_val=clip_val,
-                clipped_stddev=clipped_stddev, num_threads=num_threads)
+                matvec_thread_offsets = NULL
+                rmatvec_thread_offsets = NULL
             
-            def matvec(V):
-                matvec_csr_parallel(data=csr_data, indices=csr_indices,
-                                    indptr=csr_indptr, V=V,
-                                    clipped_stddev=clipped_stddev,
-                                    num_cells_buffer=num_cells_buffer,
-                                    num_genes_buffer=num_genes_buffer,
-                                    num_threads=num_threads)
-                return num_cells_buffer
-            
-            def rmatvec(V):
-                rmatvec_csc_parallel(data=csc_data, indices=csc_indices,
-                                     indptr=csc_indptr, V=V,
-                                     clipped_stddev=clipped_stddev,
-                                     num_cells_buffer=num_cells_buffer,
-                                     num_genes_buffer=num_genes_buffer,
-                                     num_threads=num_threads)
-                return num_genes_buffer
-        # noinspection PyArgumentList
-        op = LinearOperator(matvec=matvec, rmatvec=rmatvec, dtype=X.dtype,
-                            shape=(X.shape[0], X.shape[1]))
-        with Timer('irlba'):
-            # Allocate workspace arrays: left vectors (`U`), right vectors + one
-            # column of scratch space (`V`), bidiagonal matrix (`B`)
-            U = np.empty((num_cells, subspace_size), dtype=np.float32, order='F')
-            V = np.empty((num_genes, subspace_size + 1), dtype=np.float32,
-                         order='F')
-            B = np.zeros((subspace_size, subspace_size + 1), dtype=np.float32,
-                         order='F')
-            
-            # Allocate space for the PCs
-            PCs = np.empty((num_cells, num_PCs), dtype=np.float32)
+            # Decide which function to use for matvec and rmatvec. Get the
+            # clipped standard deviation of each gene, for variance scaling;
+            # use CSC for this if available, for speed.
+            if match_parallel:
+                matvec = matvec_csr
+                rmatvec = rmatvec_csc
+            elif num_threads == 1:
+                if is_csr:
+                    matvec = matvec_csr_fast
+                    rmatvec = rmatvec_csr
+                else:
+                    matvec = matvec_csc
+                    rmatvec = rmatvec_csc
+            else:
+                matvec = matvec_csr_parallel
+                rmatvec = rmatvec_csc_parallel
+
+            if num_threads == 1 and is_csr and not match_parallel:
+                clipped_stddev_csr(data_matvec, indices_matvec, indptr_matvec,
+                                   num_cells, num_genes, clip_val, clipped_stddev)
+            else:
+                clipped_stddev_csc(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                   num_cells, num_genes, clip_val, clipped_stddev,
+                                   num_threads, rmatvec_thread_offsets)
             
             # Initialize the first column of `V` with a random normal vector
-            V[:, 0] = np.random.default_rng(seed).standard_normal(num_genes,
-                                                                  dtype=np.float32)
-            V[:, 0] /= np.linalg.norm(V[:, 0])
+            for i in range(num_genes):
+                V[i, 0] = random_normal(&state)
+            inverse_norm = 1 / norm(V[:, 0])
+            for i in range(num_genes):
+                V[i, 0] *= inverse_norm
             
-            # Run PCA with irlba
-            original_num_threads = X._num_threads
-            X._num_threads = num_threads
-            try:
-                with threadpool_limits(num_threads):
-                    irlba = cython_inline(r'''
-                import numpy as np
-                cimport numpy as np
-                
-                def irlba(operator,
-                          # float[::1, :] U,
-                          # float[::1, :] V,
-                          # float[::1, :] B,
-                          # float[:, ::1] PCs,
-                          np.ndarray[np.float32_t, ndim=2, mode='fortran'] U,
-                          np.ndarray[np.float32_t, ndim=2, mode='fortran'] V,
-                          np.ndarray[np.float32_t, ndim=2, mode='fortran'] B,
-                          np.ndarray[np.float32_t, ndim=2] PCs,
-                          const float tolerance,
-                          const unsigned max_iterations):
+            # Initialize `B` with zeros
+            B[:] = 0
+            
+            # Now that setup is done, run the IRLBA iterations
+            if num_threads == 1:
+                for iteration in range(max_iterations):
+                    # Perform Lanczos bidiagonalization with reorthogonalization;
+                    # use for loops instead of `sgemv()` for matrix-vector
+                    # multiplication to ensure deterministic parallelism
+                    j = k_current
+                    while True:
+                        # `U[:, j] = X_scaled @ V[:, j]`; use `remainder` as a
+                        # temporary buffer (it happens to have the correct type, float,
+                        # and length, `num_genes`)
+                        matvec(data_matvec, indices_matvec, indptr_matvec, V[:, j],
+                               clipped_stddev, &U[0, j], &remainder[0], num_cells,
+                               num_genes, num_threads, matvec_thread_offsets)
+                        
+                        if j > 0:
+                            # U[:, j] -= U[:, :j] @ (U[:, :j].T @ U[:, j])
+                            # Use `work` to store the intermediate product
+                            # `U[:, :j].T @ U[:, j]`, which has length `j`. This is
+                            # guaranteed to fit since `sgesdd()` guarantees that `work` has
+                            # at least `4 * subspace_size ** 2 + 7 * subspace_size`
+                            # elements, and we only need `j`, which is less than
+                            # `subspace_size`.
+                            
+                            # `work = U[:, :j].T @ U[:, j]`
+                            # sgemv(b'T', num_cells, j, 1, &U[0, 0], num_cells, &U[0, j], 1, 0,
+                            #       work.data(), 1)
+                            for col in range(j):
+                                dot_product = 0
+                                for row in range(num_cells):
+                                    dot_product = dot_product + U[row, col] * U[row, j]
+                                work[col] = dot_product
+                            
+                            # `U[:, j] -= U[:, :j] @ work`
+                            # sgemv(b'N', num_cells, j, -1, &U[0, 0], num_cells,
+                            #       work.data(), 1, 1, &U[0, j], 1)
+                            for row in range(num_cells):
+                                dot_product = 0
+                                for col in range(j):
+                                    dot_product = dot_product + U[row, col] * work[col]
+                                U[row, j] -= dot_product
+                            
+                        alpha = norm(U[:, j])
+                        inverse_alpha = 1 / alpha
+                        for i in range(num_cells):
+                            U[i, j] *= inverse_alpha
+                        B[j, j] = alpha
+            
+                        if j < subspace_size - 1:
+                            # `V[:, j + 1] = X_scaled.T @ U[:, j]`; use `U_new` as a
+                            # temporary buffer (it happens to have the correct type, float,
+                            # and length, at least `num_cells`)
+                            rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                    U[:, j], clipped_stddev, &U_new[0, 0], &V[0, j + 1],
+                                    num_cells, num_genes, num_threads, rmatvec_thread_offsets)
+                            
+                            # `V[:, j + 1] -= alpha * V[:, j]`
+                            for i in range(num_genes):
+                                V[i, j + 1] -= alpha * V[i, j]
+                            
+                            # `V[:, j + 1] -= V[:, :j + 1] @ (V[:, :j + 1].T @ V[:, j + 1])`;
+                            # use `work` to store the intermediate product, which has length
+                            # `j + 1` and is guaranteed to fit: as mentioned above, `work` has
+                            # at least `4 * subspace_size ** 2 + 7 * subspace_size` elements
+                            
+                            # `work = V[:, :j + 1].T @ V[:, j + 1]`
+                            # sgemv(b'T', num_genes, j + 1, 1, &V[0, 0], num_genes,
+                            #       &V[0, j + 1], 1, 0, work.data(), 1)
+                            for col in range(j + 1):
+                                dot_product = 0
+                                for row in range(num_genes):
+                                    dot_product = dot_product + V[row, col] * V[row, j + 1]
+                                work[col] = dot_product
+                            
+                            # `V[:, j + 1] -= V[:, :j + 1] @ work`
+                            # sgemv(b'N', num_genes, j + 1, -1, &V[0, 0], num_genes,
+                            #       work.data(), 1, 1, &V[0, j + 1], 1)
+                            for row in range(num_genes):
+                                dot_product = 0
+                                for col in range(j + 1):
+                                    dot_product = dot_product + V[row, col] * work[col]
+                                V[row, j + 1] -= dot_product
+                        else:
+                            # `j == subspace_size - 1` so `V[:, j + 1]` would overwrite
+                            # the end of the array. Do the same computation, but store the
+                            # results in the `remainder` vector instead of `V[:, j + 1]`.
+                            # `remainder = X_scaled.T @ U[:, j]`
+                            rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                    U[:, j], clipped_stddev, &U_new[0, 0], &remainder[0],
+                                    num_cells, num_genes, num_threads, rmatvec_thread_offsets)
+                            
+                            # `remainder -= alpha * V[:, j]`
+                            for i in range(num_genes):
+                                remainder[i] -= alpha * V[i, j]
+                            
+                            # `work = V.T @ remainder`
+                            # sgemv(b'T', num_genes, subspace_size, 1, &V[0, 0], num_genes,
+                            #       &remainder[0], 1, 0, &work[0], 1)
+                            for col in range(subspace_size):
+                                dot_product = 0
+                                for row in range(num_genes):
+                                    dot_product = dot_product + V[row, col] * remainder[row]
+                                work[col] = dot_product
+                            
+                            # `remainder -= V @ work`
+                            # sgemv(b'N', num_genes, subspace_size, -1, &V[0, 0], num_genes,
+                            #       &work[0], 1, 1, &remainder[0], 1)
+                            for row in range(num_genes):
+                                dot_product = 0
+                                for col in range(subspace_size):
+                                    dot_product = dot_product + V[row, col] * work[col]
+                                remainder[row] -= dot_product
+                            
+                            break
+                            
+                        beta = norm(V[:, j + 1])
+                        inverse_beta = 1 / beta
+                        for i in range(num_genes):
+                            V[i, j + 1] *= inverse_beta
+                        B[j, j + 1] = beta
+                        j += 1
+                        if j % 10 == 9:
+                            PyErr_CheckSignals()
+                        
+                    # Compute the SVD of the bidiagonal matrix `B`, equivalent to
+                    # `Ub, Sb, Vbt = np.linalg.svd(B, full_matrices=False)`
+                    svd(B, Ub, Sb, Vbt, work.data(), iwork.data(), lwork)
                     
-                    cdef unsigned iteration, i, j, num_converged, \
-                        num_cells = U.shape[0], num_genes = V.shape[0], \
-                        subspace_size = U.shape[1], k = PCs.shape[1], k_current = 0
-                    cdef float alpha, beta, remainder_norm, \
-                         Smax = 2.4221817809573368e-05  # (float32 eps) ** (2 / 3)
-                    cdef bint converged = False
-                    cdef np.ndarray[np.float32_t, ndim=1] Sb, residuals, S  # TODO
-                    cdef np.ndarray[np.float32_t, ndim=2] Ub, VbT  # TODO
+                    # Normalize the `remainder` vector
+                    remainder_norm = norm(remainder)
+                    for i in range(num_genes):
+                        remainder[i] /= remainder_norm
                     
+                    # Update `Smax`, the largest singular value of `B` we've seen so far
+                    Smax = max(Sb[0], Smax)
+                    
+                    # Check convergence of singular values via residuals
+                    num_converged = 0
+                    for i in range(k):
+                        residual = remainder_norm * Ub[subspace_size - 1, i]
+                        num_converged += abs(residual) < tolerance * Smax
+                    if num_converged == k:
+                        converged = True
+                        break
+                    
+                    # For the next iteration, increase `k_current` to `k` + the number of
+                    # converged singular values, ensuring it stays under the subspace size
+                    k_current = min(max(k_current, k + num_converged), subspace_size - 1)
+                    
+                    # Restart with new subspace: update `U`, `V` and `B`. The `U` and `V`
+                    # updates are in-place, but `sgemm()` doesn't support in-place matrix
+                    # multiplication, so use `U_new` and `V_new` as the output arrays and
+                    # then swap the pointers so that `U` and `V` point to the output.
+                    
+                    # U[:, :k_current] = U @ Ub[:, :k_current]
+                    sgemm(b'N', b'N', num_cells, k_current, subspace_size, 1, &U[0, 0],
+                          num_cells, &Ub[0, 0], subspace_size, 0, &U_new[0, 0], num_cells)
+                    temp = U
+                    U = U_new
+                    U_new = temp
+                    
+                    # V[:, :k_current] = V @ Vbt.T[:subspace_size, :k_current]
+                    sgemm(b'N', b'T', num_genes, k_current, subspace_size, 1, &V[0, 0],
+                          num_genes, &Vbt[0, 0], subspace_size, 0, &V_new[0, 0], num_genes)
+                    temp = V
+                    V = V_new
+                    V_new = temp
+                    
+                    for i in range(num_genes):
+                        V[i, k_current] = remainder[i]
+                    B[:] = 0
+                    for i in range(k_current):
+                        B[i, i] = Sb[i]
+                        residual = remainder_norm * Ub[subspace_size - 1, i]
+                        B[i, k_current] = residual
+            else:
+                # Same as the single-threaded version, except for `nogil` and `prange()`
+                with nogil:
                     for iteration in range(max_iterations):
                         # Perform Lanczos bidiagonalization with reorthogonalization
                         j = k_current
                         while True:
-                            U[:, j] = operator.matvec(V[:, j])  # TODO
-                            if j > 0:
-                                U[:, j] -= U[:, :j] @ (U[:, :j].T @ U[:, j])  # TODO
-                            alpha = np.linalg.norm(U[:, j])  # TODO
+                            # `U[:, j] = X_scaled @ V[:, j]`; use `remainder` as a
+                            # temporary buffer (it happens to have the correct type, float,
+                            # and length, `num_genes`)
+                            matvec(data_matvec, indices_matvec, indptr_matvec, V[:, j],
+                                   clipped_stddev, &U[0, j], &remainder[0], num_cells,
+                                   num_genes, num_threads, matvec_thread_offsets)
                             
-                            for i in range(num_cells):
-                                U[i, j] /= alpha
+                            if j > 0:
+                                # U[:, j] -= U[:, :j] @ (U[:, :j].T @ U[:, j])
+                                # Use `work` to store the intermediate product
+                                # `U[:, :j].T @ U[:, j]`, which has length `j`. This is
+                                # guaranteed to fit since `sgesdd()` guarantees that `work` has
+                                # at least `4 * subspace_size ** 2 + 7 * subspace_size`
+                                # elements, and we only need `j`, which is less than
+                                # `subspace_size`.
+                                
+                                # `work = U[:, :j].T @ U[:, j]`
+                                # sgemv(b'T', num_cells, j, 1, &U[0, 0], num_cells, &U[0, j], 1, 0,
+                                #       work.data(), 1)
+                                for col in prange(j, num_threads=num_threads):
+                                    dot_product = 0
+                                    for row in range(num_cells):
+                                        dot_product = dot_product + U[row, col] * U[row, j]
+                                    work[col] = dot_product
+                                
+                                # `U[:, j] -= U[:, :j] @ work`
+                                # sgemv(b'N', num_cells, j, -1, &U[0, 0], num_cells,
+                                #       work.data(), 1, 1, &U[0, j], 1)
+                                for row in prange(num_cells, num_threads=num_threads):
+                                    dot_product = 0
+                                    for col in range(j):
+                                        dot_product = dot_product + U[row, col] * work[col]
+                                    U[row, j] -= dot_product
+                                
+                            alpha = norm(U[:, j])
+                            inverse_alpha = 1 / alpha
+                            for i in prange(num_cells, num_threads=num_threads):
+                                U[i, j] *= inverse_alpha
                             B[j, j] = alpha
                 
-                            V[:, j + 1] = operator.rmatvec(U[:, j])  # TODO
-                            for i in range(num_genes):
-                                V[i, j + 1] -= alpha * V[i, j]
-                            V[:, j + 1] -= V[:, :j + 1] @ (V[:, :j + 1].T @ V[:, j + 1])  # TODO
-                            if j == subspace_size - 1:
+                            if j < subspace_size - 1:
+                                # `V[:, j + 1] = X_scaled.T @ U[:, j]`; use `U_new` as a
+                                # temporary buffer (it happens to have the correct type, float,
+                                # and length, at least `num_cells`)
+                                rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                        U[:, j], clipped_stddev, &U_new[0, 0], &V[0, j + 1],
+                                        num_cells, num_genes, num_threads, rmatvec_thread_offsets)
+                                
+                                # `V[:, j + 1] -= alpha * V[:, j]`
+                                for i in prange(num_genes, num_threads=num_threads):
+                                    V[i, j + 1] -= alpha * V[i, j]
+                                
+                                # `V[:, j + 1] -= V[:, :j + 1] @ (V[:, :j + 1].T @ V[:, j + 1])`;
+                                # use `work` to store the intermediate product, which has length
+                                # `j + 1` and is guaranteed to fit: as mentioned above, `work` has
+                                # at least `4 * subspace_size ** 2 + 7 * subspace_size` elements
+                                
+                                # `work = V[:, :j + 1].T @ V[:, j + 1]`
+                                # sgemv(b'T', num_genes, j + 1, 1, &V[0, 0], num_genes,
+                                #       &V[0, j + 1], 1, 0, work.data(), 1)
+                                for col in prange(j + 1, num_threads=num_threads):
+                                    dot_product = 0
+                                    for row in range(num_genes):
+                                        dot_product = dot_product + V[row, col] * V[row, j + 1]
+                                    work[col] = dot_product
+                                
+                                # `V[:, j + 1] -= V[:, :j + 1] @ work`
+                                # sgemv(b'N', num_genes, j + 1, -1, &V[0, 0], num_genes,
+                                #       work.data(), 1, 1, &V[0, j + 1], 1)
+                                for row in prange(num_genes, num_threads=num_threads):
+                                    dot_product = 0
+                                    for col in range(j + 1):
+                                        dot_product = dot_product + V[row, col] * work[col]
+                                    V[row, j + 1] -= dot_product
+                            else:
+                                # `j == subspace_size - 1` so `V[:, j + 1]` would overwrite
+                                # the end of the array. Do the same computation, but store the
+                                # results in the `remainder` vector instead of `V[:, j + 1]`.
+                                # `remainder = X_scaled.T @ U[:, j]`
+                                rmatvec(data_rmatvec, indices_rmatvec, indptr_rmatvec,
+                                        U[:, j], clipped_stddev, &U_new[0, 0], &remainder[0],
+                                        num_cells, num_genes, num_threads, rmatvec_thread_offsets)
+                                
+                                # `remainder -= alpha * V[:, j]`
+                                for i in prange(num_genes, num_threads=num_threads):
+                                    remainder[i] -= alpha * V[i, j]
+                                
+                                # `work = V.T @ remainder`
+                                # sgemv(b'T', num_genes, subspace_size, 1, &V[0, 0], num_genes,
+                                #       &remainder[0], 1, 0, &work[0], 1)
+                                for col in prange(subspace_size, num_threads=num_threads):
+                                    dot_product = 0
+                                    for row in range(num_genes):
+                                        dot_product = dot_product + V[row, col] * remainder[row]
+                                    work[col] = dot_product
+                                
+                                # `remainder -= V @ work`
+                                # sgemv(b'N', num_genes, subspace_size, -1, &V[0, 0], num_genes,
+                                #       &work[0], 1, 1, &remainder[0], 1)
+                                for row in prange(num_genes, num_threads=num_threads):
+                                    dot_product = 0
+                                    for col in range(subspace_size):
+                                        dot_product = dot_product + V[row, col] * work[col]
+                                    remainder[row] -= dot_product
+                                
                                 break
-                            beta = np.linalg.norm(V[:, j + 1])  # TODO
-                            B[j, j + 1] = beta
+                                
+                            beta = norm(V[:, j + 1])
+                            inverse_beta = 1 / beta
                             for i in range(num_genes):
-                                V[i, j + 1] /= beta
+                                V[i, j + 1] *= inverse_beta
+                            B[j, j + 1] = beta
                             j += 1
+                            if j % 10 == 9:
+                                with gil:
+                                    PyErr_CheckSignals()
+                            
+                        # Compute the SVD of the bidiagonal matrix `B`, equivalent to
+                        # `Ub, Sb, Vbt = np.linalg.svd(B, full_matrices=False)`
+                        svd(B, Ub, Sb, Vbt, work.data(), iwork.data(), lwork)
                         
-                        # Compute the SVD of the bidiagonal matrix `B`
-                        Ub, Sb, VbT = np.linalg.svd(B, full_matrices=False)  # TODO use sgesdd
+                        # Normalize the `remainder` vector
+                        remainder_norm = norm(remainder)
+                        for i in range(num_genes):
+                            remainder[i] /= remainder_norm
                         
-                        # Normalize the remainder vector; get the residuals
-                        remainder_norm = np.linalg.norm(V[:, subspace_size])  # TODO
-                        V[:, subspace_size] /= remainder_norm  # TODO
-                        residuals = remainder_norm * Ub[subspace_size - 1, :]  # TODO
-                        
-                        # Update `Smax`; check convergence of singular values via residuals
+                        # Update `Smax`, the largest singular value of `B` we've seen so far
                         Smax = max(Sb[0], Smax)
-                        num_converged = (np.abs(residuals[:k]) < tolerance * Smax).sum()  # TODO
+                        
+                        # Check convergence of singular values via residuals
+                        num_converged = 0
+                        for i in range(k):
+                            residual = remainder_norm * Ub[subspace_size - 1, i]
+                            num_converged += abs(residual) < tolerance * Smax
                         if num_converged == k:
                             converged = True
                             break
@@ -19523,26 +22000,127 @@ class SingleCell:
                         # converged singular values, ensuring it stays under the subspace size
                         k_current = min(max(k_current, k + num_converged), subspace_size - 1)
                         
-                        # Restart with new subspace
-                        U[:, :k_current] = U[:, :subspace_size] @ Ub[:, :k_current]  # TODO
-                        V[:, :k_current] = V[:, :subspace_size] @ VbT.T[:subspace_size, :k_current]  # TODO
+                        # Restart with new subspace: update `U`, `V` and `B`. The `U` and `V`
+                        # updates are in-place, but `sgemm()` doesn't support in-place matrix
+                        # multiplication, so use `U_new` and `V_new` as the output arrays and
+                        # then swap the pointers so that `U` and `V` point to the output.
+                        
+                        # U[:, :k_current] = U @ Ub[:, :k_current]
+                        sgemm(b'N', b'N', num_cells, k_current, subspace_size, 1, &U[0, 0],
+                              num_cells, &Ub[0, 0], subspace_size, 0, &U_new[0, 0], num_cells)
+                        temp = U
+                        U = U_new
+                        U_new = temp
+                        
+                        # V[:, :k_current] = V @ Vbt.T[:subspace_size, :k_current]
+                        sgemm(b'N', b'T', num_genes, k_current, subspace_size, 1, &V[0, 0],
+                              num_genes, &Vbt[0, 0], subspace_size, 0, &V_new[0, 0], num_genes)
+                        temp = V
+                        V = V_new
+                        V_new = temp
+                        
                         for i in range(num_genes):
-                            V[i, k_current] = V[i, subspace_size]
+                            V[i, k_current] = remainder[i]
                         B[:] = 0
-                        B[:k_current, :k_current] = np.diag(Sb[:k_current])  # TODO
-                        B[:k_current, k_current] = residuals[:k_current]  # TODO
-                    
-                    # Construct final PCs from the top `k` components of `U` and `S`
-                    PCs[:] = (U[:, :subspace_size] @ Ub[:, :k]) * Sb[:k]  # TODO
-                    
-                    # Return whether IRLBA converged
-                    return converged
-                    ''')['irlba']
-                    converged = irlba(op, U=U, V=V, B=B, PCs=PCs,
-                                      tolerance=tolerance,
-                                      max_iterations=max_iterations)
-            finally:
-                X._num_threads = original_num_threads
+                        for i in range(k_current):
+                            B[i, i] = Sb[i]
+                            residual = remainder_norm * Ub[subspace_size - 1, i]
+                            B[i, k_current] = residual
+                
+            # Free all no-longer-needed memory, then allocate the final NumPy array
+            # for the PCs
+            if &U_new[0, 0] == U_buffer.data():
+                U_new_buffer.clear()
+            else:
+                U_buffer.clear()
+            V_buffer.clear()
+            V_new_buffer.clear()
+            B_buffer.clear()
+            Vbt_buffer.clear()
+            remainder_buffer.clear()
+            work.clear()
+            np.import_array()
+            # PCs = np.empty((num_cells, k), dtype=np.float32)
+            PCs = np.PyArray_EMPTY(2, dims, np.NPY_FLOAT32, 0)
+        
+            # Construct final PCs from the top `k` components of `U` and `S`:
+            # U[:, :k] = U[:, :subspace_size] @ Ub[:, :k]
+            # PCs[:] = U[:, :k] * Sb[:k]
+            # As an optimization, due to linearity we can switch the order of
+            # operations to:
+            # Ub[:, :k] *= Sb[:k]
+            for j in range(k):
+                Sbj = Sb[j]
+                for i in range(subspace_size):
+                    Ub[i, j] *= Sbj
+            # followed by:
+            # PCs[:] = U[:, :subspace_size] @ Ub[:, :k]
+            # However, since `PCs` is C-contiguous whereas `U` and `Ub` are
+            # Fortran-contiguous, we actually compute:
+            # PCs.T[:] = Ub[:, :k].T @ U[:, :subspace_size].T
+            # and then reinterpret PCs as C-contiguous
+            sgemm(b'T', b'T', k, num_cells, subspace_size, 1, &Ub[0, 0],
+                  subspace_size, &U[0, 0], num_cells, 0, &PCs[0, 0], k)
+            
+            # Return the PCs, and whether IRLBA converged
+            return PCs, converged
+            ''', warn_undeclared=False)['irlba']
+        
+        # Get the data, indices and indptr to be used for the matvec and for
+        # the rmatvec. When `match_parallel=True`, this requires calculating
+        # the "opposite" version of the array (CSC if `X` is CSR, CSR if CSC)
+        is_csr = isinstance(X, csr_array)
+        if is_csr:
+            # `X` is CSR, so always use CSR for the matvec. If `num_threads=1`
+            # and `match_parallel=False`, use CSR for the rmatvec as well,
+            # otherwise use CSC for the rmatvec to enable paralellism.
+            data_matvec = X.data
+            indices_matvec = X.indices
+            indptr_matvec = X.indptr
+            if num_threads == 1 and not match_parallel:
+                data_rmatvec = data_matvec
+                indices_rmatvec = indices_matvec
+                indptr_rmatvec = indptr_matvec
+            else:
+                X_csc = X.tocsc()
+                data_rmatvec = X_csc.data
+                indices_rmatvec = X_csc.indices
+                indptr_rmatvec = X_csc.indptr
+        else:
+            # `X` is CSC, so always use CSC for the rmatvec. If `num_threads=1`
+            # and `match_parallel=False`, use CSC for the matvec as well,
+            # otherwise use CSR for the matvec to enable paralellism.
+            data_rmatvec = X.data
+            indices_rmatvec = X.indices
+            indptr_rmatvec = X.indptr
+            if num_threads == 1 and not match_parallel:
+                data_matvec = data_rmatvec
+                indices_matvec = indices_rmatvec
+                indptr_matvec = indptr_rmatvec
+            else:
+                X_csr = X.tocsr()
+                data_matvec = X_csr.data
+                indices_matvec = X_csr.indices
+                indptr_matvec = X_csr.indptr
+        
+        # Run PCA with irlba
+        original_num_threads = X._num_threads
+        X._num_threads = num_threads
+        try:
+            with threadpool_limits(num_threads, user_api='blas'):
+                num_cells, num_genes = X.shape
+                PCs, converged = irlba(
+                    data_matvec=data_matvec, indices_matvec=indices_matvec,
+                    indptr_matvec=indptr_matvec, data_rmatvec=data_rmatvec,
+                    indices_rmatvec=indices_rmatvec,
+                    indptr_rmatvec=indptr_rmatvec, num_cells=num_cells,
+                    num_genes=num_genes, k=num_PCs,
+                    subspace_size=subspace_size, tolerance=tolerance,
+                    max_iterations=max_iterations, seed=seed,
+                    match_parallel=match_parallel, is_csr=is_csr,
+                    num_threads=num_threads)
+        finally:
+            X._num_threads = original_num_threads
         
         # Print a message if PCs did not converge and `verbose=True`
         if not converged and verbose:
@@ -19613,8 +22191,8 @@ class SingleCell:
                            cell
             num_clusters: the number of k-means clusters to use during the
                           nearest-neighbor search. Called `nlist` internally by
-                          faiss. Must be positive and less than the number of
-                          cells. If `None`, will be set to
+                          faiss. Must be less than the number of cells. If
+                          `None`, will be set to
                           `ceil(min(sqrt(num_cells), num_cells / 100))`
                           clusters, i.e. the minimum of the square root of the
                           number of cells and 1% of the number of cells,
@@ -19783,7 +22361,8 @@ class SingleCell:
             while True:
                 num_probes = min(num_probes * 2, num_clusters)
                 if verbose:
-                    print(f'{len(needs_update_X):,} cells '
+                    print(f'{len(needs_update_X):,} '
+                          f'{plural("cell", len(needs_update_X))} '
                           f'({len(needs_update_X) / len(self._obs):.2f}%) did '
                           f'not have enough neighbors with {index.nprobe:,} '
                           f'probes; re-running nearest-neighbors finding for '
@@ -19884,7 +22463,7 @@ class SingleCell:
                   num_init_iterations: int | np.integer = 5,
                   oversampling_factor: int | np.integer | float |
                                        np.floating = 1,
-                  chunk_size: int | np.integer = 256,
+                  chunk_size: int | np.integer | None = None,
                   seed: int | np.integer = 0,
                   overwrite: bool = False,
                   verbose: bool = True,
@@ -19941,8 +22520,8 @@ class SingleCell:
                            cell; must be less than or equal to the number of
                            cells
             num_clusters: the number of k-means clusters to use during the
-                          nearest-neighbor search. Must be positive and less
-                          than the number of cells. If `None`, will be set to
+                          nearest-neighbor search. Must be less than the number
+                          of cells. If `None`, will be set to
                           `ceil(min(sqrt(num_cells), num_cells / 100))`
                           clusters, i.e. the minimum of the square root of the
                           number of cells and 1% of the number of cells,
@@ -20023,9 +22602,10 @@ class SingleCell:
             chunk_size: the chunk size to use for distance calculations in the
                         initial k-means clustering and in the nearest-neighbor
                         search itself. Setting this to a power of 2 is
-                        recommended; 256 was determined to be the optimal chunk
-                        size by scikit-learn (for k-means clustering) and in
-                        our tests (for both steps).
+                        recommended; 256 was found to be the optimal chunk size
+                        by scikit-learn (for k-means clustering) and in our 
+                        tests (for both steps). Defaults to 
+                        `min(256, number of cells)`.
             seed: the random seed to use when finding nearest neighbors
             overwrite: if `True`, overwrite `neighbors_key` if already present
                        in `obsm`, instead of raising an error
@@ -20100,7 +22680,7 @@ class SingleCell:
             QCed_NumPy = QC_column.to_numpy()
             PCs = PCs[QCed_NumPy]
         
-        # Check that `num_neighbors` is between 1 and the number of cells
+        # Check that `num_neighbors` is between 1 and `num_cells - 1`
         check_type(num_neighbors, 'num_neighbors', int, 'a positive integer')
         num_cells = len(PCs)
         if not 1 <= num_neighbors < num_cells:
@@ -20109,17 +22689,17 @@ class SingleCell:
                 f'less than the number of cells ({num_cells:,})')
             raise ValueError(error_message)
         
-        # Check that `num_clusters` is between 1 and the number of cells; if
-        # `None`, set to `ceil(min(sqrt(num_cells), num_cells / 100)))`
+        # Check that `num_clusters` is between 1 and `num_cells`; if `None`,
+        # set to `ceil(min(sqrt(num_cells), num_cells / 100)))`
         if num_clusters is None:
             num_clusters = \
                 int(np.ceil(min(np.sqrt(num_cells), num_cells / 100)))
         else:
             check_type(num_clusters, 'num_clusters', int, 'a positive integer')
-            if not 1 <= num_clusters < num_cells:
+            if not 1 <= num_clusters <= num_cells:
                 error_message = (
-                    f'num_clusters is {num_clusters:,}, but must be ≥ 1 and '
-                    f'less than the number of cells ({num_cells:,})')
+                    f'num_clusters is {num_clusters:,}, but must be ≥ 1 and ≤ '
+                    f'the number of cells ({num_cells:,})')
                 raise ValueError(error_message)
         
         # Check that `max_clusters_searched` is between `num_neighbors` and
@@ -20137,7 +22717,7 @@ class SingleCell:
                 raise ValueError(error_message)
         
         # Check that `min_clusters_searched` is between 1 and
-        # `min_clusters_searched`; if `None`, set to
+        # `max_clusters_searched`; if `None`, set to
         # `min(10, num_neighbors, num_clusters)`
         if min_clusters_searched is None:
             min_clusters_searched = min(10, num_neighbors, num_clusters)
@@ -20151,7 +22731,8 @@ class SingleCell:
                     f'({max_clusters_searched:,})')
                 raise ValueError(error_message)
        
-        # Check that `num_candidates_per_neighbor` is between 1 and `num_cells`
+        # Check that `num_candidates_per_neighbor` is between 1 and
+        # `num_cells - 1`
         check_type(num_candidates_per_neighbor, 'num_candidates_per_neighbor',
                    int, 'a positive integer')
         if not 1 <= num_candidates_per_neighbor < num_cells:
@@ -20194,13 +22775,17 @@ class SingleCell:
                     'kmeans_barbar=True')
                 raise ValueError(error_message)
         
-        # Check that `chunk_size` is between 1 and `num_cells`
-        check_type(chunk_size, 'chunk_size', int, 'a positive integer')
-        if not 1 <= chunk_size < num_cells:
-            error_message = (
-                f'chunk_size is {chunk_size:,}, but must be ≥ 1 and '
-                f'less than the number of cells ({num_cells:,})')
-            raise ValueError(error_message)
+        # Check that `chunk_size` is between 1 and `num_cells`; if `None`, set
+        # to `min(256, num_cells)`
+        if chunk_size is None:
+            chunk_size = min(256, num_cells)
+        else:
+            check_type(chunk_size, 'chunk_size', int, 'a positive integer')
+            if not 1 <= chunk_size <= num_cells:
+                error_message = (
+                    f'chunk_size is {chunk_size:,}, but must be ≥ 1 and ≤ the '
+                    f'number of cells ({num_cells:,})')
+                raise ValueError(error_message)
         
         # Check that `seed` is an integer
         check_type(seed, 'seed', int, 'an integer')
@@ -20829,278 +23414,270 @@ class SingleCell:
         num_threads = self._process_num_threads(num_threads)
         
         # Compute the shared nearest neighbor graph
-        indptr = np.empty(num_cells + 1, dtype=np.uint64)
-        indices, data = cython_inline(r'''
-            cimport numpy as np
-            from cpython.exc cimport PyErr_CheckSignals
-            from cython.parallel cimport parallel, prange, threadid
-            from libc.string cimport memcpy
-            from libcpp.vector cimport vector
+        indptr = np.empty(num_cells + 1, dtype=np.int64)
+        indices, data = cython_inline(_thread_offset_import + r'''
+        cimport numpy as np
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libc.string cimport memcpy
+        from libcpp.vector cimport vector
+        
+        def compute_SNN(const unsigned[:, ::1] neighbors,
+                        const long[::1] QCed_to_full_map,
+                        long[::1] indptr,
+                        const unsigned min_shared_neighbors,
+                        str neighbors_key,
+                        unsigned num_threads):
+            # Loosely based on the build_snn_graph function from
+            # github.com/libscran/scran_graph_cluster
             
-            def compute_SNN(const unsigned[:, ::1] neighbors,
-                            const long[::1] QCed_to_full_map,
-                            unsigned long[::1] indptr,
-                            const unsigned min_shared_neighbors,
-                            str neighbors_key,
-                            const unsigned num_threads):
-                # Loosely based on the build_snn_graph function from
-                # github.com/libscran/scran_graph_cluster
-                
-                cdef bint has_QC_column = QCed_to_full_map.shape[0] != 0
-                cdef unsigned i, j, k, neighbor, thread_index, num_unique_ks, \
-                    num_unique_pruned_ks, num_shared, size, \
-                    num_cells = QCed_to_full_map.shape[0] \
-                        if has_QC_column else neighbors.shape[0], \
-                    num_neighbors = neighbors.shape[1], \
-                    twice_num_neighbors = 2 * num_neighbors
-                cdef unsigned long start
-                cdef np.npy_intp nnz
-                cdef vector[vector[unsigned]] reverse_neighbors, shared_neighbors
-                cdef vector[vector[float]] shared_neighbor_weights
-                cdef vector[unsigned] num_shared_neighbors
-                cdef vector[vector[unsigned]] thread_num_shared_neighbors
-                cdef np.ndarray[np.uint32_t, ndim=1] indices
-                cdef np.ndarray[np.float32_t, ndim=1] data
-                cdef unsigned[::1] indices_view
-                cdef float[::1] data_view
-                cdef str error_message
-                
-                # Allocate space for shared nearest neighbors and weights
-                shared_neighbors.resize(num_cells)
-                shared_neighbor_weights.resize(num_cells)
-                
-                # Build the "reverse" mapping: which cells have each cell as a neighbor.
-                # Also check that all neighbor indices are in-range.
-                reverse_neighbors.resize(num_cells)
-                for i in range(num_cells):
-                    for j in range(num_neighbors):
-                        neighbor = neighbors[i, j]
-                        if neighbor >= num_cells:
-                            error_message = (
-                                f'some nearest-neighbor indices in '
-                                f'obsm[{neighbors_key!r}] are >= the total '
-                                f'number of cells, {num_cells:,}. This may '
-                                f'happen if you subset this SingleCell '
-                                f'dataset between neighbors() and '
-                                f'shared_neighbors(); if so, make sure to run '
-                                f'neighbors() after, not before, subsetting.')
-                            raise ValueError(error_message)
-                        reverse_neighbors[neighbor].push_back(i)
-                
-                PyErr_CheckSignals()
-                
-                # Calculate the number of shared neigbors for each pair of cells
-                shared_neighbors.resize(num_cells)
-                shared_neighbor_weights.resize(num_cells)
-                if not has_QC_column:
-                    if num_threads == 1:
-                        num_shared_neighbors.resize(num_cells)
-                        for i in range(num_cells):
-                            # For this cell `i`, find all pairs of cells `j` and `k`
-                            # where `j` is a shared nearest neighbor of `i` and `k`.
-                            # Do this by looking up all neighbors (`j`) of this cell
-                            # (`i`), then looking up each of these neighbors' reverse
-                            # neighbors (`k`).
-                            for j in range(num_neighbors):
-                                for k in reverse_neighbors[neighbors[i, j]]:
-                                    # Make a list of the unique `k`s...
-                                    if num_shared_neighbors[k] == 0:
-                                        shared_neighbors[i].push_back(k)
-                                    # ...and the number of times each `k` has a shared
-                                    # nearest neighbor with `i`. Note: almost all elements of
-                                    # `num_shared_neighbors` are 0!
-                                    num_shared_neighbors[k] += 1
-                            
-                            # Calculate the SNN weight between `i` and each `k`: the
-                            # number of shared neighbors, divided by the total number
-                            # of unique cells in `i` and `k`'s neighbor lists (which is
-                            # twice the number of total neighbors, minus the number of
-                            # shared neighbors). Note that since `shared_neighbors` is
-                            # sorted, the elements of `shared_neighbor_weights` will
-                            # correspond to the unique `k`s (after pruning) in sorted order.
-                            # Preallocate enough space for all `num_unique_ks` to avoid the
-                            # need for dynamic resizing, even though the true required size
-                            # (which we call `num_unique_pruned_ks`) is less due to the pruning.
-                            num_unique_ks = shared_neighbors[i].size()
-                            shared_neighbor_weights[i].reserve(num_unique_ks)
-                            num_unique_pruned_ks = 0
-                            for k in shared_neighbors[i]:
-                                num_shared = num_shared_neighbors[k]
-                                if num_shared >= min_shared_neighbors:
-                                    shared_neighbor_weights[i].push_back(
-                                        <float> num_shared /
-                                        (twice_num_neighbors - num_shared))
-                                    shared_neighbors[i][num_unique_pruned_ks] = k  # move left
-                                    num_unique_pruned_ks += 1
-                                num_shared_neighbors[k] = 0  # reset
-                            
-                            # Store the number of unique `k`s after pruning in
-                            # `indptr` (we will take the cumsum later)
-                            indptr[i + 1] = num_unique_pruned_ks
+            cdef bint has_QC_column = QCed_to_full_map.shape[0] != 0
+            cdef unsigned i, j, k, neighbor, thread_index, num_unique_ks, \
+                num_unique_pruned_ks, num_shared, size, \
+                num_cells = QCed_to_full_map.shape[0] \
+                    if has_QC_column else neighbors.shape[0], \
+                num_neighbors = neighbors.shape[1], \
+                twice_num_neighbors = 2 * num_neighbors
+            cdef unsigned long start
+            cdef np.npy_intp nnz
+            cdef pair[unsigned, unsigned] row_range
+            cdef vector[vector[unsigned]] reverse_neighbors, shared_neighbors
+            cdef vector[vector[float]] shared_neighbor_weights
+            cdef vector[unsigned] num_shared_neighbors_buffer
+            cdef vector[vector[unsigned]] thread_num_shared_neighbors
+            cdef np.ndarray[np.uint32_t, ndim=1] indices
+            cdef np.ndarray[np.float32_t, ndim=1] data
+            cdef unsigned[::1] num_shared_neighbors, indices_view
+            cdef float[::1] data_view
+            cdef str error_message
+            
+            # Build the "reverse" mapping: which cells have each cell as a neighbor.
+            # Also check that all neighbor indices are in-range.
+            reverse_neighbors.resize(num_cells)
+            for i in range(num_cells):
+                for j in range(num_neighbors):
+                    neighbor = neighbors[i, j]
+                    if neighbor >= num_cells:
+                        error_message = (
+                            f'some nearest-neighbor indices in '
+                            f'obsm[{neighbors_key!r}] are >= the total '
+                            f'number of cells, {num_cells:,}. This may '
+                            f'happen if you subset this SingleCell '
+                            f'dataset between neighbors() and '
+                            f'shared_neighbors(); if so, make sure to run '
+                            f'neighbors() after, not before, subsetting.')
+                        raise ValueError(error_message)
+                    reverse_neighbors[neighbor].push_back(i)
+            
+            PyErr_CheckSignals()
+            
+            # Calculate the number of shared neigbors for each pair of cells
+            shared_neighbors.resize(num_cells)
+            shared_neighbor_weights.resize(num_cells)
+            num_threads = min(num_threads, num_cells)
+            if not has_QC_column:
+                if num_threads == 1:
+                    num_shared_neighbors_buffer.resize(num_cells)
+                    num_shared_neighbors = <unsigned[:num_cells]> \
+                        num_shared_neighbors_buffer.data()
+                    for i in range(num_cells):
+                        # For this cell `i`, find all pairs of cells `j` and `k`
+                        # where `j` is a shared nearest neighbor of `i` and `k`.
+                        # Do this by looking up all neighbors (`j`) of this cell
+                        # (`i`), then looking up each of these neighbors' reverse
+                        # neighbors (`k`).
+                        for j in range(num_neighbors):
+                            for k in reverse_neighbors[neighbors[i, j]]:
+                                # Make a list of the unique `k`s...
+                                if num_shared_neighbors[k] == 0:
+                                    shared_neighbors[i].push_back(k)
+                                # ...and the number of times each `k` has a shared
+                                # nearest neighbor with `i`. Note: almost all elements of
+                                # `num_shared_neighbors` are 0!
+                                num_shared_neighbors[k] += 1
                         
-                        num_shared_neighbors.clear()  # no longer needed
-                    else:
-                        # Same as the single-threaded version except that
-                        # `num_shared_neighbors` is now `thread_num_shared_neighbors`
+                        # Calculate the SNN weight between `i` and each `k`: the
+                        # number of shared neighbors, divided by the total number
+                        # of unique cells in `i` and `k`'s neighbor lists (which is
+                        # twice the number of total neighbors, minus the number of
+                        # shared neighbors). Note that since `shared_neighbors` is
+                        # sorted, the elements of `shared_neighbor_weights` will
+                        # correspond to the unique `k`s (after pruning) in sorted order.
+                        # Preallocate enough space for all `num_unique_ks` to avoid the
+                        # need for dynamic resizing, even though the true required size
+                        # (which we call `num_unique_pruned_ks`) is less due to the pruning.
+                        num_unique_ks = shared_neighbors[i].size()
+                        shared_neighbor_weights[i].reserve(num_unique_ks)
+                        num_unique_pruned_ks = 0
+                        for k in shared_neighbors[i]:
+                            num_shared = num_shared_neighbors[k]
+                            if num_shared >= min_shared_neighbors:
+                                shared_neighbor_weights[i].push_back(
+                                    <float> num_shared /
+                                    (twice_num_neighbors - num_shared))
+                                shared_neighbors[i][num_unique_pruned_ks] = k  # move left
+                                num_unique_pruned_ks += 1
+                            num_shared_neighbors[k] = 0  # reset
                         
-                        thread_num_shared_neighbors.resize(num_threads)
-                        with nogil, parallel(num_threads=num_threads):
-                            thread_index = threadid()
-                            thread_num_shared_neighbors[thread_index].resize(num_cells)
-                            for i in prange(num_cells):
-                                for j in range(num_neighbors):
-                                    for k in reverse_neighbors[neighbors[i, j]]:
-                                        if thread_num_shared_neighbors[thread_index][k] == 0:
-                                            shared_neighbors[i].push_back(k)
-                                        thread_num_shared_neighbors[thread_index][k] += 1
-                                num_unique_ks = shared_neighbors[i].size()
-                                shared_neighbor_weights[i].reserve(num_unique_ks)
-                                num_unique_pruned_ks = 0
-                                for k in shared_neighbors[i]:
-                                    num_shared = thread_num_shared_neighbors[thread_index][k]
-                                    if num_shared >= min_shared_neighbors:
-                                        shared_neighbor_weights[i].push_back(
-                                            <float> num_shared /
-                                            (twice_num_neighbors - num_shared))
-                                        shared_neighbors[i][num_unique_pruned_ks] = k
-                                        num_unique_pruned_ks = num_unique_pruned_ks + 1
-                                    thread_num_shared_neighbors[thread_index][k] = 0
-                                indptr[i + 1] = num_unique_pruned_ks
-                            thread_num_shared_neighbors[thread_index].clear()  # no longer needed
-                else:
-                    # Same as the version without a QC column, but store in
-                    # `indptr[QCed_to_full_map[i] + 1]` instead of `indptr[i + 1]`.
-                    # Also, initialize `indptr` to 0 so that cells failing QC are not
-                    # left uninitialized.
+                        # Store the number of unique `k`s after pruning in
+                        # `indptr` (we will take the cumsum later)
+                        indptr[i + 1] = num_unique_pruned_ks
                     
-                    indptr[:] = 0
-                    if num_threads == 1:
-                        num_shared_neighbors.resize(num_cells)
-                        for i in range(num_cells):
+                    num_shared_neighbors_buffer.clear()  # no longer needed
+                else:
+                    # Same as the single-threaded version except that
+                    # `num_shared_neighbors` is now `thread_num_shared_neighbors`
+                    
+                    thread_num_shared_neighbors.resize(num_threads)
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        thread_num_shared_neighbors[thread_index].resize(num_cells)
+                        for i in prange(num_cells):
                             for j in range(num_neighbors):
                                 for k in reverse_neighbors[neighbors[i, j]]:
-                                    if num_shared_neighbors[k] == 0:
+                                    if thread_num_shared_neighbors[thread_index][k] == 0:
                                         shared_neighbors[i].push_back(k)
-                                    num_shared_neighbors[k] += 1
+                                    thread_num_shared_neighbors[thread_index][k] += 1
                             num_unique_ks = shared_neighbors[i].size()
                             shared_neighbor_weights[i].reserve(num_unique_ks)
                             num_unique_pruned_ks = 0
                             for k in shared_neighbors[i]:
-                                num_shared = num_shared_neighbors[k]
+                                num_shared = thread_num_shared_neighbors[thread_index][k]
                                 if num_shared >= min_shared_neighbors:
                                     shared_neighbor_weights[i].push_back(
                                         <float> num_shared /
                                         (twice_num_neighbors - num_shared))
                                     shared_neighbors[i][num_unique_pruned_ks] = k
-                                    num_unique_pruned_ks += 1
-                                num_shared_neighbors[k] = 0
-                            indptr[QCed_to_full_map[i] + 1] = num_unique_pruned_ks
-                        num_shared_neighbors.clear()  # no longer needed
-                    else:
-                        thread_num_shared_neighbors.resize(num_threads)
-                        with nogil, parallel(num_threads=num_threads):
-                            thread_index = threadid()
-                            thread_num_shared_neighbors[thread_index].resize(num_cells)
-                            for i in prange(num_cells):
-                                for j in range(num_neighbors):
-                                    for k in reverse_neighbors[neighbors[i, j]]:
-                                        if thread_num_shared_neighbors[thread_index][k] == 0:
-                                            shared_neighbors[i].push_back(k)
-                                        thread_num_shared_neighbors[thread_index][k] += 1
-                                num_unique_ks = shared_neighbors[i].size()
-                                shared_neighbor_weights[i].reserve(num_unique_ks)
-                                num_unique_pruned_ks = 0
-                                for k in shared_neighbors[i]:
-                                    num_shared = thread_num_shared_neighbors[thread_index][k]
-                                    if num_shared >= min_shared_neighbors:
-                                        shared_neighbor_weights[i].push_back(
-                                            <float> num_shared /
-                                            (twice_num_neighbors - num_shared))
-                                        shared_neighbors[i][num_unique_pruned_ks] = k
-                                        num_unique_pruned_ks = num_unique_pruned_ks + 1
-                                    thread_num_shared_neighbors[thread_index][k] = 0
-                                indptr[QCed_to_full_map[i] + 1] = num_unique_pruned_ks
-                            thread_num_shared_neighbors[thread_index].clear()  # no longer needed
+                                    num_unique_pruned_ks = num_unique_pruned_ks + 1
+                                thread_num_shared_neighbors[thread_index][k] = 0
+                            indptr[i + 1] = num_unique_pruned_ks
+                        thread_num_shared_neighbors[thread_index].clear()  # no longer needed
+            else:
+                # Same as the version without a QC column, but store in
+                # `indptr[QCed_to_full_map[i] + 1]` instead of `indptr[i + 1]`.
+                # Also, initialize `indptr` to 0 so that cells failing QC are not
+                # left uninitialized.
                 
-                reverse_neighbors.clear()  # no longer needed
-                PyErr_CheckSignals()
-                
-                # Take the cumulative sum of the values in `indptr`; initialize the
-                # first element to 0
-                indptr[0] = 0
-                for i in range(2, indptr.shape[0]):
-                    indptr[i] += indptr[i - 1]
-                
-                # Allocate `indices` and `data`: their length is the sum of the
-                # numbers of unique `k`s across all cells
-                nnz = indptr[indptr.shape[0] - 1]
-                np.import_array()
-                # indices = np.empty(nnz, dtype=np.uint32)
-                indices = np.PyArray_EMPTY(1, &nnz, np.NPY_UINT32, 0)
-                # data = np.empty(nnz, dtype=np.float32)
-                data = np.PyArray_EMPTY(1, &nnz, np.NPY_FLOAT32, 0)
-                
-                # Populate `indices` and `data` with `shared_neighbors` and
-                # `shared_neighbor_weights`, respectively. Access the arrays via
-                # memoryviews with C-contiguity specified to force Cython to avoid
-                # generating slower code that accounts for stride (not sure if this
-                # is necessary). If `QC_column` was specified, map each element
-                # of `indices` through `QCed_to_full_map` so the indices are
-                # with respect to all cells, not just QCed cells.
-                indices_view = indices
-                data_view = data
-                if not has_QC_column:
-                    if num_threads == 1:
-                        for i in range(num_cells):
-                            start = indptr[i]
-                            size = indptr[i + 1] - start
-                            
-                            # indices_view[start:start + size] = shared_neighbors[i][:]
-                            memcpy(&indices_view[start], shared_neighbors[i].data(),
-                                   size * sizeof(unsigned))
-                            
-                            # data_view[start:start + size] = shared_neighbor_weights[i][:]
-                            memcpy(&data_view[start], shared_neighbor_weights[i].data(),
-                                   size * sizeof(float))
-                    else:
-                        for i in prange(num_cells, num_threads=num_threads, nogil=True):
-                            start = indptr[i]
-                            size = indptr[i + 1] - start
-                            
-                            # indices_view[start:start + size] = shared_neighbors[i][:]
-                            memcpy(&indices_view[start], shared_neighbors[i].data(),
-                                   size * sizeof(unsigned))
-                            
-                            # data_view[start:start + size] = shared_neighbor_weights[i][:]
-                            memcpy(&data_view[start], shared_neighbor_weights[i].data(),
-                                   size * sizeof(float))
+                indptr[:] = 0
+                if num_threads == 1:
+                    num_shared_neighbors_buffer.resize(num_cells)
+                    num_shared_neighbors = <unsigned[:num_cells]> \
+                        num_shared_neighbors_buffer.data()
+                    for i in range(num_cells):
+                        for j in range(num_neighbors):
+                            for k in reverse_neighbors[neighbors[i, j]]:
+                                if num_shared_neighbors[k] == 0:
+                                    shared_neighbors[i].push_back(k)
+                                num_shared_neighbors[k] += 1
+                        num_unique_ks = shared_neighbors[i].size()
+                        shared_neighbor_weights[i].reserve(num_unique_ks)
+                        num_unique_pruned_ks = 0
+                        for k in shared_neighbors[i]:
+                            num_shared = num_shared_neighbors[k]
+                            if num_shared >= min_shared_neighbors:
+                                shared_neighbor_weights[i].push_back(
+                                    <float> num_shared /
+                                    (twice_num_neighbors - num_shared))
+                                shared_neighbors[i][num_unique_pruned_ks] = k
+                                num_unique_pruned_ks += 1
+                            num_shared_neighbors[k] = 0
+                        indptr[QCed_to_full_map[i] + 1] = num_unique_pruned_ks
+                    num_shared_neighbors.clear()  # no longer needed
                 else:
-                    if num_threads == 1:
-                        for i in range(num_cells):
-                            start = indptr[QCed_to_full_map[i]]
-                            size = indptr[QCed_to_full_map[i] + 1] - start
-                            
-                            # indices_view[start:start + size] = QCed_to_full_map[shared_neighbors[i][:]]
-                            for j in range(size):
-                                indices_view[start + j] = QCed_to_full_map[shared_neighbors[i][j]]
-                            
-                            # data_view[start:start + size] = shared_neighbor_weights[i][:]
+                    thread_num_shared_neighbors.resize(num_threads)
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        thread_num_shared_neighbors[thread_index].resize(num_cells)
+                        for i in prange(num_cells):
+                            for j in range(num_neighbors):
+                                for k in reverse_neighbors[neighbors[i, j]]:
+                                    if thread_num_shared_neighbors[thread_index][k] == 0:
+                                        shared_neighbors[i].push_back(k)
+                                    thread_num_shared_neighbors[thread_index][k] += 1
+                            num_unique_ks = shared_neighbors[i].size()
+                            shared_neighbor_weights[i].reserve(num_unique_ks)
+                            num_unique_pruned_ks = 0
+                            for k in shared_neighbors[i]:
+                                num_shared = thread_num_shared_neighbors[thread_index][k]
+                                if num_shared >= min_shared_neighbors:
+                                    shared_neighbor_weights[i].push_back(
+                                        <float> num_shared /
+                                        (twice_num_neighbors - num_shared))
+                                    shared_neighbors[i][num_unique_pruned_ks] = k
+                                    num_unique_pruned_ks = num_unique_pruned_ks + 1
+                                thread_num_shared_neighbors[thread_index][k] = 0
+                            indptr[QCed_to_full_map[i] + 1] = num_unique_pruned_ks
+                        thread_num_shared_neighbors[thread_index].clear()  # no longer needed
+            
+            reverse_neighbors.clear()  # no longer needed
+            PyErr_CheckSignals()
+            
+            # Take the cumulative sum of the values in `indptr`; initialize the
+            # first element to 0
+            indptr[0] = 0
+            for i in range(2, indptr.shape[0]):
+                indptr[i] += indptr[i - 1]
+            
+            # Allocate `indices` and `data`: their length is the sum of the
+            # numbers of unique `k`s across all cells
+            nnz = indptr[indptr.shape[0] - 1]
+            np.import_array()
+            # indices = np.empty(nnz, dtype=np.uint32)
+            indices = np.PyArray_EMPTY(1, &nnz, np.NPY_UINT32, 0)
+            # data = np.empty(nnz, dtype=np.float32)
+            data = np.PyArray_EMPTY(1, &nnz, np.NPY_FLOAT32, 0)
+            
+            # Populate `indices` and `data` with `shared_neighbors` and
+            # `shared_neighbor_weights`, respectively. Access the arrays via
+            # memoryviews with C-contiguity specified to force Cython to avoid
+            # generating slower code that accounts for stride (not sure if this
+            # is necessary). If `QC_column` was specified, map each element
+            # of `indices` through `QCed_to_full_map` so the indices are
+            # with respect to all cells, not just QCed cells.
+            indices_view = indices
+            data_view = data
+            if not has_QC_column:
+                if num_threads == 1:
+                    for i in range(num_cells):
+                        start = indptr[i]
+                        size = indptr[i + 1] - start
+                        memcpy(&indices_view[start], shared_neighbors[i].data(),
+                               size * sizeof(unsigned))
+                        memcpy(&data_view[start], shared_neighbor_weights[i].data(),
+                               size * sizeof(float))
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        row_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for i in range(row_range.first, row_range.second):
+                            start = indptr[i]
+                            size = indptr[i + 1] - start
+                            memcpy(&indices_view[start], shared_neighbors[i].data(),
+                                   size * sizeof(unsigned))
                             memcpy(&data_view[start], shared_neighbor_weights[i].data(),
                                    size * sizeof(float))
-                    else:
-                        for i in prange(num_cells, num_threads=num_threads, nogil=True):
+            else:
+                if num_threads == 1:
+                    for i in range(num_cells):
+                        start = indptr[QCed_to_full_map[i]]
+                        size = indptr[QCed_to_full_map[i] + 1] - start
+                        for j in range(size):
+                            indices_view[start + j] = QCed_to_full_map[shared_neighbors[i][j]]
+                        memcpy(&data_view[start], shared_neighbor_weights[i].data(),
+                               size * sizeof(float))
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        row_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for i in range(row_range.first, row_range.second):
                             start = indptr[QCed_to_full_map[i]]
                             size = indptr[QCed_to_full_map[i] + 1] - start
-                            
-                            # indices_view[start:start + size] = QCed_to_full_map[shared_neighbors[i][:]]
                             for j in range(size):
                                 indices_view[start + j] = QCed_to_full_map[shared_neighbors[i][j]]
-                            
-                            # data_view[start:start + size] = shared_neighbor_weights[i][:]
                             memcpy(&data_view[start], shared_neighbor_weights[i].data(),
                                    size * sizeof(float))
-                
-                return indices, data
+            
+            return indices, data
             ''')['compute_SNN'](
                 neighbors=neighbors, QCed_to_full_map=QCed_to_full_map, 
                 indptr=indptr, min_shared_neighbors=min_shared_neighbors,
@@ -21113,15 +23690,19 @@ class SingleCell:
                           varp=self._varp, uns=self._uns,
                           num_threads=self._num_threads)
     
-    def cluster(self,
+    def dendrogram(self,
                 *,
-                QC_column: SingleCellColumn | None |
-                           Sequence[SingleCellColumn | None] = 'passed_QC',
+                # QC_column: SingleCellColumn | None |
+                #            Sequence[SingleCellColumn | None] = 'passed_QC',
                 shared_neighbors_key: str = 'shared_neighbors',
                 cell_type_column: str = 'cell_type',
                 overwrite: bool = False,
                 verbose: bool = True,
-                num_threads: int | np.integer | None = None) -> SingleCell:
+                num_threads: int | np.integer | None = None) -> \
+            tuple[np.ndarray[1, np.dtype[np.uint32]],
+                  np.ndarray[1, np.dtype[np.uint32]],
+                  np.ndarray[1, np.dtype[np.float32]],
+                  np.ndarray[1, np.dtype[np.uint32]]]:  # SingleCell:
         """
         Cluster cells into cell types using hierarchical clustering.
         
@@ -21136,19 +23717,20 @@ class SingleCell:
         github.com/XuegongLab/HGC).
         
         Args:
-            QC_column: an optional Boolean column of `obs` indicating which
-                       cells passed QC. Can be a column name, a polars
-                       expression, a polars Series, a 1D NumPy array, or a
-                       function that takes in this SingleCell dataset and
-                       returns a polars Series or 1D NumPy array. Set to `None`
-                       to include all cells. Cells failing QC will be ignored
-                       and have their cell-type labels set to `NaN`.
+            # QC_column: an optional Boolean column of `obs` indicating which
+            #            cells passed QC. Can be a column name, a polars
+            #            expression, a polars Series, a 1D NumPy array, or a
+            #            function that takes in this SingleCell dataset and
+            #            returns a polars Series or 1D NumPy array. Set to `None`
+            #            to include all cells. Cells failing QC will be ignored
+            #            and have their cell-type labels set to `NaN`.
             shared_neighbors_key: the key of `obsp` containing the shared
                                   nearest neighbor graph calculated with
                                   `shared_neighbors()`, to use as the input for
                                   cell-type clustering. Must be symmetric,
                                   although this is not checked for, due to
-                                  speed considerations.
+                                  speed considerations. Diagonals are assumed
+                                  to be 1; the actual values are ignored.
             cell_type_column: the name of an integer column to be added to
                               obs indicating the cell-type labels
             overwrite: if `True`, overwrite `cell_type_column` if already
@@ -21166,8 +23748,22 @@ class SingleCell:
                          as the original dataset's `num_threads`.
         
         Returns:
-            A new SingleCell dataset where `obs[cell_type_column]` contains an
-            integer cell-type label for each cell.
+            A tuple of four NumPy arrays of length `2 * num_cells - 1`:
+            - `left_nodes`: the integer index of the left node of each split
+            - `right_nodes`: the integer index of the right node of each split
+            - `distances`: the distance of each split
+            - `sizes`: the total size (left + right) at each split
+            Or, to adapt SciPy's description at docs.scipy.org/doc/scipy/
+            reference/generated/scipy.cluster.hierarchy.linkage.html: at the
+            `i`th clustering iteration, clusters with indices `left_nodes[i]`
+            and `right_nodes[i]` are combined to form cluster `num_cells + i`.
+            A cluster with an index less than `num_cells` corresponds to one of
+            the original observations. The distance between clusters
+            `left_nodes[i]` and `right_nodes[i]` is given by `distances[i]`.
+            `sizes[i]` represents the number of original observations in the
+            newly formed cluster.
+            # TODO A new SingleCell dataset where `obs[cell_type_column]`
+            # contains an integer cell-type label for each cell.
         
         Note:
             This function may give an incorrect output if you specified a
@@ -21197,13 +23793,12 @@ class SingleCell:
             raise ValueError(error_message)
         
         # Get the QC column, if not None
-        if QC_column is not None:
-            QC_column = self._get_column(
-                'obs', QC_column, 'QC_column', pl.Boolean,
-                allow_missing=QC_column == 'passed_QC')
+        # if QC_column is not None:
+        #     QC_column = self._get_column(
+        #         'obs', QC_column, 'QC_column', pl.Boolean,
+        #         allow_missing=QC_column == 'passed_QC')
         
-        # Get the shared nearest neighbor graph, and check that it is
-        # float32
+        # Get the shared nearest neighbor graph, and check that it is float32
         check_type(shared_neighbors_key, 'shared_neighbors_key', str,
                    'a string')
         if shared_neighbors_key not in self._obsp:
@@ -21238,45 +23833,30 @@ class SingleCell:
         #       is the number of cells/nodes in the graph.
         # Note: because `snn_graph` is symmetric, we don't have to worry about
         #       whether it's CSR or CSC.
-        num_nodes = snn_graph.shape[0]
-        num_nodes_minus_1 = num_nodes - 1
-        left_nodes = np.empty(num_nodes_minus_1, dtype=np.uint32)
-        right_nodes = np.empty(num_nodes_minus_1, dtype=np.uint32)
-        distances = np.empty(num_nodes_minus_1, dtype=np.float32)
-        cython_inline(_uninitialized_vector_import + r'''
-        # This code generally follows the original Paris clustering
-        # implementation (github.com/tbonald/paris/blob/master/paris.py), but
-        # ignores self edges (the diagonal of the sparse matrix) instead of
-        # counting them twice towards `w` and once towards `wtot`. For
-        # computational efficiency, it also differs from the original by not
-        # keeping track of cluster sizes, and not relabelling non-leaf nodes in
-        # order of increasing distance when sorting by distance. Note that
-        # since the shared nearest neighbors graph is symmetric (not checked),
-        # we do not need to handle CSR and CSC separately.
+        num_cells = snn_graph.shape[0]
+        num_merges = num_cells - 1
+        left_nodes = np.empty(num_merges, dtype=np.uint32)
+        right_nodes = np.empty(num_merges, dtype=np.uint32)
+        distances = np.empty(num_merges, dtype=np.float32)
+        sizes = np.empty(num_merges, dtype=np.uint32)
         
+        # This code generally follows the original Paris clustering implementation
+        # (github.com/tbonald/paris/blob/master/paris.py). Note that since the shared
+        # nearest neighbors graph is assumed to be symmetric, we do not need to handle
+        # CSR and CSC separately.
+        cython_inline(_thread_offset_import + _uninitialized_vector_import + r'''
         from cpython.exc cimport PyErr_CheckSignals
-        from cython.operator cimport dereference
-        from cython.parallel cimport prange
-        from libc.math cimport INFINITY, isinf
-        from libcpp.pair cimport pair
+        from cython.parallel cimport parallel, threadid
+        from libc.math cimport INFINITY
+        from libc.float cimport FLT_MAX
+        from libc.limits cimport UINT_MAX
         from libcpp.vector cimport vector
-        
-        cdef extern from "limits.h":
-            cdef unsigned UINT_MAX
-        
-        ctypedef fused signed_integer:
-            int
-            long
         
         cdef extern from * nogil:
             """
             // From github.com/ktprime/emhash/blob/master/thirdparty/emilib/emilib2o.hpp,
             // as benchmarked at jacksonallan.github.io/c_cpp_hash_tables_benchmark.
-            // LICENSE:
-            //   This software is dual-licensed to the public domain and under the following
-            //   license: you are granted a perpetual, irrevocable license to copy, modify,
-            //   publish, and distribute this file as you see fit.
-        
+           
             #include <cstdlib>
             #include <cstring>
             #include <iterator>
@@ -22510,57 +25090,82 @@ class SingleCell:
                   unsigned[::1] left_nodes,
                   unsigned[::1] right_nodes,
                   float[::1] distances,
+                  unsigned[::1] sizes,
                   const unsigned long num_nodes,
-                  const unsigned num_threads):
+                  unsigned num_threads):
             
-            cdef unsigned a, b, c, u, v, start_node, num_merges = 0, \
+            cdef unsigned a, b, c, u, v, thread_index, start_node, num_merges = 0, \
                 n = num_nodes, num_dendrogram_nodes = 2 * num_nodes - 1
             cdef unsigned long i
-            cdef float weight, d, dmin, wtot = 0, inv_wtot
+            cdef float wu, weight, d, dmin, inv_wtot, wtot = 0
             cdef pair[unsigned, float] neighbor
+            cdef pair[unsigned, unsigned] row_range
             
             # SNN graph
-            cdef vector[UnsignedFloatHashMap] graph = \
-                vector[UnsignedFloatHashMap](num_dendrogram_nodes)
+            cdef vector[UnsignedFloatHashMap] graph
             
             # Node weights
-            cdef vector[float] w
+            cdef uninitialized_vector[float] w_buffer
+            w_buffer.resize(num_dendrogram_nodes)
+            cdef float[::1] w = <float[:num_dendrogram_nodes]> w_buffer.data()
+            
+            # Node sizes
+            cdef uninitialized_vector[unsigned] s_buffer
+            s_buffer.resize(num_dendrogram_nodes)
+            cdef unsigned[::1] s = <unsigned[:num_dendrogram_nodes]> s_buffer.data()
+            s[:] = 1
             
             # Current (merged) node index for each leaf node
-            cdef uninitialized_vector[unsigned] node_map
+            cdef uninitialized_vector[unsigned] node_map_buffer
+            node_map_buffer.resize(num_nodes)
+            cdef unsigned[::1] node_map = <unsigned[:num_nodes]> node_map_buffer.data()
             
             # Nearest-neighbor chain
             cdef vector[unsigned] chain
             
             # Connected components
-            cdef vector[unsigned] cc
+            # cdef vector[unsigned] cc
+            cdef vector[pair[unsigned, unsigned]] cc
+            cdef pair[unsigned, unsigned] comp
             
-            # Build graph and calculate weights
-            w.resize(num_dendrogram_nodes)
-            node_map.resize(num_nodes)
+            # Build the graph and calculate the node weights. Note: like in the
+            # original Paris clustering implementation, self-edges (which we assume to
+            # all be 1) are counted twice towards `w` and once towards `wtot`.
+            graph.resize(num_dendrogram_nodes)
+            num_threads = min(num_threads, num_nodes)
             if num_threads == 1:
                 for u in range(num_nodes):
+                    wu = 0
                     for i in range(<unsigned long> indptr[u],
                                    <unsigned long> indptr[u + 1]):
                         v = indices[i]
                         if u != v:
                             weight = data[i]
                             graph[u][v] = weight
-                            w[u] += weight
+                            wu += weight
                     node_map[u] = u
-                    wtot += w[u]
+                    wu += 2  # count self-edges twice towards `w`
+                    w[u] = wu
+                    wtot += wu
             else:
-                for u in prange(num_nodes, num_threads=num_threads, nogil=True):
-                    for i in range(<unsigned long> indptr[u],
-                                   <unsigned long> indptr[u + 1]):
-                        v = indices[i]
-                        if u != v:
-                            weight = data[i]
-                            graph[u][v] = weight
-                            w[u] = w[u] + weight
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    row_range = get_thread_offset(indptr, thread_index, num_threads)
+                    for u in range(row_range.first, row_range.second):
+                        wu = 0
+                        for i in range(<unsigned long> indptr[u],
+                                       <unsigned long> indptr[u + 1]):
+                            v = indices[i]
+                            if u != v:
+                                weight = data[i]
+                                graph[u][v] = weight
+                                wu = wu + weight
+                        wu = wu + 2  # count self-edges twice towards `w`
+                        w[u] = wu
                 for u in range(num_nodes):
                     node_map[u] = u
                     wtot += w[u]
+            wtot -= num_nodes  # count self-edges only once towards `wtot`
             inv_wtot = 1 / wtot
             
             # Cluster
@@ -22576,13 +25181,14 @@ class SingleCell:
                         chain.push_back(start_node)
                         break
                     start_node += 1
+                
                 while not chain.empty():
                     # Pop the last node, `a`, from the chain
                     a = chain.back()
                     chain.pop_back()
                     
                     # Find `a`'s nearest neighbor, `b`
-                    dmin = INFINITY
+                    dmin = FLT_MAX
                     for neighbor in graph[a]:
                         v = neighbor.first
                         weight = neighbor.second
@@ -22607,6 +25213,7 @@ class SingleCell:
                             left_nodes[num_merges] = node_map[a]
                             right_nodes[num_merges] = node_map[b]
                             distances[num_merges] = dmin * w[a] * inv_wtot
+                            sizes[num_merges] = s[a] + s[b]
                             num_merges += 1
                             
                             # Update graph
@@ -22639,9 +25246,10 @@ class SingleCell:
                                 node_map[a] = UINT_MAX
                                 node_map[b] = u
                                 
-                                # Update the weight of `b` to include the
+                                # Update the weight and size of `b` to include the
                                 # contribution from `a`
                                 w[b] += w[a]
+                                s[b] += s[a]
                             else:
                                 # Merge `b` into `a`: the reverse of the code
                                 # above
@@ -22657,6 +25265,7 @@ class SingleCell:
                                 node_map[b] = UINT_MAX
                                 node_map[a] = u
                                 w[a] += w[b]
+                                s[a] += s[b]
                             n -= 1
                             u += 1
                         else:
@@ -22669,7 +25278,7 @@ class SingleCell:
                             chain.push_back(c)
                             chain.push_back(a)
                             chain.push_back(b)
-                    elif not isinf(dmin):
+                    elif dmin != FLT_MAX:
                         # `a` was the first node we added to the chain. Add it
                         # and its nearest neighbor `b` to the chain, and keep
                         # going.
@@ -22679,45 +25288,76 @@ class SingleCell:
                         # `a` has no neighbors, meaning that it comprises an
                         # entire connected component. Remove this connected
                         # component from the graph and store it in `cc`.
-                        cc.push_back(node_map[a])
+                        
+                        # cc.push_back(s[a])
+                        cc.push_back(pair[unsigned_, unsigned_](node_map[a], s[a]))
                         for neighbor in graph[a]:
                             graph[neighbor.first].erase(a)
                         graph[a].clear()
                         node_map[a] = UINT_MAX
                         n -= 1
-
+            
             # Add connected components to the dendrogram, with a distance of
             # infinity from each other
             if not cc.empty():
-                a = cc.back()
+                # a = cc.back()
+                # cc.pop_back()
+                # for b in cc:
+                #     left_nodes[num_merges] = a
+                #     right_nodes[num_merges] = b
+                #     distances[num_merges] = INFINITY
+                #     num_merges += 1
+                #     a = u
+                #     u += 1
+                comp = cc.back()
                 cc.pop_back()
-                for b in cc:
+                a = comp.first
+                size = comp.second
+                for comp in cc:
+                    b = comp.first
+                    size += comp.second
                     left_nodes[num_merges] = a
                     right_nodes[num_merges] = b
                     distances[num_merges] = INFINITY
+                    sizes[num_merges] = size
                     num_merges += 1
                     a = u
                     u += 1
         ''', warn_undeclared=False)['paris'](
             data=snn_graph.data, indices=snn_graph.indices,
             indptr=snn_graph.indptr, left_nodes=left_nodes,
-            right_nodes=right_nodes, distances=distances, num_nodes=num_nodes,
-            num_threads=num_threads)
-        cell_type_labels = (lambda a, b, c: pl.Series(
-            np.zeros(len(self._obs if QC_column is None else QC_column))))(
-            left_nodes, right_nodes, distances)  # not currently using `verbose`
-        if QC_column is not None:
-            # Back-project from QCed cells to all cells, filling with `null`
-            cell_type_labels = pl.when(QC_column)\
-                .then(cell_type_labels
-                      .gather(QC_column.cum_sum().cast(pl.Int32) - 1))
-        return SingleCell(X=self._X,
-                          obs=self._obs.with_columns(cell_type_labels),
-                          var=self._var, obsm=self._obsm, varm=self._varm,
-                          obsp=self._obsp, varp=self._varp, uns=self._uns,
-                          num_threads=self._num_threads)
+            right_nodes=right_nodes, distances=distances, sizes=sizes,
+            num_nodes=num_cells, num_threads=num_threads)
+        
+        # Reorder the dendrogram so that distances and non-leaf node IDs are in
+        # ascending order
+        order = np.vstack((np.arange(num_merges), distances))
+        index = np.lexsort(order)
+        nindex = np.concatenate([np.arange(num_cells),
+                                 num_cells + index.argsort()])
+        np.take(nindex, left_nodes, out=left_nodes)
+        np.take(nindex, right_nodes, out=right_nodes)
+        np.take(left_nodes, index, out=left_nodes)
+        np.take(right_nodes, index, out=right_nodes)
+        np.take(distances, index, out=distances)
+        np.take(sizes, index, out=sizes)
+        
+        return left_nodes, right_nodes, distances, sizes
+        # cell_type_labels = (lambda a, b, c: pl.Series(
+        #     np.zeros(len(self._obs if QC_column is None else QC_column))))(
+        #     left_nodes, right_nodes, distances)  # not currently using `verbose`
+        # if QC_column is not None:
+        #     # Back-project from QCed cells to all cells, filling with `null`
+        #     cell_type_labels = pl.when(QC_column)\
+        #         .then(cell_type_labels
+        #               .gather(QC_column.cum_sum().cast(pl.Int32) - 1))
+        # return SingleCell(X=self._X,
+        #                   obs=self._obs.with_columns(cell_type_labels),
+        #                   var=self._var, obsm=self._obsm, varm=self._varm,
+        #                   obsp=self._obsp, varp=self._varp, uns=self._uns,
+        #                   num_threads=self._num_threads)
     
-    def harmonize_old(self,
+    def harmonize_even_older(self,
                   *others: SingleCell,
                   QC_column: SingleCellColumn | None |
                              Sequence[SingleCellColumn | None] = 'passed_QC',
@@ -22743,10 +25383,11 @@ class SingleCell:
             SingleCell | tuple[SingleCell, ...]:
         """
         Harmonize this SingleCell dataset with other datasets, using Harmony
-        (nature.com/articles/s41592-019-0619-0). Harmony was originally written
-        in R (github.com/immunogenomics/harmony) but has two Python ports,
-        harmony-pytorch (github.com/lilab-bcb/harmony-pytorch), which our
-        implementation is based on, and harmonypy
+        (nature.com/articles/s41592-019-0619-0).
+        
+        Harmony was originally written in R (github.com/immunogenomics/harmony)
+        and has two Python ports, harmony-pytorch
+        (github.com/lilab-bcb/harmony-pytorch) and harmonypy
         (github.com/slowkow/harmonypy).
         
         Args:
@@ -22972,6 +25613,22 @@ class SingleCell:
             cdef extern from "<utility>" namespace "std" nogil:
                 T swap[T](T &a, T &b)
             
+            cdef inline void matrix_vector_multiply(
+                    const float[:, ::1] A,
+                    const float[::1] X,
+                    float[::1] Y,
+                    const bint transpose,
+                    const float alpha,
+                    const float beta) noexcept nogil:
+                # Flip `trans` since our matrix is C-major, whereas BLAS
+                # expects Fortran-major
+                
+                cdef int m = A.shape[1], n = A.shape[0], incx = 1, incy = 1
+                cdef char trans = b'N' if transpose else b'T'
+                sgemv(&trans, &m, &n, <float*> &alpha, <float*> &A[0,0],
+                      &m, <float*> &X[0], &incx, <float*> &beta, &Y[0],
+                      &incy)
+            
             cdef inline void matrix_multiply(const float[:, ::1] A,
                                              const float[:, ::1] B,
                                              float[:, ::1] C,
@@ -23005,22 +25662,6 @@ class SingleCell:
                 sgemm(&transA, &transB, &m, &n, &k, <float*> &alpha,
                       <float*> &B[0, 0], &lda, <float*> &A[0, 0], &ldb,
                       <float*> &beta, &C[0, 0], &m)
-            
-            cdef inline void matrix_vector_multiply(
-                    const float[:, ::1] A,
-                    const float[::1] X,
-                    float[::1] Y,
-                    const bint transpose,
-                    const float alpha,
-                    const float beta) noexcept nogil:
-                # Flip `trans` since our matrix is C-major, whereas BLAS
-                # expects Fortran-major
-                
-                cdef int m = A.shape[1], n = A.shape[0], incx = 1, incy = 1
-                cdef char trans = b'N' if transpose else b'T'
-                sgemv(&trans, &m, &n, <float*> &alpha, <float*> &A[0,0],
-                      &m, <float*> &X[0], &incx, <float*> &beta, &Y[0],
-                      &incy)
             
             cdef inline unsigned rand(unsigned long* state) noexcept nogil:
                 cdef unsigned long x = state[0]
@@ -23104,7 +25745,7 @@ class SingleCell:
                 for i in range(num_batches):
                     Pr_b[i] = <float> N_b[i] / num_cells
                 
-                # Initialize `R` (and `R_sum`) and `O`
+                # Initialize `R`, `R_sum`, and `O`
                 
                 matrix_multiply(Z_norm, Y_norm, Z_norm_times_Y_norm,
                                 transpose_A=False, transpose_B=True, alpha=1,
@@ -23500,7 +26141,7 @@ class SingleCell:
                 varm=self._varm, uns=self._uns, num_threads=self._num_threads)
         return tuple(datasets) if others else datasets[0]
     
-    def harmonize(self,
+    def harmonize_older(self,
                   *others: SingleCell,
                   QC_column: SingleCellColumn | None |
                              Sequence[SingleCellColumn | None] = 'passed_QC',
@@ -23648,8 +26289,8 @@ class SingleCell:
                                  `kmeans_barbar=True`.
             chunk_size: the chunk size to use for distance calculations in the
                         initial k-means clustering. Setting this to a power of
-                        2 is recommended; 256 was determined to be the optimal
-                        chunk size by scikit-learn and in our tests.
+                        2 is recommended; 256 was found to be the optimal chunk 
+                        size by scikit-learn and in our tests.
             seed: the random seed to use for the initial k-means clustering
             overwrite: if `True`, overwrite `Harmony_key` if already present in
                        obsm, instead of raising an error
@@ -23815,8 +26456,8 @@ class SingleCell:
         
         # Concatenate PCs (`Z`) across datasets; get labels indicating which
         # rows of these concatenated PCs come from each dataset or batch. Check
-        # that the PCs are float32 and C-contiguous and all have the same width
-        # as each other.
+        # that the PCs are float32 and C-contiguous and all have the same
+        # width.
         Z = [dataset._obsm[PC_key] for dataset in datasets]
         for PCs in Z:
             dtype = PCs.dtype
@@ -23878,7 +26519,7 @@ class SingleCell:
         elif num_clusters >= num_cells:
             error_message = (
                 f'num_clusters is {num_clusters:,}, but must be less than the '
-                f'total number of cells across all datasets({num_cells:,})')
+                f'total number of cells across all datasets ({num_cells:,})')
             raise ValueError(error_message)
         
         # Also check that `chunk_size` is less than the total number of cells
@@ -23886,7 +26527,7 @@ class SingleCell:
         if chunk_size >= num_cells:
             error_message = (
                 f'chunk_size is {chunk_size:,}, but must be less than the '
-                f'total number of cells across all datasets({num_cells:,})')
+                f'total number of cells across all datasets ({num_cells:,})')
             raise ValueError(error_message)
         
         # Define Cython functions
@@ -23984,7 +26625,7 @@ class SingleCell:
                     const float sigma,
                     const unsigned num_cells,
                     const unsigned num_clusters,
-                    const unsigned num_batches) noexcept nogil:
+                    const unsigned num_batches):
                 cdef unsigned i, j
                 cdef float kmeans_error, entropy_term, diversity_penalty
                 kmeans_error = entropy_term = diversity_penalty = 0
@@ -24029,7 +26670,7 @@ class SingleCell:
                 for i in range(num_batches):
                     Pr_b[i] = <float> N_b[i] / num_cells
                 
-                # Initialize `R` (and `R_sum`) and `O`
+                # Initialize `R`, `R_sum`, and `O`
                 matrix_multiply(Z_norm, Y_norm, Z_norm_times_Y_norm,
                                 transpose_A=False, transpose_B=True, alpha=1,
                                 beta=0)
@@ -24108,6 +26749,8 @@ class SingleCell:
                         norm = 1 / sqrt(norm)
                         for j in range(num_PCs):
                             Y_norm[i, j] = Y_norm[i, j] * norm
+                    
+                    # Shuffle the order of the cells
                     for i in range(num_cells):
                         idx_list[i] = i
                     shuffle_array(idx_list, &state)
@@ -24138,8 +26781,9 @@ class SingleCell:
                             for j in range(num_clusters):
                                 E[i, j] -= Pr_b[i] * R_in_sum[j]
                         
-                        # Recompute `R` for the removed cells
-                        # Note: the original formula is
+                        # Recompute `R`, the fractional soft clustering
+                        # assignments of each cell to each cluster, for the
+                        # removed cells. Note that the original formula is:
                         # `exp(-2 / sigma * (1 - Z_norm_block @ Y_norm.T))`,
                         # which expands to `exp(-2 / sigma) *
                         # exp(2 / sigma * Z_norm_block @ Y_norm.T))`. Since
@@ -24434,6 +27078,2803 @@ class SingleCell:
                 varm=self._varm, uns=self._uns, num_threads=self._num_threads)
         return tuple(datasets) if others else datasets[0]
     
+    def harmonize_old(self,
+                  *others: SingleCell,
+                  QC_column: SingleCellColumn | None |
+                             Sequence[SingleCellColumn | None] = 'passed_QC',
+                  batch_column: SingleCellColumn | None |
+                                Sequence[SingleCellColumn | None] = None,
+                  PC_key: str = 'PCs',
+                  Harmony_key: str = 'Harmony_PCs',
+                  num_clusters: int | np.integer | None = None,
+                  max_iterations: int | np.integer = 10,
+                  num_kmeans_iterations: int | np.integer = 25,
+                  num_clustering_iterations: int | np.integer = 5,
+                  block_proportion: int | float | np.integer |
+                                    np.floating = 0.05,
+                  tolerance: int | float | np.integer | np.floating = 1e-4,
+                  ridge_lambda: int | float | np.integer | np.floating = 1,
+                  sigma: int | float | np.integer | np.floating = 0.1,
+                  kmeans_barbar: bool = False,
+                  num_init_iterations: int | np.integer = 5,
+                  oversampling_factor: int | np.integer | float |
+                                       np.floating = 1,
+                  chunk_size_kmeans: int | np.integer | None = None,
+                  chunk_size_Harmony: int | np.integer | None = None,
+                  seed: int | np.integer = 0,
+                  overwrite: bool = False,
+                  verbose: bool = True,
+                  num_threads: int | np.integer | None = None) -> \
+            SingleCell | tuple[SingleCell, ...]:
+        """
+        Harmonize this SingleCell dataset with other datasets, using Harmony
+        (nature.com/articles/s41592-019-0619-0).
+        
+        Harmony was originally written in R (github.com/immunogenomics/harmony)
+        but has two Python ports, harmony-pytorch
+        (github.com/lilab-bcb/harmony-pytorch), which our implementation is
+        loosely based on, and harmonypy (github.com/slowkow/harmonypy).
+        
+        Args:
+            others: the other SingleCell datasets to harmonize this one with
+            QC_column: an optional Boolean column of `obs` indicating which
+                       cells passed QC. Can be a column name, a polars
+                       expression, a polars Series, a 1D NumPy array, or a
+                       function that takes in this SingleCell dataset and
+                       returns a polars Series or 1D NumPy array. Set to `None`
+                       to include all cells. Cells failing QC will be ignored
+                       and have their Harmony embeddings set to `NaN`. When
+                       `others` is specified, `QC_column` can be a
+                       length-`1 + len(others)` sequence of columns,
+                       expressions, Series, functions, or `None` for each
+                       dataset (for `self`, followed by each dataset in
+                       `others`).
+            batch_column: an optional String, Enum, Categorical, or integer
+                          column of `obs` indicating which batch each cell is
+                          from. Can be a column name, a polars expression, a
+                          polars Series, a 1D NumPy array, or a function that
+                          takes in this SingleCell dataset and returns a polars
+                          Series or 1D NumPy array. Each batch will be treated
+                          as if it were a distinct dataset; this is exactly
+                          equivalent to splitting the dataset with
+                          `split_by(batch_column)` and then passing each of the
+                          resulting datasets to `harmonize()`. Set to `None` to
+                          treat each dataset as having a single batch. When
+                          `others` is specified, `batch_column` may be a
+                          length-`1 + len(others)` sequence of columns,
+                          expressions, Series, functions, or `None` for each
+                          dataset (for `self`, followed by each dataset in
+                          `others`).
+            PC_key: the key of `obsm` containing the principal components
+                    calculated with `PCA()`, to use as the input to Harmony
+            Harmony_key: the key of `obsm` where the Harmony embeddings will be
+                         stored; will be added in-place to both `self` and each
+                         of the datasets in `others`!
+            num_clusters: the number of clusters used in the Harmony algorithm,
+                          including in the initial k-means clustering. If not
+                          specified, take the minimum of 100 and
+                          floor(total number of cells / 30).
+            max_iterations: the maximum number of iterations to run Harmony
+                            for, if convergence is not achieved. Defaults to
+                            10, like the original Harmony R package,
+                            harmony-pytorch, and harmonypy. Set to `None` to
+                            use as many iterations as necessary to achieve
+                            convergence.
+            num_kmeans_iterations: the number of iterations of k-means
+                                   clustering to run, as the first step of
+                                   Harmony. Defaults to 25, like the original
+                                   Harmony R package, harmony-pytorch, and
+                                   harmonypy. However, unlike these packages,
+                                   only one initialization is tried rather than
+                                   10 to reduce runtime.
+            num_clustering_iterations: the number of iterations to run the
+                                       clustering step within each Harmony
+                                       iteration for. Unlike the original
+                                       Harmony algorithm, convergence of the
+                                       clustering is not checked. Defaults to 5
+                                       iterations; this differs from the 20
+                                       used by the original harmony R package
+                                       and harmonypy, and the 200 iterations
+                                       used by harmony-pytorch (which do have
+                                       convergence checks).
+            block_proportion: the proportion of cells to use in each batch
+                              update in the clustering step; must be greater
+                              than zero and less than or equal to 1
+            tolerance: the relative tolerance used to determine whether to stop
+                       Harmony before `max_iterations` iterations; must be
+                       positive
+            ridge_lambda: the ridge regression penalty used in the Harmony
+                          correction step; must be non-negative
+            sigma: the weight of the entropy term in the Harmony objective
+                   function; must be non-negative
+            kmeans_barbar: whether to use k-means|| initialization (a parallel
+                           version of k-means++ from arxiv.org/abs/1203.6402)
+                           to initialize the k-means clustering centroids,
+                           instead of random initialization
+            num_init_iterations: the number of k-means|| iterations used to
+                                 initialize the k-means clustering that
+                                 constitutes the first step of Harmony.
+                                 k-means|| is a parallel version of the
+                                 widely used k-means++ initialization scheme
+                                 for k-means clustering. The default value of 5
+                                 is recommended by the k-means|| paper
+                                 (arxiv.org/abs/1203.6402). Only used when
+                                 `kmeans_barbar=True`.
+            oversampling_factor: the number of candidate centroids selected, on
+                                 average, at each of the `num_init_iterations`
+                                 iterations of k-means||, as a multiple of
+                                 `num_clusters`. The default value of 1 is the
+                                 midpoint (in log space) of the values explored
+                                 by the k-means|| paper
+                                 (arxiv.org/abs/1203.6402), namely 0.1 to 10.
+                                 The total number of candidate centroids
+                                 selected, on average, will be
+                                 `oversampling_factor * num_clusters + 1`, from
+                                 which the final `num_clusters` centroids will
+                                 then be selected via k-means++. Only used when
+                                 `kmeans_barbar=True`.
+            chunk_size_kmeans: the chunk size to use for distance calculations
+                               in the initial k-means clustering. Setting this
+                               to a power of 2 is recommended; 256 was found to
+                               be the optimal chunk size by scikit-learn and in
+                               our tests. Defaults to `min(256, num_cells)`.
+            chunk_size_Harmony: the chunk size to use for Harmony. Setting this
+                                to a power of 2 is recommended; 512 was found
+                                to be the optimal chunk size in our tests.
+                                Defaults to `min(512, num_cells)`.
+            seed: the random seed to use for the initial k-means clustering
+            overwrite: if `True`, overwrite `Harmony_key` if already present in
+                       obsm, instead of raising an error
+            verbose: whether to print details of the harmonization process
+            num_threads: the number of threads to use when concatenating
+                         principal components and batch/dataset labels across
+                         datasets, for the initial k-means clustering, and for
+                         the matrix and matrix-vector multiplications within
+                         Harmony. Set `num_threads=-1` to use all available
+                         cores, as determined by `os.cpu_count()`, or leave
+                         unset to use `self.num_threads` cores. Does not affect
+                         the returned SingleCell dataset's `num_threads`; this
+                         will always be the same as the original dataset's
+                         `num_threads`.
+        
+        Returns:
+            A length-`1 + len(others)` tuple of SingleCell datasets with the
+            Harmony embeddings stored in `obsm[Harmony_key]`: `self`, followed
+            by each dataset in `others`.
+        """
+        # If `others` was specified, check that all elements of `others` are
+        # SingleCell datasets
+        if not others:
+            error_message = 'others cannot be empty'
+            raise ValueError(error_message)
+        check_types(others, 'others', SingleCell, 'SingleCell datasets')
+        datasets = [self] + list(others)
+        
+        # Check that `Harmony_key` is a string
+        check_type(Harmony_key, 'Harmony_key', str, 'a string')
+        
+        # Check that `overwrite` is Boolean
+        check_type(overwrite, 'overwrite', bool, 'Boolean')
+        
+        # Check that `Harmony_key` is not already in `obsm` for any dataset,
+        # unless `overwrite=True`
+        if not overwrite and \
+                any(Harmony_key in dataset._obsm for dataset in datasets):
+            error_message = (
+                f'Harmony_key {Harmony_key!r} is already a key of obsm for at '
+                f'least one dataset; did you already run harmonize()? Set '
+                f'overwrite=True to overwrite.')
+            raise ValueError(error_message)
+        
+        # Get `QC_column` and `batch_column` from every dataset, if not None
+        QC_columns = SingleCell._get_columns(
+            'obs', datasets, QC_column, 'QC_column', pl.Boolean,
+            allow_missing=True)
+        QC_columns_NumPy = [QC_col.to_numpy() if QC_col is not None else None
+                            for QC_col in QC_columns]
+        batch_columns = SingleCell._get_columns(
+            'obs', datasets, batch_column, 'batch_column',
+            (pl.String, pl.Categorical, pl.Enum, 'integer'),
+            QC_columns=QC_columns)
+        
+        # Check that `PC_key` is a key of `obsm` for every dataset
+        check_type(PC_key, 'PC_key', str, 'a string')
+        if not all(PC_key in dataset._obsm for dataset in datasets):
+            error_message = (
+                f'PC_key {PC_key!r} is not a column of obs for at least one '
+                f'dataset; did you forget to run PCA() before harmonize()?')
+            raise ValueError(error_message)
+        
+        # If `num_clusters` is not `None`, check that it is a positive integer
+        # We will assign `num_clusters` its default value (if `None`) and check
+        # its upper bound later, once we know the total number of cells across
+        # all datasets.
+        if num_clusters is not None:
+            check_type(num_clusters, 'num_clusters', int, 'a positive integer')
+            check_bounds(num_clusters, 'num_clusters', 1)
+        
+        # Check that `max_iterations` is `None` or a positive integer; if
+        # `None`, set to `INT32_MAX`
+        if max_iterations is None:
+            max_iterations = 2_147_483_647
+        else:
+            check_type(max_iterations, 'max_iterations', int,
+                       'a positive integer')
+            check_bounds(max_iterations, 'max_iterations', 1)
+        
+        # Check that `num_kmeans_iterations` is a positive integer
+        check_type(num_kmeans_iterations, 'num_kmeans_iterations', int,
+                   'a positive integer')
+        check_bounds(num_kmeans_iterations, 'num_kmeans_iterations', 1)
+        
+        # Check that `num_clustering_iterations` is a positive integer
+        check_type(num_clustering_iterations, 'num_clustering_iterations', int,
+                   'a positive integer')
+        check_bounds(num_clustering_iterations, 'num_clustering_iterations', 1)
+        
+        # Check that `block_proportion` is a number and that
+        # `0 < block_proportion <= 1`
+        check_type(block_proportion, 'block_proportion', (int, float),
+                   'a number greater than zero and less than or equal to 1')
+        check_bounds(block_proportion, 'block_proportion', 0, 1,
+                     left_open=True)
+        
+        # Check that `tolerance` is a positive number, and that `ridge_lambda`
+        # and `sigma `are non-negative numbers. If any is an integer, cast it
+        # to a float.
+        check_type(tolerance, 'tolerance', (int, float),
+                   'a positive number')
+        check_bounds(tolerance, 'tolerance', 0, left_open=True)
+        for parameter, parameter_name in (
+                (ridge_lambda, 'ridge_lambda'), (sigma, 'sigma')):
+            check_type(parameter, parameter_name, (int, float),
+                       'a non-negative number')
+            check_bounds(parameter, parameter_name, 0)
+        tolerance = float(tolerance)
+        ridge_lambda = float(ridge_lambda)
+        sigma = float(sigma)
+        
+        # Check that `kmeans_barbar` is Boolean
+        check_type(kmeans_barbar, 'kmeans_barbar', bool, 'Boolean')
+        
+        # Check that `num_init_iterations` is a positive integer
+        check_type(num_init_iterations, 'num_init_iterations', int,
+                   'a positive integer')
+        check_bounds(num_init_iterations, 'num_init_iterations', 1)
+        
+        # Check that `oversampling_factor` is a positive number
+        check_type(oversampling_factor, 'oversampling_factor', (int, float),
+                   'a positive number')
+        check_bounds(oversampling_factor, 'oversampling_factor', 0,
+                     left_open=True)
+        
+        # If `kmeans_barbar=False`, check that `num_init_iterations` and
+        # `oversampling_factor` have their default values
+        if not kmeans_barbar:
+            if num_init_iterations != 5:
+                error_message = (
+                    'num_init_iterations can only be specified when '
+                    'kmeans_barbar=True')
+                raise ValueError(error_message)
+            if oversampling_factor != 1:
+                error_message = (
+                    'oversampling_factor can only be specified when '
+                    'kmeans_barbar=True')
+                raise ValueError(error_message)
+            
+        # If `chunk_size_kmeans` and/or `chunk_size_Harmony` are not `None`,
+        # check that they are positive integers. We will check their upper
+        # bounds and set their default values (if `None`) later, once we know
+        # the total number of cells across all datasets.
+        for chunk_size, chunk_size_name in \
+                (chunk_size_kmeans, 'chunk_size_kmeans'), \
+                (chunk_size_Harmony, 'chunk_size_Harmony'):
+            if chunk_size is not None:
+                check_type(chunk_size, chunk_size_name, int,
+                           'a positive integer')
+                check_bounds(chunk_size, chunk_size_name, 1)
+        
+        # Check that `seed` is an integer
+        check_type(seed, 'seed', int, 'an integer')
+        
+        # Check that `verbose` is Boolean
+        check_type(verbose, 'verbose', bool, 'Boolean')
+        
+        # Check that `num_threads` is a positive integer, -1 or `None`; if
+        # `None`, set to `self.num_threads`, and if -1, set to `os.cpu_count()`
+        num_threads = self._process_num_threads(num_threads)
+        
+        # Concatenate PCs across datasets; get labels indicating which rows of
+        # these concatenated PCs come from each dataset or batch. Check that
+        # the PCs are float32 and C-contiguous and all have the same width.
+        all_PCs = [dataset._obsm[PC_key] for dataset in datasets]
+        for PCs in all_PCs:
+            dtype = PCs.dtype
+            if dtype != np.float32:
+                error_message = (
+                    f'obsm[{PC_key!r}].dtype is {dtype!r} for at least one '
+                    f'dataset, but must be float32')
+                raise TypeError(error_message)
+            if not PCs.flags['C_CONTIGUOUS']:
+                error_message = (
+                    f'obsm[{PC_key!r}].dtype is not C-contiguous for at least '
+                    f'one dataset; make it C-contiguous with '
+                    f'pipe_obsm_key({PC_key!r}, np.ascontiguousarray)')
+                raise ValueError(error_message)
+        width = all_PCs[0].shape[1]
+        for PCs in all_PCs[1:]:
+            if PCs.shape[1] != width:
+                error_message = (
+                    f"two datasets' PCs have different numbers of dimensions "
+                    f"({width:,} vs {PCs.shape[1]:,}")
+                raise ValueError(error_message)
+        if QC_column is not None:
+            all_PCs = [PCs[QCed] if QCed is not None else PCs
+                       for PCs, QCed in zip(all_PCs, QC_columns_NumPy)]
+        num_cells_per_dataset = np.array(list(map(len, all_PCs)))
+        if batch_column is None:
+            batch_labels = np.repeat(np.arange(len(num_cells_per_dataset),
+                                               dtype=np.uint32),
+                                     num_cells_per_dataset)
+        else:
+            batch_labels = []
+            batch_index = 0
+            for dataset, QC_col, batch_col in \
+                    zip(datasets, QC_columns, batch_columns):
+                if batch_col is not None:
+                    if QC_col is not None:
+                        batch_col = batch_col.filter(QC_col)
+                    if batch_col.dtype in (pl.String, pl.Categorical, pl.Enum):
+                        if batch_col.dtype != pl.Enum:
+                            batch_col = batch_col\
+                                .cast(pl.Enum(batch_col.unique().drop_nulls()))
+                        batch_col = batch_col.to_physical()
+                    batch_labels.append(batch_col.to_numpy() + batch_index)
+                    batch_index += batch_col.n_unique()
+                else:
+                    batch_labels.append(np.full(batch_index,
+                                                len(dataset) if QC_col is None
+                                                else QC_col.sum(),
+                                                dtype=np.float32))
+                    batch_index += 1
+            batch_labels = concatenate(batch_labels, num_threads=num_threads)
+        PCs = concatenate(all_PCs, num_threads=num_threads)
+        num_cells, num_PCs = PCs.shape
+        
+        # If `num_clusters` is `None`, set it to
+        # `min(100, int(num_cells / 30))`. Otherwise, check that it is less
+        # than the total number of cells across all datasets.
+        if num_clusters is None:
+            num_clusters = min(100, int(num_cells / 30))
+        elif num_clusters >= num_cells:
+            error_message = (
+                f'num_clusters is {num_clusters:,}, but must be less than the '
+                f'total number of cells across all datasets ({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # If `chunk_size_kmeans` is `None`, set it to `min(256, num_cells)`.
+        # Otherwise, check that it is less than the total number of cells
+        # across all datasets.
+        if chunk_size_kmeans is None:
+            chunk_size_kmeans = min(256, num_cells)
+        elif chunk_size_kmeans >= num_cells:
+            error_message = (
+                f'chunk_size_kmeans is {chunk_size_kmeans:,}, but must be '
+                f'less than the total number of cells across all datasets '
+                f'({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # If `chunk_size_Harmony` is `None`, set it to `min(512, num_cells)`.
+        # Otherwise, check that it is less than the total number of cells
+        # across all datasets.
+        if chunk_size_Harmony is None:
+            chunk_size_Harmony = min(512, num_cells)
+        elif chunk_size_Harmony >= num_cells:
+            error_message = (
+                f'chunk_size_Harmony is {chunk_size_Harmony:,}, but must be '
+                f'less than the total number of cells across all datasets '
+                f'({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # Define Cython functions
+        cython_functions = cython_inline(_uninitialized_vector_import + r'''
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libcpp.cmath cimport abs, ceil, exp, pow, log, sqrt
+        from libcpp.vector cimport vector
+        from scipy.linalg.cython_blas cimport sgemm
+        
+        ctypedef fused integer:
+            unsigned
+            int
+            long
+        
+        cdef extern from "<utility>" namespace "std" nogil:
+            T swap[T](T &a, T &b)
+        
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+        
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+        
+        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+            cdef unsigned r, threshold = -bound % bound
+            while True:
+                r = rand(state)
+                if r >= threshold:
+                    return r % bound
+        
+        cdef inline void bincount(const integer[::1] arr,
+                                  unsigned[::1] counts,
+                                  const unsigned num_threads) noexcept nogil:
+            cdef unsigned long start, end, i, num_bins, chunk_size, \
+                num_elements = arr.shape[0]
+            cdef unsigned thread_index
+            cdef vector[vector[unsigned]] thread_counts
+            
+            if num_threads == 1:
+                counts[:] = 0
+                for i in range(num_elements):
+                    counts[arr[i]] += 1
+            else:
+                # Store counts for each thread in a temporary buffer, then
+                # aggregate at the end. As an optimization, put the counts for
+                # the last thread (`thread_index == num_threads - 1`) directly
+                # into the final `counts` array.
+                thread_counts.resize(num_threads - 1)
+                num_bins = counts.shape[0]
+                chunk_size = (num_elements + num_threads - 1) / num_threads
+                with nogil, parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    start = thread_index * chunk_size
+                    if thread_index == num_threads - 1:
+                        end = num_elements
+                        counts[:] = 0
+                        for i in range(start, end):
+                            counts[arr[i]] += 1
+                    else:
+                        thread_counts[thread_index].resize(num_bins)
+                        end = start + chunk_size
+                        for i in range(start, end):
+                            thread_counts[thread_index][arr[i]] += 1
+                
+                # Aggregate counts from all threads except the last
+                for thread_index in range(num_threads - 1):
+                    for i in range(num_bins):
+                        counts[i] += thread_counts[thread_index][i]
+        
+        cdef inline void matrix_multiply(const float[:, ::1] A,
+                                         const float[:, ::1] B,
+                                         float[:, ::1] C,
+                                         const bint transpose_A,
+                                         const bint transpose_B,
+                                         const float alpha,
+                                         const float beta) noexcept nogil:
+            # A wrapper for `sgemm()` for the case when all matrices are
+            # C-major. Flip `A` <-> `B`, `shape[0]` <-> `shape[1]`, and both
+            # transpose flags, since BLAS expects Fortran-major.
+            
+            cdef int m, n, k, lda, ldb
+            cdef char transA, transB
+            if transpose_B:
+                m = B.shape[0]
+                k = B.shape[1]
+                lda = k
+                transA = b'T'
+            else:
+                m = B.shape[1]
+                k = B.shape[0]
+                lda = m
+                transA = b'N'
+            if transpose_A:
+                n = A.shape[1]
+                ldb = n
+                transB = b'T'
+            else:
+                n = A.shape[0]
+                ldb = k
+                transB = b'N'
+            sgemm(&transA, &transB, &m, &n, &k, <float*> &alpha,
+                  <float*> &B[0, 0], &lda, <float*> &A[0, 0], &ldb,
+                  <float*> &beta, &C[0, 0], &m)
+        
+        cdef inline void normalize_rows_inplace(float[:, ::1] arr,
+                                                 const unsigned num_threads) \
+                noexcept nogil:
+            cdef unsigned i, j
+            cdef float norm
+            for i in prange(arr.shape[0], num_threads=num_threads):
+                norm = 0
+                for j in range(arr.shape[1]):
+                    norm = norm + arr[i, j] * arr[i, j]
+                norm = 1 / sqrt(norm)
+                for j in range(arr.shape[1]):
+                    arr[i, j] = arr[i, j] * norm
+        
+        def normalize_rows(const float[:, ::1] arr,
+                           float[:, ::1] out,
+                           const unsigned num_threads):
+            cdef unsigned i, j
+            cdef float norm
+            for i in prange(arr.shape[0], nogil=True, num_threads=num_threads):
+                norm = 0
+                for j in range(arr.shape[1]):
+                    norm = norm + arr[i, j] * arr[i, j]
+                norm = 1 / sqrt(norm)
+                for j in range(arr.shape[1]):
+                    out[i, j] = arr[i, j] * norm
+        
+        def harmony(const float[:, ::1] PCs,
+                    float[:, ::1] Z,
+                    float[:, ::1] Y,
+                    const unsigned[::1] batch_labels,
+                    const unsigned max_iterations,
+                    const unsigned num_clustering_iterations,
+                    const float block_proportion,
+                    const float tolerance,
+                    const float ridge_lambda,
+                    const float sigma,
+                    const unsigned chunk_size,
+                    const unsigned long seed,
+                    const bint verbose,
+                    const unsigned num_threads):
+            
+            # The major data structures in the Harmony algorithm are:
+            # - `Z` (cells × PCs): the row-normalized principal components
+            # - `Y` (clusters × PCs): the centroid of each cluster
+            # - `R` (cells × clusters): the soft assignment of each cell to each
+            #   cluster, which has values between 0 and 1 and sums to 1 for each cell
+            # - `O` (batches × clusters): the sum of the `R`s across all cells from
+            #    each batch that are part of each cluster
+            # - `E` (batches × clusters): the expected value of `O` if batches were
+            #   randomly distributed across clusters. For a given batch `i` and cluster
+            #   `j`, this is just `Pr_b[i]` (the fraction of cells in batch `i`) times
+            #   `sum(R[:, j])` (the sum of `R` for that cluster across all batches).
+            #    We define `R_sum = sum(R[:, j])`.
+            # The Harmony paper also refers to ϕ, the one-hot encoded batch labels. We
+            # avoid one-hot encoding for efficiency and just use the raw batch labels.
+            #
+            # We process cells blockwise and then chunkwise within each block. Why both
+            # blocks and chunks? Because `O` and `E` need to be updated by block, so
+            # parallelization has to occur within each block.
+            #
+            # The number of chunks may be slightly less for the last block, so
+            # per-chunk arrays are allocated to have
+            # `max_chunks_per_block = ceil(block_size / chunk_size)` chunks, of which
+            # only the first `num_chunks_per_block` are used for each block.
+            #
+            # Allocate per-thread storage for `Z_chunk` and `distance = Z_chunk @ Y.T`.
+            # Allocate a single buffer for all threads without worrying about false
+            # sharing, since the default `chunk_size` (256) is a multiple of the cache
+            # line size.
+            
+            cdef unsigned i, j, k, thread_index, chunk_index, chunk_start, chunk_end, \
+                iteration, clustering_iteration, block_index, block_start, block_end, \
+                num_chunks_per_block, batch_label, start_row, end_row, \
+                num_cells = Z.shape[0], num_PCs = Z.shape[1], \
+                num_clusters = Y.shape[0], \
+                num_batches = batch_labels[batch_labels.shape[0] - 1] + 1, \
+                num_chunks = (num_cells + chunk_size - 1) / chunk_size, \
+                block_size = <unsigned> ceil(num_cells * block_proportion), \
+                num_blocks = (num_cells + block_size - 1) / block_size, \
+                max_chunks_per_block = (block_size + chunk_size - 1) / chunk_size, \
+                num_cells_per_thread = (num_cells + num_threads - 1) / num_threads
+            cdef unsigned long state = srand(seed)
+            cdef float base, kmeans_error, entropy_term, norm, R_sum, O_sum, \
+                diversity_penalty, prev_objective, total, delta_Eij, delta_Oij, Eij, \
+                Oij, objective, c, c_inv, batch_total, two_over_sigma = 2 / sigma, \
+                exp_neg_two_over_sigma = exp(-two_over_sigma)
+            cdef str iteration_string, metrics
+            cdef uninitialized_vector[unsigned] N_b_buffer, cell_order_buffer
+            cdef uninitialized_vector[float] Pr_b_buffer, factor_buffer, \
+                R_buffer, E_buffer, O_buffer, R_sums_buffer, P_buffer, \
+                P_t_B_inv_buffer, inv_mat_buffer, Phi_t_diag_R_X_t_buffer, W_buffer, \
+                Y_chunk_buffer, Z_chunk_buffer, distance_buffer, delta_O_buffer, \
+                delta_E_buffer, ratio_buffer, kmeans_errors, entropy_terms, \
+                Phi_t_diag_R_X_t_chunk_buffer
+            N_b_buffer.resize(num_batches)
+            cell_order_buffer.resize(num_cells)
+            Pr_b_buffer.resize(num_batches)
+            factor_buffer.resize(num_cells)
+            R_buffer.resize(num_cells * num_clusters)
+            E_buffer.resize(num_batches * num_clusters)
+            O_buffer.resize(num_batches * num_clusters)
+            R_sums_buffer.resize(num_chunks * num_clusters)
+            P_buffer.resize((num_batches + 1) * (num_batches + 1))
+            P_t_B_inv_buffer.resize((num_batches + 1) * (num_batches + 1))
+            inv_mat_buffer.resize((num_batches + 1) * (num_batches + 1))
+            Phi_t_diag_R_X_t_buffer.resize(num_PCs * (num_batches + 1))
+            W_buffer.resize(num_PCs * (num_batches + 1))
+            Y_chunk_buffer.resize(num_chunks * num_clusters * num_PCs)
+            Z_chunk_buffer.resize(num_threads * chunk_size * num_PCs)
+            distance_buffer.resize(num_threads * chunk_size * num_clusters)
+            delta_O_buffer.resize(num_chunks * num_batches * num_clusters)
+            delta_E_buffer.resize(num_chunks * num_batches * num_clusters)
+            ratio_buffer.resize(max_chunks_per_block * num_batches * num_clusters)
+            kmeans_errors.resize(num_chunks)
+            entropy_terms.resize(num_chunks)
+            Phi_t_diag_R_X_t_chunk_buffer.resize(
+                num_chunks * num_PCs * (num_batches + 1))
+            cdef unsigned[::1] \
+                N_b = <unsigned[:num_batches]> N_b_buffer.data(), \
+                cell_order = <unsigned[:num_cells]> cell_order_buffer.data()
+            cdef float[::1] \
+                Pr_b = <float[:num_batches]> Pr_b_buffer.data(), \
+                factor = <float[:num_cells]> factor_buffer.data(), Rk = factor
+            cdef float[:, ::1] R = <float[:num_cells, :num_clusters]> R_buffer.data(), \
+                E = <float[:num_batches, :num_clusters]> E_buffer.data(), \
+                O = <float[:num_batches, :num_clusters]> O_buffer.data(), \
+                R_sums = <float[:num_chunks, :num_clusters]> R_sums_buffer.data(), \
+                P = <float[:num_batches + 1, :num_batches + 1]> P_buffer.data(), \
+                P_t_B_inv = <float[:num_batches + 1, :num_batches + 1]> \
+                    P_t_B_inv_buffer.data(), \
+                inv_mat = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_mat_buffer.data(), \
+                Phi_t_diag_R_X_t = <float[:num_PCs, :num_batches + 1]> \
+                    Phi_t_diag_R_X_t_buffer.data(), \
+                W = <float[:num_batches + 1, :num_PCs]> W_buffer.data()
+            cdef float[:, :, ::1] \
+                Y_chunk = \
+                    <float[:num_chunks, :num_clusters, :num_PCs]> \
+                    Y_chunk_buffer.data(), \
+                Z_chunk = <float[:num_threads, :chunk_size, :num_PCs]> \
+                    Z_chunk_buffer.data(), \
+                distances = <float[:num_threads, :chunk_size, :num_clusters]> \
+                    distance_buffer.data(), \
+                delta_O = <float[:num_chunks, :num_batches, :num_clusters]> \
+                    delta_O_buffer.data(), \
+                delta_E = <float[:num_chunks, :num_batches, :num_clusters]> \
+                    delta_E_buffer.data(), \
+                ratio = <float[:max_chunks_per_block, :num_batches, :num_clusters]> \
+                    ratio_buffer.data(), \
+                Phi_t_diag_R_X_t_chunk = \
+                    <float[:num_chunks, :num_PCs, :num_batches + 1]> \
+                    Phi_t_diag_R_X_t_chunk_buffer.data()
+            
+            with nogil:
+                # Get the number (`N_b`) and fraction (`Pr_b`) of cells in each batch
+                bincount(batch_labels, N_b, num_threads)
+                for i in range(num_batches):
+                    Pr_b[i] = <float> N_b[i] / num_cells
+                N_b_buffer.clear()
+                
+                # Initialize `R`, `R_sum`, and `O` chunkwise
+                with parallel(num_threads=min(num_threads, num_chunks)):
+                    thread_index = threadid()
+                    for chunk_index in prange(num_chunks):
+                        chunk_start = chunk_index * chunk_size
+                        chunk_end = min(chunk_start + chunk_size, num_cells)
+                        matrix_multiply(Z[chunk_start:chunk_end], Y, distances[thread_index],
+                                        transpose_A=False, transpose_B=True, alpha=1,
+                                        beta=0)
+                        kmeans_error = 0
+                        entropy_term = 0
+                        R_sums[chunk_index, :] = 0
+                        delta_O[chunk_index, :, :] = 0
+                        for i in range(chunk_start, chunk_end):
+                            norm = 0
+                            for j in range(num_clusters):
+                                R[i, j] = exp(two_over_sigma *
+                                              (distances[thread_index, i - chunk_start, j] - 1))
+                                norm += R[i, j]
+                            norm = 1 / norm
+                            for j in range(num_clusters):
+                                R[i, j] *= norm
+                                R_sums[chunk_index, j] += R[i, j]
+                                delta_O[chunk_index, batch_labels[i], j] += R[i, j]
+                                kmeans_error = kmeans_error + \
+                                    R[i, j] * (1 - distances[thread_index, i - chunk_start, j])
+                                entropy_term = entropy_term + R[i, j] * log(R[i, j])
+                        kmeans_errors[chunk_index] = kmeans_error
+                        entropy_terms[chunk_index] = entropy_term
+                
+                # Initialize `E`
+                for i in range(num_batches):
+                    for j in range(num_clusters):
+                        R_sum = 0
+                        for chunk_index in range(num_chunks):
+                            R_sum += R_sums[chunk_index, j]
+                        E[i, j] = Pr_b[i] * R_sum
+                
+                # Compute the initial k-means error and entropy term, the first two
+                # components of the objective function
+                kmeans_error = 0
+                entropy_term = 0
+                for chunk_index in range(num_chunks):
+                    kmeans_error += kmeans_errors[chunk_index]
+                    entropy_term += entropy_terms[chunk_index]
+                kmeans_error *= 2
+                entropy_term *= sigma
+                
+                # Initialize `O` and compute the initial diversity penalty, the third
+                # component of the objective function
+                diversity_penalty = 0
+                for i in range(num_batches):
+                    for j in range(num_clusters):
+                        O_sum = 0
+                        for chunk_index in range(num_chunks):
+                            O_sum += delta_O[chunk_index, i, j]
+                        O[i, j] = O_sum
+                        diversity_penalty += \
+                            O_sum * log((O_sum + 1) / (E[i, j] + 1))
+                diversity_penalty *= 2 * sigma
+                
+                # Compute the initial total objective function
+                prev_objective = kmeans_error + entropy_term + diversity_penalty
+                
+                # Normalize each row of `Y` in-place
+                normalize_rows_inplace(Y, num_threads)
+                
+            # Define the random order to iterate over cells in, via the "inside-out"
+            # variant of the Fisher-Yates shuffle
+            for i in range(num_cells):
+                j = randint(i + 1, &state)
+                cell_order[i] = cell_order[j]
+                cell_order[j] = i
+                
+            if verbose:
+                print(f'Initialization is complete: objective = '
+                      f'{prev_objective:.2f}')
+                iteration_string = 'iteration' if max_iterations == 1 else 'iterations'
+            
+            # Check for KeyboardInterrupts
+            PyErr_CheckSignals()
+            
+            # Shrink `R_sums`, `delta_O`, and `delta_E` from `num_chunks` to
+            # `max_chunks_per_block` along their first dimension
+            R_sums_buffer.resize(max_chunks_per_block * num_clusters)
+            delta_O_buffer.resize(max_chunks_per_block * num_batches * num_clusters)
+            delta_E_buffer.resize(max_chunks_per_block * num_batches * num_clusters)
+            R_sums = <float[:max_chunks_per_block, :num_clusters]> R_sums_buffer.data()
+            delta_O = <float[:max_chunks_per_block, :num_batches, :num_clusters]> \
+                delta_O_buffer.data()
+            delta_E = <float[:max_chunks_per_block, :num_batches, :num_clusters]> \
+                delta_E_buffer.data()
+            
+            # Now that initialization is done, start the Harmony iterations
+            with nogil:
+                for iteration in range(max_iterations):
+                    # Perform `num_clustering_iterations` iterations of clustering
+                    # within each Harmony iteration
+                    for clustering_iteration in range(num_clustering_iterations):
+                        # Compute `Y`, the normalized cluster centroids, chunkwise
+                        for chunk_index in prange(num_chunks, num_threads=num_threads):
+                            chunk_start = chunk_index * chunk_size
+                            chunk_end = min(chunk_start + chunk_size, num_cells)
+                            matrix_multiply(R[chunk_start:chunk_end],
+                                            Z[chunk_start:chunk_end], Y_chunk[chunk_index],
+                                            transpose_A=True, transpose_B=False, alpha=1,
+                                            beta=0)
+                        for i in prange(num_clusters, num_threads=num_threads):
+                            norm = 0
+                            for j in range(num_PCs):
+                                total = 0
+                                for chunk_index in range(num_chunks):
+                                    total = total + Y_chunk[chunk_index, i, j]
+                                Y[i, j] = total
+                                norm = norm + total * total
+                            norm = 1 / sqrt(norm)
+                            for j in range(num_PCs):
+                                Y[i, j] *= norm
+
+                        # Process cells blockwise and then chunkwise within each block
+                        for block_index in range(num_blocks):
+                            block_start = block_index * block_size
+                            block_end = min(block_start + block_size, num_cells)
+                            num_chunks_per_block = \
+                                (block_end - block_start + chunk_size - 1) / chunk_size
+                            with parallel(num_threads=min(num_threads, num_chunks_per_block)):
+                                thread_index = threadid()
+                                for chunk_index in prange(num_chunks_per_block):
+                                    chunk_start = chunk_index * chunk_size
+                                    chunk_end = min(chunk_start + chunk_size,
+                                                    block_end - block_start)
+                                    
+                                    # Get the chunk of `Z`, the normalized PCs, to process.
+                                    # Calculate the observed-to-expected ratio
+                                    # `((E + 1) / (O + 1)) ** 2` for this chunk, subtracting
+                                    # the chunk's own contributions to `E` and `O` (stored in
+                                    # `delta_O[chunk_index]` and `delta_E[chunk_index]`).
+                                    #
+                                    # Note: the formula for `R` has the term:
+                                    # `exp(-2 / sigma * (1 - Z @ Y.T))`
+                                    # which expands to:
+                                    # `exp(-2 / sigma) * exp(2 / sigma * Z @ Y.T))`
+                                    # Since `exp(-2 / sigma)` is a constant, we fold it
+                                    # into `ratio`.
+                                    R_sums[chunk_index, :] = 0
+                                    delta_O[chunk_index, :, :] = 0
+                                    for i in range(chunk_end - chunk_start):
+                                        k = cell_order[block_start + chunk_start + i]
+                                        batch_label = batch_labels[k]
+                                        Z_chunk[thread_index, i, :] = Z[k, :]
+                                        for j in range(num_clusters):
+                                            R_sums[chunk_index, j] += R[k, j]
+                                            delta_O[chunk_index, batch_label, j] -= R[k, j]
+                                    for i in range(num_batches):
+                                        for j in range(num_clusters):
+                                            delta_Eij = -Pr_b[i] * R_sums[chunk_index, j]
+                                            delta_Oij = delta_O[chunk_index, i, j]
+                                            Eij = E[i, j] + delta_Eij
+                                            Oij = O[i, j] + delta_Oij
+                                            ratio[chunk_index, i, j] = \
+                                                exp_neg_two_over_sigma * \
+                                                (Eij + 1) / (Oij + 1) * \
+                                                (Eij + 1) / (Oij + 1)
+                                            delta_E[chunk_index, i, j] = delta_Eij
+                                    
+                                    # Update `R`, the fractional soft clustering
+                                    # assignment of each cell to each cluster, for the
+                                    # cells in the chunk. Normalize each row of `R` to
+                                    # ensure it always sums to 1 despite floating-point
+                                    # error. Also, add back this chunk's contributions
+                                    # to `O` and `E` to `delta_O[chunk_index]` and
+                                    # `delta_E[chunk_index]` using the newly-updated
+                                    # `R`. Note: we fold `two_over_sigma` into `distances`
+                                    # during the matrix multiplication to avoid having to
+                                    # multiply by it after the fact.
+                                    matrix_multiply(Z_chunk[thread_index], Y,
+                                                    distances[thread_index],
+                                                    transpose_A=False, transpose_B=True,
+                                                    alpha=two_over_sigma, beta=0)
+                                    R_sums[chunk_index, :] = 0
+                                    for i in range(chunk_end - chunk_start):
+                                        k = cell_order[block_start + chunk_start + i]
+                                        batch_label = batch_labels[k]
+                                        norm = 0
+                                        for j in range(num_clusters):
+                                            R[k, j] = exp(distances[
+                                                thread_index, i, j]) * \
+                                                ratio[chunk_index, batch_label, j]
+                                            norm += R[k, j]
+                                        norm = 1 / norm
+                                        for j in range(num_clusters):
+                                            R[k, j] *= norm
+                                            R_sums[chunk_index, j] += R[k, j]
+                                            delta_O[chunk_index, batch_label, j] += R[k, j]
+                                    for i in range(num_batches):
+                                        for j in range(num_clusters):
+                                            delta_E[chunk_index, i, j] += \
+                                                Pr_b[i] * R_sums[chunk_index, j]
+                            
+                            # Update `O` and `E` for this block with the `delta_E` and
+                            # `delta_O` for each chunk.
+                            for chunk_index in range(num_chunks_per_block):
+                                for i in range(num_batches):
+                                    for j in range(num_clusters):
+                                        E[i, j] += delta_E[chunk_index, i, j]
+                                        O[i, j] += delta_O[chunk_index, i, j]
+                
+                    # Check for KeyboardInterrupts after each clustering iteration
+                    with gil:
+                        PyErr_CheckSignals()
+                
+                    # Compute the objective function. Compute its first two components
+                    # chunkwise: the k-means error and entropy term.
+                    with parallel(num_threads=min(num_threads, num_chunks)):
+                        thread_index = threadid()
+                        for chunk_index in prange(num_chunks):
+                            chunk_start = chunk_index * chunk_size
+                            chunk_end = min(chunk_start + chunk_size, num_cells)
+                            matrix_multiply(Z[chunk_start:chunk_end], Y,
+                                            distances[thread_index], transpose_A=False,
+                                            transpose_B=True, alpha=1, beta=0)
+                            kmeans_error = 0
+                            entropy_term = 0
+                            for i in range(chunk_start, chunk_end):
+                                for j in range(num_clusters):
+                                    kmeans_error = kmeans_error + \
+                                        R[i, j] * (1 - distances[
+                                            thread_index, i - chunk_start, j])
+                                    entropy_term = entropy_term + R[i, j] * log(R[i, j])
+                            kmeans_errors[chunk_index] = kmeans_error
+                            entropy_terms[chunk_index] = entropy_term
+                    kmeans_error = 0
+                    entropy_term = 0
+                    for chunk_index in range(num_chunks):
+                        kmeans_error += kmeans_errors[chunk_index]
+                        entropy_term += entropy_terms[chunk_index]
+                    kmeans_error *= 2
+                    entropy_term *= sigma
+    
+                    # Compute the diversity penalty, the third component of the
+                    # objective function
+                    diversity_penalty = 0
+                    for i in range(num_batches):
+                        for j in range(num_clusters):
+                            diversity_penalty += \
+                                O[i, j] * log((O[i, j] + 1) / (E[i, j] + 1))
+                    diversity_penalty *= 2 * sigma
+                    
+                    # Compute the total objective function
+                    objective = kmeans_error + entropy_term + diversity_penalty
+                    
+                    # Apply the Harmony correction to the PCs to get the new
+                    # Harmony embeddings, `Z`
+                    
+                    # Initialize `Z` to `PCs`
+                    with parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        start_row = thread_index * num_cells_per_thread
+                        end_row = min(start_row + num_cells_per_thread, num_cells)
+                        Z[start_row:end_row] = PCs[start_row:end_row]
+                    
+                    # Initialize `P` to the identity matrix
+                    P[:] = 0
+                    for i in range(num_batches + 1):
+                        P[i, i] = 1
+                
+                    for k in range(num_clusters):
+                        # Compute `factor`, `c_inv` and `P`
+                        c = 0
+                        for i in range(num_batches):
+                            factor[i] = 1 / (O[i, k] + ridge_lambda)
+                            c += O[i, k] * (1 - factor[i] * O[i, k])
+                            P[num_batches, i] = -factor[i] * O[i, k]
+                        c_inv = 1 / c
+                        
+                        # Compute `P_t_B_inv`
+                        P_t_B_inv[:] = 0
+                        P_t_B_inv[num_batches, num_batches] = c_inv
+                        for i in range(num_batches):
+                            P_t_B_inv[i, i] = factor[i]
+                            P_t_B_inv[i, num_batches] = P[num_batches, i] * c_inv
+                        
+                        # Cache `R[:, k]` to avoid strided access
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            start_row = thread_index * num_cells_per_thread
+                            end_row = min(start_row + num_cells_per_thread, num_cells)
+                            for i in range(start_row, end_row):
+                                Rk[i] = R[i, k]
+                        
+                        # Compute `Phi_t_diag_R_X_t = (Phi_t_diag_R @ X).T` in chunks
+                        for chunk_index in prange(num_chunks, num_threads=num_threads):
+                            start_row = chunk_index * chunk_size
+                            end_row = min(start_row + chunk_size, num_cells)
+                            Phi_t_diag_R_X_t_chunk[chunk_index, :, :] = 0
+                            for i in range(start_row, end_row):
+                                batch_label = batch_labels[i]
+                                for j in range(num_PCs):
+                                    Phi_t_diag_R_X_t_chunk[
+                                        chunk_index, j, batch_label] += PCs[i, j] * Rk[i]
+                        
+                        # Compute `inv_mat`
+                        matrix_multiply(P_t_B_inv, P, inv_mat, transpose_A=False,
+                                        transpose_B=False, alpha=1, beta=0)
+                        
+                        # Compute `R`-scaled PCs in chunks
+                        for j in prange(num_PCs, num_threads=num_threads):
+                            total = 0
+                            for batch_label in range(num_batches):
+                                batch_total = 0
+                                for chunk_index in range(num_chunks):
+                                    batch_total = batch_total + Phi_t_diag_R_X_t_chunk[
+                                        chunk_index, j, batch_label]
+                                Phi_t_diag_R_X_t[j, batch_label] = batch_total
+                                total = total + batch_total
+                            Phi_t_diag_R_X_t[j, num_batches] = total
+                        
+                        # Compute `W`
+                        matrix_multiply(inv_mat, Phi_t_diag_R_X_t, W,
+                                        transpose_A=False, transpose_B=True,
+                                        alpha=1, beta=0)
+                        
+                        # Update `Z`
+                        for i in prange(num_cells, num_threads=num_threads):
+                            batch_label = batch_labels[i]
+                            for j in range(num_PCs):
+                                Z[i, j] -= W[batch_label, j] * Rk[i]
+                    
+                    with gil:
+                        if verbose:
+                            metrics = (
+                                f'objective = {objective:.2f} (k-means error = '
+                                f'{kmeans_error:.2f}, entropy term = {entropy_term:.2f}, '
+                                f'diversity penalty = {diversity_penalty:.2f})')
+                            if max_iterations == 2_147_483_647:
+                                print(f'Completed {iteration + 1:,} {iteration_string}: {metrics}')
+                            else:
+                                print(f'Completed {iteration + 1:,} of {max_iterations:,} '
+                                      f'iterations: {metrics}')
+                        
+                        # If Harmony converged, return
+                        if prev_objective - objective < tolerance * abs(prev_objective):
+                            if verbose:
+                                print(f'Reached convergence after {iteration + 1:,} '
+                                      f'{iteration_string}')
+                            return
+                        prev_objective = objective
+                    
+                        # Check for KeyboardInterrupts
+                        PyErr_CheckSignals()
+                    
+                    # Normalize each row of `Z` in-place
+                    normalize_rows_inplace(Z, num_threads)
+                
+            if verbose:
+                print(f'Failed to converge after {max_iterations:,} '
+                      f'{iteration_string}')
+        ''')
+        normalize_rows = cython_functions['normalize_rows']
+        harmony = cython_functions['harmony']
+        
+        # Get `Z`, the row-normalized PCs
+        Z = np.empty((num_cells, num_PCs), dtype=np.float32)
+        normalize_rows(arr=PCs, out=Z, num_threads=num_threads)
+        
+        # Run k-means clustering on `Z`. Since `Y` and `Y_new` are swapped
+        # every iteration, `Y_new` will contain the final `Y` when doing an odd
+        # number of k-means iterations; if so, swap them at the end.
+        Y = np.empty((num_clusters, num_PCs), dtype=np.float32)
+        Y_new = np.empty((num_clusters, num_PCs), dtype=np.float32)
+        with threadpool_limits(1, user_api='blas'):
+            kmeans = _kmeans_and_knn_functions['kmeans']
+            kmeans(X=Z, cluster_labels=np.empty(num_cells, dtype=np.uint32),
+                   centroids=Y, centroids_new=Y_new,
+                   num_cells_per_cluster=np.empty(num_clusters,
+                                                  dtype=np.uint32),
+                   kmeans_barbar=kmeans_barbar,
+                   num_init_iterations=num_init_iterations,
+                   oversampling_factor=oversampling_factor,
+                   num_kmeans_iterations=num_kmeans_iterations, seed=seed,
+                   chunk_size=chunk_size_kmeans, num_threads=num_threads)
+        if num_kmeans_iterations & 1:
+            Y = Y_new
+        del Y_new
+        
+        # Run Harmony. Unlike above, here we need to use single-threaded matrix
+        # multiplication to ensure consistent floating-point roundoff.
+        with threadpool_limits(1, user_api='blas'):
+            harmony(PCs=PCs, Z=Z, Y=Y, batch_labels=batch_labels,
+                    max_iterations=max_iterations,
+                    num_clustering_iterations=num_clustering_iterations,
+                    block_proportion=block_proportion, tolerance=tolerance,
+                    ridge_lambda=ridge_lambda, sigma=sigma,
+                    chunk_size=chunk_size_Harmony, seed=seed,
+                    verbose=verbose, num_threads=num_threads)
+        
+        del batch_labels, PCs, Y
+        
+        # Store each dataset's Harmony embedding in its obsm
+        for dataset_index, (dataset, QC_col, num_cells, end_index) in \
+                enumerate(zip(datasets, QC_columns_NumPy,
+                              num_cells_per_dataset,
+                              num_cells_per_dataset.cumsum())):
+            start_index = end_index - num_cells
+            dataset_Harmony_embedding = Z[start_index:end_index]
+            # If `QC_col` is not `None` for this dataset, back-project from
+            # QCed cells to all cells, filling with `NaN`
+            if QC_col is not None:
+                dataset_Harmony_embedding_QCed = dataset_Harmony_embedding
+                dataset_Harmony_embedding = np.full(
+                    (len(dataset), dataset_Harmony_embedding_QCed.shape[1]),
+                    np.nan, dtype=np.float32)
+                # noinspection PyUnboundLocalVariable
+                dataset_Harmony_embedding[QC_col] = \
+                    dataset_Harmony_embedding_QCed
+            datasets[dataset_index] = SingleCell(
+                X=dataset._X, obs=dataset._obs, var=dataset._var,
+                obsm=dataset._obsm | {Harmony_key: dataset_Harmony_embedding},
+                varm=self._varm, uns=self._uns, num_threads=self._num_threads)
+        return tuple(datasets) if others else datasets[0]
+        
+    def harmonize(self,
+                  *others: SingleCell,
+                  QC_column: SingleCellColumn | None |
+                             Sequence[SingleCellColumn | None] = 'passed_QC',
+                  batch_column: SingleCellColumn | None |
+                                Sequence[SingleCellColumn | None] = None,
+                  PC_key: str = 'PCs',
+                  Harmony_key: str = 'Harmony_PCs',
+                  num_clusters: int | np.integer | None = None,
+                  max_iterations: int | np.integer = 10,
+                  num_kmeans_iterations: int | np.integer = 25,
+                  max_clustering_iterations: int | np.integer = 5,
+                  block_proportion: int | float | np.integer |
+                                    np.floating = 0.05,
+                  tolerance: int | float | np.integer | np.floating = 0.01,
+                  early_stopping: bool = False,
+                  clustering_tolerance: int | float | np.integer |
+                                        np.floating = 0.001,
+                  alpha: float | np.floating = 0.2,
+                  sigma: int | float | np.integer | np.floating = 0.1,
+                  kmeans_barbar: bool = False,
+                  num_init_iterations: int | np.integer = 5,
+                  oversampling_factor: int | np.integer | float |
+                                       np.floating = 1,
+                  chunk_size_kmeans: int | np.integer | None = None,
+                  chunk_size_Harmony: int | np.integer | None = None,
+                  seed: int | np.integer = 0,
+                  original: bool = False,
+                  overwrite: bool = False,
+                  verbose: bool = True,
+                  num_threads: int | np.integer | None = None) -> \
+            SingleCell | tuple[SingleCell, ...]:
+        """
+        Harmonize this SingleCell dataset with other datasets, using Harmony
+        (nature.com/articles/s41592-019-0619-0).
+        
+        Harmony was originally written in R (github.com/immunogenomics/harmony)
+        but has two Python ports, harmony-pytorch
+        (github.com/lilab-bcb/harmony-pytorch) and harmonypy
+        (github.com/slowkow/harmonypy).
+        
+        Our implementation differs from the original in three key ways:
+        
+        First, we parallelize Harmony via an innovative nested block strategy.
+        The original algorithm partitions cells randomly into blocks, each
+        containing a fixed fraction (`block_proportion`, 5% by default) of the
+        total cells. It iterates over each block, subtracting the contribution
+        of the cells in the block to the observed and expected cluster-batch
+        co-occurence matrices `O` and `E`, re-calculating the soft-clustering
+        assignments `R` based on the residual `O` and `E`, then adding back the
+        contribution of the cells in the block to `O` and `E` based on the new
+        `R`. This approach resists straightforward parallelization because 
+        updates to `R` for future blocks depend on updates to `O` and `E` from
+        previous blocks, leading to convergence failure if naively
+        parallelized. Instead, we parallelize within blocks by dividing them
+        into chunks of `chunk_size` cells (256 by default). We process each
+        chunk in parallel, subtracting only the `O` and `E` contributions of
+        the chunk itself, updating `R` for the chunk, and, after and, after
+        processing all chunks in the block, add back the `O` and `E`
+        contributions for all chunks based on the updated `R`. Updating `O` and
+        `E` at the end of each block (rather than after processing every cell
+        in the dataset) ensures convergence, while the inner chunking enables
+        parallelization without disrupting convergence. The original
+        algorithm's chunkless strategy for updating `R`, `O`, and `E`, which is
+        faster for single-threaded execution, can be re-enabled with
+        `original=True, num_threads=1`.
+        
+        Second, we reduce the default number of clustering iterations
+        (Harmony's inner loop) from 20 to 5, but always complete all 5
+        iterations without early stopping based on convergence. In practice,
+        the largest changes to the Harmony objective function result from
+        updating the PCs (outer loop), not updating the soft-clustering
+        assignments (inner loop). Our implementation makes updating the PCs
+        sufficiently fast that there are rapidly diminishing returns from
+        performing lots of clustering updates, versus just skipping directly to
+        updating the PCs after a few clustering iterations. By skipping
+        convergence checks, we reduce the number of objective function
+        evaluations (which are expensive) from once per inner iteration to once
+        per outer iteration. The old default of 20 iterations with early
+        stopping can be re-enabled with
+        `early_stopping=True, max_clustering_iterations=20`.
+        
+        Third, we adopt harmony-pytorch's 'fast' correction, which removes
+        batch-specific variation from PCs more efficiently than the original
+        Harmony implementation. We combine this with the original Harmony
+        implementation's automated selection of the regularization parameter
+        for the correction step (see the `alpha` parameter), which was
+        introduced in Harmony version 1.2.0 and is not present in either Python
+        port.
+  
+        Args:
+            others: the other SingleCell datasets to harmonize this one with
+            QC_column: an optional Boolean column of `obs` indicating which
+                       cells passed QC. Can be a column name, a polars
+                       expression, a polars Series, a 1D NumPy array, or a
+                       function that takes in this SingleCell dataset and
+                       returns a polars Series or 1D NumPy array. Set to `None`
+                       to include all cells. Cells failing QC will be ignored
+                       and have their Harmony embeddings set to `NaN`. When
+                       `others` is specified, `QC_column` can be a
+                       length-`1 + len(others)` sequence of columns,
+                       expressions, Series, functions, or `None` for each
+                       dataset (for `self`, followed by each dataset in
+                       `others`).
+            batch_column: an optional String, Enum, Categorical, or integer
+                          column of `obs` indicating which batch each cell is
+                          from. Can be a column name, a polars expression, a
+                          polars Series, a 1D NumPy array, or a function that
+                          takes in this SingleCell dataset and returns a polars
+                          Series or 1D NumPy array. Each batch will be treated
+                          as if it were a distinct dataset; this is exactly
+                          equivalent to splitting the dataset with
+                          `split_by(batch_column)` and then passing each of the
+                          resulting datasets to `harmonize()`. Set to `None` to
+                          treat each dataset as having a single batch. When
+                          `others` is specified, `batch_column` may be a
+                          length-`1 + len(others)` sequence of columns,
+                          expressions, Series, functions, or `None` for each
+                          dataset (for `self`, followed by each dataset in
+                          `others`).
+            PC_key: the key of `obsm` containing the principal components
+                    calculated with `PCA()`, to use as the input to Harmony
+            Harmony_key: the key of `obsm` where the Harmony embeddings will be
+                         stored; will be added in-place to both `self` and each
+                         of the datasets in `others`!
+            num_clusters: the number of clusters used in the Harmony algorithm,
+                          including in the initial k-means clustering. If not
+                          specified, use 100 clusters if ≥3000 cells, 1 cluster
+                          if ≤30 cells, and `round(num_cells / 30)` if between
+                          30 and 3000 cells.
+            max_iterations: the maximum number of iterations to run Harmony 
+                            for, if convergence is not achieved. Defaults to 
+                            10, like the original Harmony R package, 
+                            harmony-pytorch, and harmonypy. Set to `None` to 
+                            use as many iterations as necessary to achieve
+                            convergence.
+            num_kmeans_iterations: the number of iterations of k-means
+                                   clustering to run, as the first step of
+                                   Harmony. Defaults to 25, like the original
+                                   Harmony R package, harmony-pytorch, and
+                                   harmonypy. However, unlike these packages,
+                                   only one initialization is tried rather than
+                                   10 to reduce runtime.
+            max_clustering_iterations: the number of iterations to run the
+                                       clustering step within each Harmony
+                                       iteration for, or the maximum number of
+                                       iterations if `early_stopping=True`.
+                                       Unlike the original Harmony algorithm,
+                                       convergence of the clustering is not
+                                       checked unless `early_stopping=True`.
+                                       Defaults to 5 iterations; this differs
+                                       from the 20 used by the original harmony
+                                       R package and harmonypy and the 200
+                                       iterations used by harmony-pytorch,
+                                       which do have convergence checks.
+                                       Must be 4 or more when
+                                       `early_stopping=True`, since Harmony's
+                                       clustering convergence check requires
+                                       knowing the errors from the past 3
+                                       iterations.
+            block_proportion: the proportion of cells to use in each batch
+                              update in the clustering step; must be greater
+                              than zero and less than or equal to 1
+            tolerance: the relative tolerance used to determine whether to stop 
+                       optimizing the Harmony embeddings before
+                       `max_iterations` iterations
+            early_stopping: whether to stop clustering before
+                            `max_clustering_iterations` iterations if
+                            convergence is reached, like in the original
+                            Harmony algorithm
+            clustering_tolerance: the relative tolerance used to determine
+                                  whether to stop clustering before
+                                  `max_clustering_iterations` iterations. Only
+                                  used when `early_stopping=True`.
+            alpha: the scaling factor for the ridge regression penalty used
+                   when correcting the principal components to get the Harmony
+                   embeddings; must be greater than 0 and less than 1. The
+                   ridge penalty `lambda` is determined by `alpha` and the
+                   expected number of cells, assuming independence between
+                   batches and clusters:
+                   `lambda = alpha * expected number of cells`.
+            sigma: the weight of the entropy term in the Harmony objective
+                   function; must be non-negative
+            kmeans_barbar: whether to use k-means|| initialization (a parallel
+                           version of k-means++ from arxiv.org/abs/1203.6402)
+                           to initialize the k-means clustering centroids,
+                           instead of random initialization
+            num_init_iterations: the number of k-means|| iterations used to
+                                 initialize the k-means clustering that
+                                 constitutes the first step of Harmony.
+                                 k-means|| is a parallel version of the
+                                 widely used k-means++ initialization scheme
+                                 for k-means clustering. The default value of 5
+                                 is recommended by the k-means|| paper
+                                 (arxiv.org/abs/1203.6402). Only used when
+                                 `kmeans_barbar=True`.
+            oversampling_factor: the number of candidate centroids selected, on
+                                 average, at each of the `num_init_iterations`
+                                 iterations of k-means||, as a multiple of
+                                 `num_clusters`. The default value of 1 is the
+                                 midpoint (in log space) of the values explored
+                                 by the k-means|| paper
+                                 (arxiv.org/abs/1203.6402), namely 0.1 to 10.
+                                 The total number of candidate centroids
+                                 selected, on average, will be
+                                 `oversampling_factor * num_clusters + 1`, from
+                                 which the final `num_clusters` centroids will
+                                 then be selected via k-means++. Only used when
+                                 `kmeans_barbar=True`.
+            chunk_size_kmeans: the chunk size to use for distance calculations 
+                               in the initial k-means clustering. Setting this 
+                               to a power of 2 is recommended; 256 was found to 
+                               be the optimal chunk size by scikit-learn and in
+                               our tests. Defaults to
+                               `min(256, total number of cells)`.
+            chunk_size_Harmony: the chunk size to use for Harmony. Setting this 
+                                to a power of 2 is recommended; 512 was found 
+                                to be the optimal chunk size in our tests. 
+                                Defaults to `min(512, total number of cells)`.
+                                Not used when `original=True`.
+            seed: the random seed to use for the initial k-means clustering
+            original: if `True`, use the original Harmony algorithm's blocking
+                      strategy, rather than our nested chunks-within-blocks
+                      strategy. `original=True` requires `num_threads=1`. This
+                      gives lower memory usage and closer correspondence to the
+                      original algorithm, at the cost of a) a moderate
+                      (~20-25%) degradation in performance and b) no longer
+                      matching the Harmony embeddings produced by the
+                      multithreaded version. If `True`, exactly match the
+                      results of the multithreaded version when
+                      `num_threads=1`. Must be `False` unless `num_threads=1`.
+            overwrite: if `True`, overwrite `Harmony_key` if already present in
+                       obsm, instead of raising an error
+            verbose: whether to print details of the harmonization process
+            num_threads: the number of threads to use when concatenating
+                         principal components and batch/dataset labels across
+                         datasets, for the initial k-means clustering, and for
+                         the matrix and matrix-vector multiplications within
+                         Harmony. Set `num_threads=-1` to use all available
+                         cores, as determined by `os.cpu_count()`, or leave
+                         unset to use `self.num_threads` cores. Does not affect
+                         the returned SingleCell dataset's `num_threads`; this
+                         will always be the same as the original dataset's
+                         `num_threads`.
+        
+        Returns:
+            A length-`1 + len(others)` tuple of SingleCell datasets with the
+            Harmony embeddings stored in `obsm[Harmony_key]`: `self`, followed
+            by each dataset in `others`.
+        """
+        # If `others` was specified, check that all elements of `others` are
+        # SingleCell datasets
+        if not others:
+            error_message = 'others cannot be empty'
+            raise ValueError(error_message)
+        check_types(others, 'others', SingleCell, 'SingleCell datasets')
+        datasets = [self] + list(others)
+        
+        # Check that `Harmony_key` is a string
+        check_type(Harmony_key, 'Harmony_key', str, 'a string')
+        
+        # Check that `overwrite` is Boolean
+        check_type(overwrite, 'overwrite', bool, 'Boolean')
+        
+        # Check that `Harmony_key` is not already in `obsm` for any dataset,
+        # unless `overwrite=True`
+        if not overwrite and \
+                any(Harmony_key in dataset._obsm for dataset in datasets):
+            error_message = (
+                f'Harmony_key {Harmony_key!r} is already a key of obsm for at '
+                f'least one dataset; did you already run harmonize()? Set '
+                f'overwrite=True to overwrite.')
+            raise ValueError(error_message)
+        
+        # Get `QC_column` and `batch_column` from every dataset, if not None
+        QC_columns = SingleCell._get_columns(
+            'obs', datasets, QC_column, 'QC_column', pl.Boolean,
+            allow_missing=True)
+        QC_columns_NumPy = [QC_col.to_numpy() if QC_col is not None else None
+                            for QC_col in QC_columns]
+        batch_columns = SingleCell._get_columns(
+            'obs', datasets, batch_column, 'batch_column',
+            (pl.String, pl.Categorical, pl.Enum, 'integer'),
+            QC_columns=QC_columns)
+        
+        # Check that `PC_key` is a key of `obsm` for every dataset
+        check_type(PC_key, 'PC_key', str, 'a string')
+        if not all(PC_key in dataset._obsm for dataset in datasets):
+            error_message = (
+                f'PC_key {PC_key!r} is not a column of obs for at least one '
+                f'dataset; did you forget to run PCA() before harmonize()?')
+            raise ValueError(error_message)
+        
+        # If `num_clusters` is not `None`, check that it is a positive integer
+        # We will assign `num_clusters` its default value (if `None`) and check
+        # its upper bound later, once we know the total number of cells across
+        # all datasets.
+        if num_clusters is not None:
+            check_type(num_clusters, 'num_clusters', int, 'a positive integer')
+            check_bounds(num_clusters, 'num_clusters', 1)
+        
+        # Check that `max_iterations` is `None` or a positive integer; if 
+        # `None`, set to `INT32_MAX`
+        if max_iterations is None:
+            max_iterations = 2_147_483_647
+        else:
+            check_type(max_iterations, 'max_iterations', int, 
+                       'a positive integer')
+            check_bounds(max_iterations, 'max_iterations', 1)
+        
+        # Check that `num_kmeans_iterations` is a positive integer
+        check_type(num_kmeans_iterations, 'num_kmeans_iterations', int,
+                   'a positive integer')
+        check_bounds(num_kmeans_iterations, 'num_kmeans_iterations', 1)
+            
+        # Check that `max_clustering_iterations` is a positive integer
+        check_type(max_clustering_iterations, 'max_clustering_iterations', int,
+                   'a positive integer')
+        check_bounds(max_clustering_iterations, 'max_clustering_iterations', 1)
+        
+        # Check that `block_proportion` is a number and that
+        # `0 < block_proportion <= 1`
+        check_type(block_proportion, 'block_proportion', (int, float),
+                   'a number greater than zero and less than or equal to 1')
+        check_bounds(block_proportion, 'block_proportion', 0, 1,
+                     left_open=True)
+        
+        # Check that `tolerance` is a positive number; if an integer, cast it
+        # to a float
+        check_type(tolerance, 'tolerance', (int, float), 'a positive number')
+        check_bounds(tolerance, 'tolerance', 0, left_open=True)
+        tolerance = float(tolerance)
+        
+        # Check that `early_stopping` is Boolean
+        check_type(early_stopping, 'early_stopping', bool, 'Boolean')
+        
+        # Check that `clustering_tolerance` is a positive number; if an
+        # integer, cast it to a float
+        check_type(clustering_tolerance, 'clustering_tolerance', (int, float),
+                   'a positive number')
+        check_bounds(clustering_tolerance, 'clustering_tolerance', 0,
+                     left_open=True)
+        clustering_tolerance = float(clustering_tolerance)
+        
+        # If `early_stopping=False`, check that `clustering_tolerance` has its
+        # default value
+        if not early_stopping:
+            if clustering_tolerance != 0.001:
+                error_message = (
+                    'clustering_tolerance can only be specified when '
+                    'early_stopping=True')
+                raise ValueError(error_message)
+        
+        # Check that `alpha` is greater than 0 and less than 1
+        check_type(alpha, 'alpha', float,
+                   'a number greater than 0 and less than 1')
+        check_bounds(alpha, 'alpha', 0, 1, left_open=True, right_open=True)
+        
+        # Check that `sigma` is a non-negative number; if an integer, cast it
+        # to a float
+        check_type(sigma, 'sigma', (int, float), 'a non-negative number')
+        check_bounds(sigma, 'sigma', 0)
+        sigma = float(sigma)
+        
+        # Check that `kmeans_barbar` is Boolean
+        check_type(kmeans_barbar, 'kmeans_barbar', bool, 'Boolean')
+        
+        # Check that `num_init_iterations` is a positive integer
+        check_type(num_init_iterations, 'num_init_iterations', int,
+                   'a positive integer')
+        check_bounds(num_init_iterations, 'num_init_iterations', 1)
+        
+        # Check that `oversampling_factor` is a positive number
+        check_type(oversampling_factor, 'oversampling_factor', (int, float),
+                   'a positive number')
+        check_bounds(oversampling_factor, 'oversampling_factor', 0,
+                     left_open=True)
+        
+        # If `kmeans_barbar=False`, check that `num_init_iterations` and
+        # `oversampling_factor` have their default values
+        if not kmeans_barbar:
+            if num_init_iterations != 5:
+                error_message = (
+                    'num_init_iterations can only be specified when '
+                    'kmeans_barbar=True')
+                raise ValueError(error_message)
+            if oversampling_factor != 1:
+                error_message = (
+                    'oversampling_factor can only be specified when '
+                    'kmeans_barbar=True')
+                raise ValueError(error_message)
+            
+        # If `chunk_size_kmeans` and/or `chunk_size_Harmony` are not `None`, 
+        # check that they are positive integers. We will check their upper 
+        # bounds and set their default values (if `None`) later, once we know 
+        # the total number of cells across all datasets.
+        for chunk_size, chunk_size_name in \
+                (chunk_size_kmeans, 'chunk_size_kmeans'), \
+                (chunk_size_Harmony, 'chunk_size_Harmony'):
+            if chunk_size is not None:
+                check_type(chunk_size, chunk_size_name, int, 
+                           'a positive integer')
+                check_bounds(chunk_size, chunk_size_name, 1)
+        
+        # Check that `seed` is an integer
+        check_type(seed, 'seed', int, 'an integer')
+        
+        # Check that `verbose` is Boolean
+        check_type(verbose, 'verbose', bool, 'Boolean')
+        
+        # Check that `num_threads` is a positive integer, -1 or `None`; if
+        # `None`, set to `self.num_threads`, and if -1, set to `os.cpu_count()`
+        num_threads = self._process_num_threads(num_threads)
+        
+        # Check that `original` is Boolean, and `False` unless `num_threads=1`
+        check_type(original, 'original', bool, 'Boolean')
+        if original and num_threads != 1:
+            error_message = 'original must be False unless num_threads is 1'
+            raise ValueError(error_message)
+        
+        # Concatenate PCs across datasets; get labels indicating which rows of
+        # these concatenated PCs come from each dataset or batch. Check that
+        # the PCs are float32 and C-contiguous and all have the same width.
+        all_PCs = [dataset._obsm[PC_key] for dataset in datasets]
+        for PCs in all_PCs:
+            dtype = PCs.dtype
+            if dtype != np.float32:
+                error_message = (
+                    f'obsm[{PC_key!r}].dtype is {dtype!r} for at least one '
+                    f'dataset, but must be float32')
+                raise TypeError(error_message)
+            if not PCs.flags['C_CONTIGUOUS']:
+                error_message = (
+                    f'obsm[{PC_key!r}].dtype is not C-contiguous for at least '
+                    f'one dataset; make it C-contiguous with '
+                    f'pipe_obsm_key({PC_key!r}, np.ascontiguousarray)')
+                raise ValueError(error_message)
+        width = all_PCs[0].shape[1]
+        for PCs in all_PCs[1:]:
+            if PCs.shape[1] != width:
+                error_message = (
+                    f"two datasets' PCs have different numbers of dimensions "
+                    f"({width:,} vs {PCs.shape[1]:,}")
+                raise ValueError(error_message)
+        if QC_column is not None:
+            all_PCs = [PCs[QCed] if QCed is not None else PCs
+                       for PCs, QCed in zip(all_PCs, QC_columns_NumPy)]
+        num_cells_per_dataset = np.array(list(map(len, all_PCs)))
+        if batch_column is None:
+            batch_labels = np.repeat(np.arange(len(num_cells_per_dataset),
+                                               dtype=np.uint32),
+                                     num_cells_per_dataset)
+        else:
+            batch_labels = []
+            batch_index = 0
+            for dataset, QC_col, batch_col in \
+                    zip(datasets, QC_columns, batch_columns):
+                if batch_col is not None:
+                    if QC_col is not None:
+                        batch_col = batch_col.filter(QC_col)
+                    if batch_col.dtype in (pl.String, pl.Categorical, pl.Enum):
+                        if batch_col.dtype != pl.Enum:
+                            batch_col = batch_col\
+                                .cast(pl.Enum(batch_col.unique().drop_nulls()))
+                        batch_col = batch_col.to_physical()
+                    batch_labels.append(batch_col.to_numpy() + batch_index)
+                    batch_index += batch_col.n_unique()
+                else:
+                    batch_labels.append(np.full(batch_index,
+                                                len(dataset) if QC_col is None
+                                                else QC_col.sum(),
+                                                dtype=np.float32))
+                    batch_index += 1
+            batch_labels = concatenate(batch_labels, num_threads=num_threads)
+        PCs = concatenate(all_PCs, num_threads=num_threads)
+        num_cells, num_PCs = PCs.shape
+        
+        # If `num_clusters` is `None`, set it to `num_cells / 30`, rounded to
+        # the nearest integer and clipped to be between 1 and 100. Otherwise,
+        # check that it is less than the total number of cells across all
+        # datasets.
+        if num_clusters is None:
+            num_clusters = max(min(100, int(round(num_cells / 30))), 1)
+        elif num_clusters >= num_cells:
+            error_message = (
+                f'num_clusters is {num_clusters:,}, but must be less than the '
+                f'total number of cells across all datasets ({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # If `chunk_size_kmeans` is `None`, set it to `min(256, num_cells)`.
+        # Otherwise, check that it is less than the total number of cells
+        # across all datasets.
+        if chunk_size_kmeans is None:
+            chunk_size_kmeans = min(256, num_cells)
+        elif chunk_size_kmeans >= num_cells:
+            error_message = (
+                f'chunk_size_kmeans is {chunk_size_kmeans:,}, but must be '
+                f'less than the total number of cells across all datasets '
+                f'({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # If `chunk_size_Harmony` is `None`, set it to `min(512, num_cells)`.
+        # Otherwise, check that it is less than the total number of cells
+        # across all datasets.
+        if chunk_size_Harmony is None:
+            chunk_size_Harmony = min(512, num_cells)
+        elif chunk_size_Harmony >= num_cells:
+            error_message = (
+                f'chunk_size_Harmony is {chunk_size_Harmony:,}, but must be '
+                f'less than the total number of cells across all datasets '
+                f'({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # Define Cython functions
+        cython_functions = cython_inline(_uninitialized_vector_import + r'''
+        from cpython.exc cimport PyErr_CheckSignals
+        from cython.parallel cimport parallel, prange, threadid
+        from libcpp.cmath cimport abs, ceil, exp, log, sqrt
+        from libcpp.vector cimport vector
+        from scipy.linalg.cython_blas cimport sgemm
+        
+        ctypedef fused integer:
+            unsigned
+            int
+            long
+        
+        cdef extern from "<utility>" namespace "std" nogil:
+            T swap[T](T &a, T &b)
+        
+        cdef inline unsigned rand(unsigned long* state) noexcept nogil:
+            cdef unsigned long x = state[0]
+            state[0] = x * 6364136223846793005UL + 1442695040888963407UL
+            cdef unsigned s = (x ^ (x >> 18)) >> 27
+            cdef unsigned rot = x >> 59
+            return (s >> rot) | (s << ((-rot) & 31))
+        
+        cdef inline unsigned long srand(const unsigned long seed) noexcept nogil:
+            cdef unsigned long state = seed + 1442695040888963407UL
+            rand(&state)
+            return state
+        
+        cdef inline unsigned randint(const unsigned bound, unsigned long* state) noexcept nogil:
+            cdef unsigned r, threshold = -bound % bound
+            while True:
+                r = rand(state)
+                if r >= threshold:
+                    return r % bound
+        
+        cdef inline void bincount(const integer[::1] arr,
+                                  unsigned[::1] counts,
+                                  const unsigned num_threads) noexcept nogil:
+            cdef unsigned long start, end, i, num_bins, chunk_size, \
+                num_elements = arr.shape[0]
+            cdef unsigned thread_index
+            cdef vector[vector[unsigned]] thread_counts
+            
+            if num_threads == 1:
+                counts[:] = 0
+                for i in range(num_elements):
+                    counts[arr[i]] += 1
+            else:
+                # Store counts for each thread in a temporary buffer, then
+                # aggregate at the end. As an optimization, put the counts for
+                # the last thread (`thread_index == num_threads - 1`) directly
+                # into the final `counts` array.
+                thread_counts.resize(num_threads - 1)
+                num_bins = counts.shape[0]
+                chunk_size = (num_elements + num_threads - 1) / num_threads
+                with parallel(num_threads=num_threads):
+                    thread_index = threadid()
+                    start = thread_index * chunk_size
+                    if thread_index == num_threads - 1:
+                        end = num_elements
+                        counts[:] = 0
+                        for i in range(start, end):
+                            counts[arr[i]] += 1
+                    else:
+                        thread_counts[thread_index].resize(num_bins)
+                        end = start + chunk_size
+                        for i in range(start, end):
+                            thread_counts[thread_index][arr[i]] += 1
+                
+                # Aggregate counts from all threads except the last
+                for thread_index in range(num_threads - 1):
+                    for i in range(num_bins):
+                        counts[i] += thread_counts[thread_index][i]
+        
+        cdef inline void matrix_multiply(const float[:, ::1] A,
+                                         const float[:, ::1] B,
+                                         float[:, ::1] C,
+                                         const bint transpose_A,
+                                         const bint transpose_B,
+                                         const float alpha,
+                                         const float beta) noexcept nogil:
+            # A wrapper for `sgemm()` for the case when all matrices are C-major. Flip
+            # `A` <-> `B`, `shape[0]` <-> `shape[1]`, and both transpose flags, since
+            # BLAS expects Fortran-major. Note that `C`'s dimensions are not required
+            # to match `A` and `B`'s (and often don't); `C` is only used for its
+            # address.
+            
+            cdef int m, n, k, lda, ldb
+            cdef char transA, transB
+            if transpose_B:
+                m = B.shape[0]
+                k = B.shape[1]
+                lda = k
+                transA = b'T'
+            else:
+                m = B.shape[1]
+                k = B.shape[0]
+                lda = m
+                transA = b'N'
+            if transpose_A:
+                n = A.shape[1]
+                ldb = n
+                transB = b'T'
+            else:
+                n = A.shape[0]
+                ldb = k
+                transB = b'N'
+            sgemm(&transA, &transB, &m, &n, &k, <float*> &alpha,
+                  <float*> &B[0, 0], &lda, <float*> &A[0, 0], &ldb,
+                  <float*> &beta, &C[0, 0], &m)
+        
+        cdef inline void normalize_rows_inplace(float[:, ::1] arr):
+            cdef unsigned i, j
+            cdef float norm
+            for i in range(arr.shape[0]):
+                norm = 0
+                for j in range(arr.shape[1]):
+                    norm += arr[i, j] * arr[i, j]
+                norm = 1 / sqrt(norm)
+                for j in range(arr.shape[1]):
+                    arr[i, j] = arr[i, j] * norm
+        
+        cdef inline void normalize_rows_inplace_parallel(
+                float[:, ::1] arr,
+                const unsigned num_threads) noexcept nogil:
+            cdef unsigned i, j
+            cdef float norm
+            for i in prange(arr.shape[0], num_threads=num_threads):
+                norm = 0
+                for j in range(arr.shape[1]):
+                    norm = norm + arr[i, j] * arr[i, j]
+                norm = 1 / sqrt(norm)
+                for j in range(arr.shape[1]):
+                    arr[i, j] = arr[i, j] * norm
+        
+        def normalize_rows(const float[:, ::1] arr,
+                           float[:, ::1] out,
+                           const unsigned num_threads):
+            cdef unsigned i, j
+            cdef float norm
+            if num_threads == 1:
+                for i in range(arr.shape[0]):
+                    norm = 0
+                    for j in range(arr.shape[1]):
+                        norm += arr[i, j] * arr[i, j]
+                    norm = 1 / sqrt(norm)
+                    for j in range(arr.shape[1]):
+                        out[i, j] = arr[i, j] * norm
+            else:
+                for i in prange(arr.shape[0], nogil=True, num_threads=num_threads):
+                    norm = 0
+                    for j in range(arr.shape[1]):
+                        norm = norm + arr[i, j] * arr[i, j]
+                    norm = 1 / sqrt(norm)
+                    for j in range(arr.shape[1]):
+                        out[i, j] = arr[i, j] * norm
+
+        def harmony(const float[:, ::1] PCs,
+                    float[:, ::1] Z,
+                    float[:, ::1] Y,
+                    const unsigned[::1] batch_labels,
+                    const unsigned max_iterations,
+                    const unsigned max_clustering_iterations,
+                    const float block_proportion,
+                    const float tolerance,
+                    const bint early_stopping,
+                    const float clustering_tolerance,
+                    const float alpha,
+                    const float sigma,
+                    const unsigned chunk_size,
+                    const unsigned long seed,
+                    const bint verbose,
+                    const unsigned num_threads):
+            
+            # The major data structures in the Harmony algorithm are:
+            # - `Z` (cells × PCs): the row-normalized principal components
+            # - `Y` (clusters × PCs): the centroid of each cluster
+            # - `R` (cells × clusters): the soft assignment of each cell to each
+            #   cluster, which has values between 0 and 1 and sums to 1 for each cell
+            # - `O` (batches × clusters): the cluster-batch co-occurrence matrix, i.e.
+            #    the sum of the `R`s across all cells from each batch that are part of
+            #    each cluster
+            # - `E` (batches × clusters): the expected value of `O` if batches were
+            #   randomly distributed across clusters. For a given batch `i` and cluster
+            #   `j`, this is just `Pr_b[i]` (the fraction of cells in batch `i`) times
+            #   `sum(R[:, j])` (the sum of `R` for that cluster across all batches).
+            #    We define `R_sum = sum(R[:, j])`.
+            # The Harmony paper also refers to ϕ, the one-hot encoded batch labels. We
+            # avoid one-hot encoding for efficiency and just use the raw batch labels.
+            #
+            # We process cells blockwise and then chunkwise within each block. Why both
+            # blocks and chunks? Because `O` and `E` need to be updated by block, so
+            # parallelization has to occur within each block.
+            #
+            # The number of chunks may be slightly less for the last block, so
+            # per-chunk arrays are allocated to have
+            # `max_chunks_per_block = ceil(block_size / chunk_size)` chunks, of which
+            # only the first `num_chunks_per_block` are used for each block.
+            #
+            # Allocate per-thread storage for `Z_chunk` and `distance = Z_chunk @ Y.T`.
+            # Allocate a single buffer for all threads without worrying about false
+            # sharing, since the default `chunk_size` (256) is a multiple of the cache
+            # line size.
+            
+            cdef unsigned i, j, k, thread_index, chunk_index, chunk_start, chunk_end, \
+                iteration, clustering_iteration, block_index, block_start, block_end, \
+                num_chunks_per_block, batch_label, start_row, end_row, \
+                num_cells = Z.shape[0], num_PCs = Z.shape[1], \
+                num_clusters = Y.shape[0], \
+                num_batches = batch_labels[batch_labels.shape[0] - 1] + 1, \
+                num_chunks = (num_cells + chunk_size - 1) / chunk_size, \
+                block_size = <unsigned> ceil(num_cells * block_proportion), \
+                num_blocks = (num_cells + block_size - 1) / block_size, \
+                max_chunks_per_block = (block_size + chunk_size - 1) / chunk_size, \
+                num_cells_per_thread = (num_cells + num_threads - 1) / num_threads
+            cdef unsigned long state = srand(seed)
+            cdef float base, kmeans_error, entropy_term, norm, Rij, R_sum, O_sum, \
+                diversity_penalty, prev_objective, total, delta_Eij, delta_Oij, \
+                Pr_bi, Eij, Oij, Rkj, objective, last_two, old, new, ridge_lambda, \
+                factor, Rki, batch_total, two_over_sigma = 2 / sigma, \
+                exp_neg_two_over_sigma = exp(-two_over_sigma)
+            cdef float past_clustering_objectives[3]
+            cdef str metrics
+            cdef uninitialized_vector[unsigned] N_b_buffer, cell_order_buffer
+            cdef uninitialized_vector[float] Pr_b_buffer, Rk_buffer, \
+                R_buffer, E_buffer, O_buffer, R_sums_buffer, inv_cov_2_buffer, \
+                inv_cov_1_buffer, inv_cov_buffer, R_scaled_PCs_buffer, W_buffer, \
+                Y_chunk_buffer, Z_chunk_buffer, distance_buffer, delta_O_buffer, \
+                delta_E_buffer, ratio_buffer, kmeans_errors, entropy_terms, \
+                R_scaled_PCs_chunk_buffer
+            N_b_buffer.resize(num_batches)
+            cell_order_buffer.resize(num_cells)
+            Pr_b_buffer.resize(num_batches)
+            Rk_buffer.resize(num_cells)
+            R_buffer.resize(num_cells * num_clusters)
+            E_buffer.resize(num_batches * num_clusters)
+            O_buffer.resize(num_batches * num_clusters)
+            R_sums_buffer.resize(num_chunks * num_clusters)
+            inv_cov_2_buffer.resize((num_batches + 1) * (num_batches + 1))
+            inv_cov_1_buffer.resize((num_batches + 1) * (num_batches + 1))
+            inv_cov_buffer.resize((num_batches + 1) * (num_batches + 1))
+            R_scaled_PCs_buffer.resize(num_PCs * (num_batches + 1))
+            W_buffer.resize(num_PCs * (num_batches + 1))
+            Y_chunk_buffer.resize(num_chunks * num_clusters * num_PCs)
+            Z_chunk_buffer.resize(num_threads * chunk_size * num_PCs)
+            distance_buffer.resize(num_threads * chunk_size * num_clusters)
+            delta_O_buffer.resize(num_chunks * num_batches * num_clusters)
+            delta_E_buffer.resize(num_chunks * num_batches * num_clusters)
+            ratio_buffer.resize(max_chunks_per_block * num_batches * num_clusters)
+            kmeans_errors.resize(num_chunks)
+            entropy_terms.resize(num_chunks)
+            R_scaled_PCs_chunk_buffer.resize(
+                num_chunks * num_PCs * (num_batches + 1))
+            cdef unsigned[::1] \
+                N_b = <unsigned[:num_batches]> N_b_buffer.data(), \
+                cell_order = <unsigned[:num_cells]> cell_order_buffer.data()
+            cdef float[::1] \
+                Pr_b = <float[:num_batches]> Pr_b_buffer.data(), \
+                Rk = <float[:num_cells]> Rk_buffer.data()
+            cdef float[:, ::1] \
+                R = <float[:num_cells, :num_clusters]> R_buffer.data(), \
+                E = <float[:num_batches, :num_clusters]> E_buffer.data(), \
+                O = <float[:num_batches, :num_clusters]> O_buffer.data(), \
+                R_sums = <float[:num_chunks, :num_clusters]> R_sums_buffer.data(), \
+                inv_cov_2 = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_cov_2_buffer.data(), \
+                inv_cov_1 = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_cov_1_buffer.data(), \
+                inv_cov = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_cov_buffer.data(), \
+                R_scaled_PCs = <float[:num_PCs, :num_batches + 1]> \
+                    R_scaled_PCs_buffer.data(), \
+                W = <float[:num_batches + 1, :num_PCs]> W_buffer.data()
+            cdef float[:, :, ::1] \
+                Y_chunk = <float[:num_chunks, :num_clusters, :num_PCs]> \
+                    Y_chunk_buffer.data(), \
+                Z_chunk = <float[:num_threads, :chunk_size, :num_PCs]> \
+                    Z_chunk_buffer.data(), \
+                distances = <float[:num_threads, :chunk_size, :num_clusters]> \
+                    distance_buffer.data(), \
+                delta_O = <float[:num_chunks, :num_batches, :num_clusters]> \
+                    delta_O_buffer.data(), \
+                delta_E = <float[:num_chunks, :num_batches, :num_clusters]> \
+                    delta_E_buffer.data(), \
+                ratio = <float[:max_chunks_per_block, :num_batches, :num_clusters]> \
+                    ratio_buffer.data(), \
+                R_scaled_PCs_chunk = \
+                    <float[:num_chunks, :num_PCs, :num_batches + 1]> \
+                    R_scaled_PCs_chunk_buffer.data()
+
+            with nogil:
+                # Get the number (`N_b`) and fraction (`Pr_b`) of cells in each batch
+                bincount(batch_labels, N_b, num_threads)
+                for i in range(num_batches):
+                    Pr_b[i] = <float> N_b[i] / num_cells
+                N_b_buffer.clear()
+                
+                # Initialize `R`, `R_sum`, and `O` chunkwise. Compute the initial
+                # k-means error and entropy term, the first two components of the
+                # objective function, for each chunk.
+                with parallel(num_threads=min(num_threads, num_chunks)):
+                    thread_index = threadid()
+                    for chunk_index in prange(num_chunks):
+                        chunk_start = chunk_index * chunk_size
+                        chunk_end = min(chunk_start + chunk_size, num_cells)
+                        matrix_multiply(Z[chunk_start:chunk_end], Y,
+                                        distances[thread_index], transpose_A=False,
+                                        transpose_B=True, alpha=1, beta=0)
+                        kmeans_error = 0
+                        entropy_term = 0
+                        R_sums[chunk_index, :] = 0
+                        delta_O[chunk_index, :, :] = 0
+                        for i in range(chunk_start, chunk_end):
+                            batch_label = batch_labels[i]
+                            norm = 0
+                            for j in range(num_clusters):
+                                Rij = exp(two_over_sigma * (distances[
+                                    thread_index, i - chunk_start, j] - 1))
+                                R[i, j] = Rij
+                                norm += Rij
+                            norm = 1 / norm
+                            for j in range(num_clusters):
+                                Rij = R[i, j]
+                                Rij = Rij * norm
+                                R[i, j] = Rij
+                                R_sums[chunk_index, j] += Rij
+                                delta_O[chunk_index, batch_label, j] += Rij
+                                kmeans_error = kmeans_error + \
+                                    Rij * (1 - distances[
+                                        thread_index, i - chunk_start, j])
+                                entropy_term = entropy_term + Rij * log(Rij)
+                        kmeans_errors[chunk_index] = kmeans_error
+                        entropy_terms[chunk_index] = entropy_term
+                
+                # Initialize `E`
+                for i in range(num_batches):
+                    for j in range(num_clusters):
+                        R_sum = 0
+                        for chunk_index in range(num_chunks):
+                            R_sum += R_sums[chunk_index, j]
+                        E[i, j] = Pr_b[i] * R_sum
+                
+                # Aggregate the initial k-means error and entropy term across chunks
+                kmeans_error = 0
+                entropy_term = 0
+                for chunk_index in range(num_chunks):
+                    kmeans_error += kmeans_errors[chunk_index]
+                    entropy_term += entropy_terms[chunk_index]
+                kmeans_error *= 2
+                entropy_term *= sigma
+                
+                # Initialize `O` and compute the initial diversity penalty, the third
+                # component of the objective function
+                diversity_penalty = 0
+                for i in range(num_batches):
+                    for j in range(num_clusters):
+                        O_sum = 0
+                        for chunk_index in range(num_chunks):
+                            O_sum += delta_O[chunk_index, i, j]
+                        O[i, j] = O_sum
+                        diversity_penalty += \
+                            O_sum * log((O_sum + 1) / (E[i, j] + 1))
+                diversity_penalty *= 2 * sigma
+                
+                # Compute the initial total objective function
+                prev_objective = kmeans_error + entropy_term + diversity_penalty
+                
+                # Normalize each row of `Y` in-place
+                normalize_rows_inplace_parallel(Y, num_threads)
+                
+            # Define the random order to iterate over cells in, via the "inside-out"
+            # variant of the Fisher-Yates shuffle
+            for i in range(num_cells):
+                j = randint(i + 1, &state)
+                cell_order[i] = cell_order[j]
+                cell_order[j] = i
+                
+            if verbose:
+                print(f'Initialization is complete: objective = '
+                      f'{prev_objective:.2f}')
+            
+            # Check for KeyboardInterrupts
+            PyErr_CheckSignals()
+            
+            # Shrink `R_sums`, `delta_O`, and `delta_E` from `num_chunks` to
+            # `max_chunks_per_block` along their first dimension
+            R_sums_buffer.resize(max_chunks_per_block * num_clusters)
+            delta_O_buffer.resize(max_chunks_per_block * num_batches * num_clusters)
+            delta_E_buffer.resize(max_chunks_per_block * num_batches * num_clusters)
+            R_sums = <float[:max_chunks_per_block, :num_clusters]> R_sums_buffer.data()
+            delta_O = <float[:max_chunks_per_block, :num_batches, :num_clusters]> \
+                delta_O_buffer.data()
+            delta_E = <float[:max_chunks_per_block, :num_batches, :num_clusters]> \
+                delta_E_buffer.data()
+            
+            # Now that initialization is done, start the Harmony iterations
+            with nogil:
+                for iteration in range(1, max_iterations + 1):
+                    # Perform `max_clustering_iterations` iterations of clustering
+                    # within each Harmony iteration, stopping early if
+                    # `early_stopping=True` and convergence is met
+                    for clustering_iteration in range(1, max_clustering_iterations + 1):
+                        # Compute `Y`, the normalized cluster centroids, chunkwise
+                        for chunk_index in prange(num_chunks, num_threads=num_threads):
+                            chunk_start = chunk_index * chunk_size
+                            chunk_end = min(chunk_start + chunk_size, num_cells)
+                            matrix_multiply(R[chunk_start:chunk_end],
+                                            Z[chunk_start:chunk_end], Y_chunk[chunk_index],
+                                            transpose_A=True, transpose_B=False, alpha=1,
+                                            beta=0)
+                        for i in prange(num_clusters, num_threads=num_threads):
+                            norm = 0
+                            for j in range(num_PCs):
+                                total = 0
+                                for chunk_index in range(num_chunks):
+                                    total = total + Y_chunk[chunk_index, i, j]
+                                Y[i, j] = total
+                                norm = norm + total * total
+                            norm = 1 / sqrt(norm)
+                            for j in range(num_PCs):
+                                Y[i, j] *= norm
+                        
+                        # Update `R`, `E`, and `O` by processing cells blockwise and
+                        # then chunkwise within each block. Note that the full formula
+                        # for `R` is:
+                        # `((E + 1) / (O + 1)) ** 2 * exp(-2 / sigma * (1 - Z @ Y.T))`
+                        # which we can calculate as `ratio * exp(distances)` where
+                        # `ratio = exp(-2 / sigma) * ((E + 1) / (O + 1)) ** 2` and
+                        # `distances = 2 / sigma * Z @ Y.T`. Calculating `R` this way
+                        # saves a few multiplications.
+                        for block_index in range(num_blocks):
+                            block_start = block_index * block_size
+                            block_end = min(block_start + block_size, num_cells)
+                            num_chunks_per_block = \
+                                (block_end - block_start + chunk_size - 1) / chunk_size
+                            with parallel(num_threads=min(num_threads, num_chunks_per_block)):
+                                thread_index = threadid()
+                                for chunk_index in prange(num_chunks_per_block):
+                                    chunk_start = chunk_index * chunk_size
+                                    chunk_end = min(chunk_start + chunk_size,
+                                                    block_end - block_start)
+                                    
+                                    # Get the chunk of `Z`, the normalized PCs, to
+                                    # process. Calculate the observed-to-expected ratio
+                                    # `ratio = exp(-2 / sigma) *
+                                    #          ((E + 1) / (O + 1)) ** 2` for the chunk,
+                                    # subtracting the chunk's own contributions to `E`
+                                    # and `O`, which we store in `delta_O[chunk_index]`
+                                    # and `delta_E[chunk_index]`.
+                                    R_sums[chunk_index, :] = 0
+                                    delta_O[chunk_index, :, :] = 0
+                                    for i in range(chunk_end - chunk_start):
+                                        k = cell_order[block_start + chunk_start + i]
+                                        batch_label = batch_labels[k]
+                                        Z_chunk[thread_index, i, :] = Z[k, :]
+                                        for j in range(num_clusters):
+                                            R_sums[chunk_index, j] += R[k, j]
+                                            delta_O[chunk_index, batch_label, j] -= R[k, j]
+                                    for i in range(num_batches):
+                                        Pr_bi = Pr_b[i]
+                                        for j in range(num_clusters):
+                                            delta_Eij = -Pr_bi * R_sums[chunk_index, j]
+                                            delta_Oij = delta_O[chunk_index, i, j]
+                                            Eij = E[i, j] + delta_Eij
+                                            Oij = O[i, j] + delta_Oij
+                                            ratio[chunk_index, i, j] = \
+                                                exp_neg_two_over_sigma * \
+                                                ((Eij + 1) / (Oij + 1)) * \
+                                                ((Eij + 1) / (Oij + 1))
+                                            delta_E[chunk_index, i, j] = delta_Eij
+                                    
+                                    # Compute `distances = 2 / sigma * Z @ Y.T`
+                                    matrix_multiply(
+                                        Z_chunk[thread_index,
+                                               :chunk_end - chunk_start],
+                                        Y, distances[thread_index], transpose_A=False,
+                                        transpose_B=True, alpha=two_over_sigma, beta=0)
+                                    
+                                    # Update `R`, the fractional soft clustering
+                                    # assignment of each cell to each cluster, for the
+                                    # cells in the chunk. Normalize each row of `R` to
+                                    # ensure it always sums to 1 despite floating-point
+                                    # error. Also, add back this chunk's contributions
+                                    # to `O` and `E` to `delta_O[chunk_index]` and
+                                    # `delta_E[chunk_index]` using the newly-updated `R`.
+                                    R_sums[chunk_index, :] = 0
+                                    for i in range(chunk_end - chunk_start):
+                                        k = cell_order[block_start + chunk_start + i]
+                                        batch_label = batch_labels[k]
+                                        norm = 0
+                                        for j in range(num_clusters):
+                                            R[k, j] = exp(distances[
+                                                thread_index, i, j]) * \
+                                                ratio[chunk_index, batch_label, j]
+                                            norm += R[k, j]
+                                        norm = 1 / norm
+                                        for j in range(num_clusters):
+                                            Rkj = R[k, j]
+                                            Rkj = Rkj * norm
+                                            R[k, j] = Rkj
+                                            R_sums[chunk_index, j] += Rkj
+                                            delta_O[chunk_index, batch_label, j] += Rkj
+                                    for i in range(num_batches):
+                                        Pr_bi = Pr_b[i]
+                                        for j in range(num_clusters):
+                                            delta_E[chunk_index, i, j] += \
+                                                Pr_bi * R_sums[chunk_index, j]
+                            
+                            # Update `O` and `E` for this block with the `delta_E` and
+                            # `delta_O` for each chunk.
+                            for chunk_index in range(num_chunks_per_block):
+                                for i in range(num_batches):
+                                    for j in range(num_clusters):
+                                        E[i, j] += delta_E[chunk_index, i, j]
+                                        O[i, j] += delta_O[chunk_index, i, j]
+                        
+                        # Compute the objective function, if we are done clustering or
+                        # `early_stopping=True`
+                        if early_stopping or \
+                                clustering_iteration == max_clustering_iterations:
+                            # Compute its first two components chunkwise: the k-means
+                            # error and entropy term
+                            with parallel(num_threads=min(num_threads, num_chunks)):
+                                thread_index = threadid()
+                                for chunk_index in prange(num_chunks):
+                                    chunk_start = chunk_index * chunk_size
+                                    chunk_end = min(chunk_start + chunk_size, num_cells)
+                                    matrix_multiply(Z[chunk_start:chunk_end], Y,
+                                                    distances[thread_index], transpose_A=False,
+                                                    transpose_B=True, alpha=1, beta=0)
+                                    kmeans_error = 0
+                                    entropy_term = 0
+                                    for i in range(chunk_start, chunk_end):
+                                        for j in range(num_clusters):
+                                            kmeans_error = kmeans_error + \
+                                                R[i, j] * (1 - distances[
+                                                    thread_index, i - chunk_start, j])
+                                            entropy_term = entropy_term + R[i, j] * log(R[i, j])
+                                    kmeans_errors[chunk_index] = kmeans_error
+                                    entropy_terms[chunk_index] = entropy_term
+                            kmeans_error = 0
+                            entropy_term = 0
+                            for chunk_index in range(num_chunks):
+                                kmeans_error += kmeans_errors[chunk_index]
+                                entropy_term += entropy_terms[chunk_index]
+                            kmeans_error *= 2
+                            entropy_term *= sigma
+            
+                            # Compute the diversity penalty, the third component of the
+                            # objective function
+                            diversity_penalty = 0
+                            for i in range(num_batches):
+                                for j in range(num_clusters):
+                                    diversity_penalty += \
+                                        O[i, j] * log((O[i, j] + 1) / (E[i, j] + 1))
+                            diversity_penalty *= 2 * sigma
+                            
+                            # Compute the total objective function
+                            objective = kmeans_error + entropy_term + diversity_penalty
+                            
+                            if early_stopping:
+                                with gil:
+                                    # Check for KeyboardInterrupts after each
+                                    # clustering iteration
+                                    PyErr_CheckSignals()
+                                    
+                                    # If `verbose=True`, print the objective function
+                                    if verbose:
+                                        print(f'Clustering iteration '
+                                              f'{clustering_iteration:,}: objective = '
+                                              f'{objective:.2f} (k-means error = '
+                                              f'{kmeans_error:.2f}, entropy term = '
+                                              f'{entropy_term:.2f}, diversity '
+                                              f'penalty = {diversity_penalty:.2f})')
+                        
+                                # Exit early if the clustering converged, based on a
+                                # sliding window average of the objective over the past
+                                # three iterations
+                                if clustering_iteration <= 3:
+                                    past_clustering_objectives[clustering_iteration] = objective
+                                else:
+                                    last_two = past_clustering_objectives[1] + \
+                                        past_clustering_objectives[2]
+                                    old = past_clustering_objectives[0] + last_two
+                                    new = last_two + objective
+                                    if old - new < clustering_tolerance * abs(old):
+                                        break
+                                    else:
+                                        past_clustering_objectives[0] = \
+                                            past_clustering_objectives[1]
+                                        past_clustering_objectives[1] = \
+                                            past_clustering_objectives[2]
+                                        past_clustering_objectives[2] = objective
+                            else:
+                                # Check for KeyboardInterrupts after each clustering iteration
+                                with gil:
+                                    PyErr_CheckSignals()
+                        else:
+                            # Check for KeyboardInterrupts after each clustering iteration
+                            with gil:
+                                PyErr_CheckSignals()
+                    
+                    # Apply the Harmony correction to the PCs to get the new
+                    # Harmony embeddings, `Z`
+                    
+                    # Initialize `Z` to `PCs`
+                    with parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        start_row = thread_index * num_cells_per_thread
+                        end_row = min(start_row + num_cells_per_thread, num_cells)
+                        Z[start_row:end_row] = PCs[start_row:end_row]
+                    
+                    # Initialize `inv_cov_2` to the identity matrix
+                    inv_cov_2[:] = 0
+                    for i in range(num_batches + 1):
+                        inv_cov_2[i, i] = 1
+                    
+                    for k in range(num_clusters):
+                        # Compute `inv_cov_1` and `inv_cov_2`, which will be
+                        # multiplied together to get the inverse covariance.
+                        # (Harmony-pytorch defines `P = inv_cov_2` and
+                        # `P_t_B_inv = inv_cov_1.T`.)
+                        inv_cov_1[:] = 0
+                        norm = 0
+                        for i in range(num_batches):
+                            ridge_lambda = E[i, k] * alpha
+                            factor = 1 / (O[i, k] + ridge_lambda)
+                            inv_cov_1[i, i] = factor
+                            factor *= -O[i, k]
+                            inv_cov_2[num_batches, i] = factor
+                            norm += O[i, k] * (1 + factor)
+                        norm = 1 / norm
+                        inv_cov_1[num_batches, num_batches] = norm
+                        for i in range(num_batches):
+                            inv_cov_1[num_batches, i] = \
+                                inv_cov_2[num_batches, i] * norm
+                        
+                        # Compute the inverse covariance matrix
+                        # `inv_cov = inv_cov_1.T @ inv_cov_2`
+                        matrix_multiply(inv_cov_1, inv_cov_2, inv_cov,
+                                        transpose_A=True, transpose_B=False, alpha=1,
+                                        beta=0)
+                        
+                        # Cache `R[:, k]` to avoid strided access
+                        with parallel(num_threads=num_threads):
+                            thread_index = threadid()
+                            start_row = thread_index * num_cells_per_thread
+                            end_row = min(start_row + num_cells_per_thread, num_cells)
+                            for i in range(start_row, end_row):
+                                Rk[i] = R[i, k]
+                        
+                        # Compute `R`-scaled PCs in chunks; the last column
+                        # (`R_scaled_PCs[:, num_batches]`) stores the sum of the other
+                        # columns
+                        for chunk_index in prange(num_chunks, num_threads=num_threads):
+                            start_row = chunk_index * chunk_size
+                            end_row = min(start_row + chunk_size, num_cells)
+                            R_scaled_PCs_chunk[chunk_index, :, :] = 0
+                            for i in range(start_row, end_row):
+                                batch_label = batch_labels[i]
+                                Rki = Rk[i]
+                                for j in range(num_PCs):
+                                    R_scaled_PCs_chunk[chunk_index, j, batch_label] += \
+                                        PCs[i, j] * Rki
+                        for j in prange(num_PCs, num_threads=num_threads):
+                            total = 0
+                            for batch_label in range(num_batches):
+                                batch_total = 0
+                                for chunk_index in range(num_chunks):
+                                    batch_total = batch_total + R_scaled_PCs_chunk[
+                                        chunk_index, j, batch_label]
+                                R_scaled_PCs[j, batch_label] = batch_total
+                                total = total + batch_total
+                            R_scaled_PCs[j, num_batches] = total
+                        
+                        # Compute `W = inv_cov @ R_scaled_PCs.T`
+                        matrix_multiply(inv_cov, R_scaled_PCs, W,
+                                        transpose_A=False, transpose_B=True,
+                                        alpha=1, beta=0)
+                        
+                        # Update `Z`, the Harmony embeddings
+                        for i in prange(num_cells, num_threads=num_threads):
+                            batch_label = batch_labels[i]
+                            Rki = Rk[i]
+                            for j in range(num_PCs):
+                                Z[i, j] -= W[batch_label, j] * Rki
+                    
+                    with gil:
+                        # If `verbose=True`, print the objective function
+                        if verbose:
+                            metrics = (
+                                f'objective = {objective:.2f} (k-means error = '
+                                f'{kmeans_error:.2f}, entropy term = {entropy_term:.2f}, '
+                                f'diversity penalty = {diversity_penalty:.2f})')
+                            if max_iterations == 2_147_483_647:
+                                print(f'Completed {iteration:,} '
+                                      f'iteration{"" if iteration == 1 else "s"}: {metrics}')
+                            else:
+                                print(f'Completed {iteration:,} of {max_iterations:,} '
+                                      f'iteration{"" if max_iterations == 1 else "s"}: {metrics}')
+                        
+                        # If Harmony converged, return
+                        if prev_objective - objective < tolerance * abs(prev_objective):
+                            if verbose:
+                                print(f'Reached convergence after {iteration:,} iteration'
+                                      f'{"" if iteration == 1 else "s"}')
+                            return
+                        prev_objective = objective
+                    
+                        # Check for KeyboardInterrupts
+                        PyErr_CheckSignals()
+                    
+                    # Normalize each row of `Z` in-place
+                    normalize_rows_inplace_parallel(Z, num_threads)
+                
+            if verbose:
+                print(f'Failed to converge after {max_iterations:,} '
+                      f'iteration{"" if max_iterations == 1 else "s"}')
+        
+        def harmony_original(const float[:, ::1] PCs,
+                             float[:, ::1] Z,
+                             float[:, ::1] Y,
+                             const unsigned[::1] batch_labels,
+                             const unsigned max_iterations,
+                             const unsigned max_clustering_iterations,
+                             const float block_proportion,
+                             const float tolerance,
+                             const bint early_stopping,
+                             const float clustering_tolerance,
+                             const float alpha,
+                             const float sigma,
+                             const unsigned chunk_size,
+                             const unsigned long seed,
+                             const bint verbose):
+            # A version of `harmony()` that matches the original in its strategy for
+            # updating `R`, `O`, and `E`: updates occur blockwise instead of chunkwise,
+            # and the contribution of the entire block to `O` and `E` is subtracted
+            # before updating `R`, then added back afterwards with the new `R`. Chunks
+            # are still used for certain steps, but only to reduce memory usage and
+            # cache misses, and never nested inside blocks.
+            
+            cdef unsigned i, j, k, chunk_index, chunk_start, chunk_end, batch_label, \
+                iteration, clustering_iteration, block_index, block_start, block_end, \
+                num_cells = Z.shape[0], num_PCs = Z.shape[1], \
+                num_clusters = Y.shape[0], \
+                num_batches = batch_labels[batch_labels.shape[0] - 1] + 1, \
+                num_chunks = (num_cells + chunk_size - 1) / chunk_size, \
+                block_size = <unsigned> ceil(num_cells * block_proportion), \
+                num_blocks = (num_cells + block_size - 1) / block_size
+            cdef unsigned long state = srand(seed)
+            cdef float base, kmeans_error, entropy_term, norm, Rij, \
+                diversity_penalty, prev_objective, Pr_bi, Eij, Oij, Rkj, objective, \
+                last_two, old, new, ridge_lambda, factor, Rki, total, \
+                two_over_sigma = 2 / sigma, \
+                exp_neg_two_over_sigma = exp(-two_over_sigma)
+            cdef float past_clustering_objectives[3]
+            cdef str metrics
+            cdef uninitialized_vector[unsigned] N_b_buffer, cell_order_buffer
+            cdef uninitialized_vector[float] Pr_b_buffer, R_sums_buffer, Rk_buffer, \
+                distance_buffer, R_buffer, E_buffer, O_buffer, Z_block_buffer, \
+                inv_cov_2_buffer, inv_cov_1_buffer, inv_cov_buffer, \
+                R_scaled_PCs_buffer, W_buffer, ratio_buffer
+            N_b_buffer.resize(num_batches)
+            cell_order_buffer.resize(num_cells)
+            Pr_b_buffer.resize(num_batches)
+            R_sums_buffer.resize(num_clusters)
+            Rk_buffer.resize(num_cells)
+            distance_buffer.resize(num_cells * num_clusters)
+            R_buffer.resize(num_cells * num_clusters)
+            E_buffer.resize(num_batches * num_clusters)
+            O_buffer.resize(num_batches * num_clusters)
+            Z_block_buffer.resize(block_size * num_PCs)
+            ratio_buffer.resize(num_batches * num_clusters)
+            inv_cov_2_buffer.resize((num_batches + 1) * (num_batches + 1))
+            inv_cov_1_buffer.resize((num_batches + 1) * (num_batches + 1))
+            inv_cov_buffer.resize((num_batches + 1) * (num_batches + 1))
+            R_scaled_PCs_buffer.resize(num_PCs * (num_batches + 1))
+            W_buffer.resize(num_PCs * (num_batches + 1))
+            cdef unsigned[::1] \
+                N_b = <unsigned[:num_batches]> N_b_buffer.data(), \
+                cell_order = <unsigned[:num_cells]> cell_order_buffer.data()
+            cdef float[::1] \
+                Pr_b = <float[:num_batches]> Pr_b_buffer.data(), \
+                R_sums = <float[:num_clusters]> R_sums_buffer.data(), \
+                Rk = <float[:num_cells]> Rk_buffer.data()
+            cdef float[:, ::1] \
+                distances = <float[:chunk_size, :num_clusters]> \
+                    distance_buffer.data(), \
+                R = <float[:num_cells, :num_clusters]> R_buffer.data(), \
+                E = <float[:num_batches, :num_clusters]> E_buffer.data(), \
+                O = <float[:num_batches, :num_clusters]> O_buffer.data(), \
+                Z_block = <float[:block_size, :num_PCs]> Z_block_buffer.data(), \
+                ratio = <float[:num_batches, :num_clusters]> ratio_buffer.data(), \
+                inv_cov_2 = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_cov_2_buffer.data(), \
+                inv_cov_1 = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_cov_1_buffer.data(), \
+                inv_cov = <float[:num_batches + 1, :num_batches + 1]> \
+                    inv_cov_buffer.data(), \
+                R_scaled_PCs = <float[:num_PCs, :num_batches + 1]> \
+                    R_scaled_PCs_buffer.data(), \
+                W = <float[:num_batches + 1, :num_PCs]> W_buffer.data()
+            
+            # Get the number (`N_b`) and fraction (`Pr_b`) of cells in each batch
+            bincount(batch_labels, N_b, num_threads=1)
+            for i in range(num_batches):
+                Pr_b[i] = <float> N_b[i] / num_cells
+            N_b_buffer.clear()
+            
+            # Initialize `R`, `R_sums`, and `O` chunkwise. Compute the initial k-means
+            # error and entropy term, the first two components of the objective
+            # function.
+            R_sums[:] = 0
+            O[:] = 0
+            kmeans_error = 0
+            entropy_term = 0
+            for chunk_index in range(num_chunks):
+                chunk_start = chunk_index * chunk_size
+                chunk_end = min(chunk_start + chunk_size, num_cells)
+                matrix_multiply(Z[chunk_start:chunk_end], Y, distances,
+                                transpose_A=False, transpose_B=True, alpha=1, beta=0)
+                for i in range(chunk_start, chunk_end):
+                    norm = 0
+                    for j in range(num_clusters):
+                        Rij = exp(two_over_sigma * (distances[i - chunk_start, j] - 1))
+                        R[i, j] = Rij
+                        norm += Rij
+                    norm = 1 / norm
+                    for j in range(num_clusters):
+                        batch_label = batch_labels[i]
+                        Rij = R[i, j]
+                        Rij *= norm
+                        R[i, j] = Rij
+                        R_sums[j] += Rij
+                        O[batch_label, j] += Rij
+                        kmeans_error += Rij * (1 - distances[i - chunk_start, j])
+                        entropy_term += Rij * log(Rij)
+            kmeans_error *= 2
+            entropy_term *= sigma
+            
+            # Initialize `E`
+            for i in range(num_batches):
+                for j in range(num_clusters):
+                    E[i, j] = Pr_b[i] * R_sums[j]
+            
+            # Compute the initial diversity penalty, the third component of the
+            # objective function
+            diversity_penalty = 0
+            for i in range(num_batches):
+                for j in range(num_clusters):
+                    diversity_penalty += O[i, j] * log((O[i, j] + 1) / (E[i, j] + 1))
+            diversity_penalty *= 2 * sigma
+            
+            # Compute the initial total objective function
+            prev_objective = kmeans_error + entropy_term + diversity_penalty
+            
+            # Normalize each row of `Y` in-place
+            normalize_rows_inplace(Y)
+                
+            # Define the random order to iterate over cells in, via the "inside-out"
+            # variant of the Fisher-Yates shuffle
+            for i in range(num_cells):
+                j = randint(i + 1, &state)
+                cell_order[i] = cell_order[j]
+                cell_order[j] = i
+                
+            if verbose:
+                print(f'Initialization is complete: objective = {prev_objective:.2f}')
+            
+            # Check for KeyboardInterrupts
+            PyErr_CheckSignals()
+            
+            # Now that initialization is done, start the Harmony iterations
+            for iteration in range(1, max_iterations + 1):
+                # Perform `max_clustering_iterations` iterations of clustering
+                # within each Harmony iteration, stopping early if
+                # `early_stopping=True` and convergence is met
+                for clustering_iteration in range(1, max_clustering_iterations + 1):
+                    # Compute `Y`, the normalized cluster centroids
+                    matrix_multiply(R, Z, Y, transpose_A=True, transpose_B=False,
+                                    alpha=1, beta=0)
+                    for i in range(num_clusters):
+                        norm = 0
+                        for j in range(num_PCs):
+                            norm += Y[i, j] * Y[i, j]
+                        norm = 1 / sqrt(norm)
+                        for j in range(num_PCs):
+                            Y[i, j] *= norm
+                    
+                    # Update `R`, `E`, and `O` by processing cells blockwise. Note that
+                    # the full formula for `R` is:
+                    # `((E + 1) / (O + 1)) ** 2 * exp(-2 / sigma * (1 - Z @ Y.T))`
+                    # which we can calculate as `ratio * exp(distances)` where
+                    # `ratio = exp(-2 / sigma) * ((E + 1) / (O + 1)) ** 2` and
+                    # `distances = 2 / sigma * Z @ Y.T`. Calculating `R` this way
+                    # saves a few multiplications.
+                    for block_index in range(num_blocks):
+                        block_start = block_index * block_size
+                        block_end = min(block_start + block_size, num_cells)
+                        
+                        # Remove the cells in this block from `E` and `O`. Copy `Z` for
+                        # these cells into a contiguous array, `Z_block`.
+                        R_sums[:] = 0
+                        for i in range(block_end - block_start):
+                            k = cell_order[block_start + i]
+                            batch_label = batch_labels[k]
+                            for j in range(num_clusters):
+                                O[batch_label, j] -= R[k, j]
+                                R_sums[j] += R[k, j]
+                            for j in range(num_PCs):
+                                Z_block[i, j] = Z[k, j]
+                        for i in range(num_batches):
+                            Pr_bi = Pr_b[i]
+                            for j in range(num_clusters):
+                                E[i, j] -= Pr_bi * R_sums[j]
+                        
+                        # Update `R`, the fractional soft clustering assignment of each
+                        # cell to each cluster, for the cells in the block. Normalize
+                        # each row of `R` to ensure it always sums to 1 despite
+                        # floating-point error. Add the removed cells back into `O` and
+                        # `E`.
+                        matrix_multiply(Z_block[:block_end - block_start], Y,
+                                        distances, transpose_A=False, transpose_B=True,
+                                        alpha=two_over_sigma, beta=0)
+                        for i in range(num_batches):
+                            for j in range(num_clusters):
+                                Eij = E[i, j]
+                                Oij = O[i, j]
+                                ratio[i, j] = exp_neg_two_over_sigma * \
+                                    ((Eij + 1) / (Oij + 1)) * ((Eij + 1) / (Oij + 1))
+                        R_sums[:] = 0
+                        for i in range(block_end - block_start):
+                            k = cell_order[block_start + i]
+                            batch_label = batch_labels[k]
+                            norm = 0
+                            for j in range(num_clusters):
+                                Rkj = exp(distances[i, j]) * ratio[batch_label, j]
+                                R[k, j] = Rkj
+                                norm += Rkj
+                            norm = 1 / norm
+                            for j in range(num_clusters):
+                                Rkj = R[k, j]
+                                Rkj *= norm
+                                R[k, j] = Rkj
+                                R_sums[j] += Rkj
+                                O[batch_label, j] += Rkj
+                        for i in range(num_batches):
+                            Pr_bi = Pr_b[i]
+                            for j in range(num_clusters):
+                                E[i, j] += Pr_bi * R_sums[j]
+                    
+                    # Check for KeyboardInterrupts after each clustering
+                    # iteration
+                    PyErr_CheckSignals()
+                    
+                    # Compute the objective function, if we are done clustering or
+                    # `early_stopping=True`
+                    if early_stopping or \
+                            clustering_iteration == max_clustering_iterations:
+                        # Compute its first two components chunkwise: the k-means
+                        # error and entropy term
+                        kmeans_error = 0
+                        entropy_term = 0
+                        for chunk_index in range(num_chunks):
+                            chunk_start = chunk_index * chunk_size
+                            chunk_end = min(chunk_start + chunk_size, num_cells)
+                            matrix_multiply(Z[chunk_start:chunk_end], Y, distances,
+                                            transpose_A=False, transpose_B=True,
+                                            alpha=1, beta=0)
+                            for i in range(chunk_start, chunk_end):
+                                for j in range(num_clusters):
+                                    kmeans_error += R[i, j] * \
+                                        (1 - distances[i - chunk_start, j])
+                                    entropy_term += R[i, j] * log(R[i, j])
+                        kmeans_error *= 2
+                        entropy_term *= sigma
+        
+                        # Compute the diversity penalty, the third component of the
+                        # objective function
+                        diversity_penalty = 0
+                        for i in range(num_batches):
+                            for j in range(num_clusters):
+                                diversity_penalty += \
+                                    O[i, j] * log((O[i, j] + 1) / (E[i, j] + 1))
+                        diversity_penalty *= 2 * sigma
+                        
+                        # Compute the total objective function
+                        objective = kmeans_error + entropy_term + diversity_penalty
+                        
+                        if early_stopping:
+                            # If `verbose=True`, print the objective function
+                            if verbose:
+                                print(f'Clustering iteration '
+                                      f'{clustering_iteration:,}: objective = '
+                                      f'{objective:.2f} (k-means error = '
+                                      f'{kmeans_error:.2f}, entropy term = '
+                                      f'{entropy_term:.2f}, diversity '
+                                      f'penalty = {diversity_penalty:.2f})')
+                    
+                            # Exit early if the clustering converged, based on a
+                            # sliding window average of the objective over the past
+                            # three iterations
+                            if clustering_iteration <= 3:
+                                past_clustering_objectives[clustering_iteration] = objective
+                            else:
+                                last_two = past_clustering_objectives[1] + \
+                                    past_clustering_objectives[2]
+                                old = past_clustering_objectives[0] + last_two
+                                new = last_two + objective
+                                if old - new < clustering_tolerance * abs(old):
+                                    break
+                                else:
+                                    past_clustering_objectives[0] = \
+                                        past_clustering_objectives[1]
+                                    past_clustering_objectives[1] = \
+                                        past_clustering_objectives[2]
+                                    past_clustering_objectives[2] = objective
+                
+                # Apply the Harmony correction to the PCs to get the new Harmony
+                # embeddings, `Z`
+                
+                # Initialize `Z` to `PCs`
+                Z[:] = PCs[:]
+                
+                # Initialize `inv_cov_2` to the identity matrix
+                inv_cov_2[:] = 0
+                for i in range(num_batches + 1):
+                    inv_cov_2[i, i] = 1
+                
+                with nogil:
+                    for k in range(num_clusters):
+                        # Compute `inv_cov_1` and `inv_cov_2`, which will be
+                        # multiplied together to get the inverse covariance.
+                        # (Harmony-pytorch defines `P = inv_cov_2` and
+                        # `P_t_B_inv = inv_cov_1.T`.)
+                        inv_cov_1[:] = 0
+                        norm = 0
+                        for i in range(num_batches):
+                            ridge_lambda = E[i, k] * alpha
+                            factor = 1 / (O[i, k] + ridge_lambda)
+                            inv_cov_1[i, i] = factor
+                            factor *= -O[i, k]
+                            inv_cov_2[num_batches, i] = factor
+                            norm += O[i, k] * (1 + factor)
+                        norm = 1 / norm
+                        inv_cov_1[num_batches, num_batches] = norm
+                        for i in range(num_batches):
+                            inv_cov_1[num_batches, i] = \
+                                inv_cov_2[num_batches, i] * norm
+                        
+                        # Compute the inverse covariance matrix
+                        # `inv_cov = inv_cov_1.T @ inv_cov_2`
+                        matrix_multiply(inv_cov_1, inv_cov_2, inv_cov,
+                                        transpose_A=True, transpose_B=False, alpha=1,
+                                        beta=0)
+                        
+                        # Cache `R[:, k]` to avoid strided access
+                        for i in range(num_cells):
+                            Rk[i] = R[i, k]
+                        
+                        # Compute `R`-scaled PCs; the last column
+                        # (`R_scaled_PCs[:, num_batches]`) stores the sum of the other
+                        # columns. Surprisingly, this step, and the updates to `Z`
+                        # below, is about twice as fast with
+                        # `prange(..., num_threads=1)` as with `range()`.
+                        R_scaled_PCs[:] = 0
+                        for i in prange(num_cells, num_threads=1):
+                            batch_label = batch_labels[i]
+                            Rki = Rk[i]
+                            for j in range(num_PCs):
+                                R_scaled_PCs[j, batch_label] += Rki * PCs[i, j]
+                        for j in range(num_PCs):
+                            total = 0
+                            for batch_label in range(num_batches):
+                                total += R_scaled_PCs[j, batch_label]
+                            R_scaled_PCs[j, num_batches] = total
+                        
+                        # Compute `W = inv_cov @ R_scaled_PCs.T`
+                        matrix_multiply(inv_cov, R_scaled_PCs, W,
+                                        transpose_A=False, transpose_B=True,
+                                        alpha=1, beta=0)
+                        
+                        # Update `Z`, the Harmony embeddings.
+                        for i in prange(num_cells, num_threads=1):
+                            batch_label = batch_labels[i]
+                            Rki = Rk[i]
+                            for j in range(num_PCs):
+                                Z[i, j] -= W[batch_label, j] * Rki
+                
+                # If `verbose=True`, print the objective function
+                if verbose:
+                    metrics = (
+                        f'objective = {objective:.2f} (k-means error = '
+                        f'{kmeans_error:.2f}, entropy term = {entropy_term:.2f}, '
+                        f'diversity penalty = {diversity_penalty:.2f})')
+                    if max_iterations == 2_147_483_647:
+                        print(f'Completed {iteration:,} '
+                              f'iteration{"" if iteration == 1 else "s"}: {metrics}')
+                    else:
+                        print(f'Completed {iteration:,} of {max_iterations:,} '
+                              f'iteration{"" if max_iterations == 1 else "s"}: {metrics}')
+                
+                # If Harmony converged, return
+                if prev_objective - objective < tolerance * abs(prev_objective):
+                    if verbose:
+                        print(f'Reached convergence after {iteration:,} iteration'
+                              f'{"" if iteration == 1 else "s"}')
+                    return
+                prev_objective = objective
+            
+                # Check for KeyboardInterrupts
+                PyErr_CheckSignals()
+                
+                # Normalize each row of `Z` in-place
+                normalize_rows_inplace(Z)
+            if verbose:
+                print(f'Failed to converge after {max_iterations:,} '
+                      f'iteration{"" if max_iterations == 1 else "s"}')
+        ''')
+        normalize_rows = cython_functions['normalize_rows']
+        
+        # Get `Z`, the row-normalized PCs
+        Z = np.empty((num_cells, num_PCs), dtype=np.float32)
+        normalize_rows(arr=PCs, out=Z, num_threads=num_threads)
+        
+        # Run k-means clustering on `Z`. Since `Y` and `Y_new` are swapped
+        # every iteration, `Y_new` will contain the final `Y` when doing an odd
+        # number of k-means iterations; if so, swap them at the end.
+        Y = np.empty((num_clusters, num_PCs), dtype=np.float32)
+        Y_new = np.empty((num_clusters, num_PCs), dtype=np.float32)
+        
+        with threadpool_limits(1, user_api='blas'):
+            kmeans = _kmeans_and_knn_functions['kmeans']
+            kmeans(X=Z, cluster_labels=np.empty(num_cells, dtype=np.uint32),
+                   centroids=Y, centroids_new=Y_new,
+                   num_cells_per_cluster=np.empty(num_clusters,
+                                                  dtype=np.uint32),
+                   kmeans_barbar=kmeans_barbar,
+                   num_init_iterations=num_init_iterations,
+                   oversampling_factor=oversampling_factor,
+                   num_kmeans_iterations=num_kmeans_iterations, seed=seed,
+                   chunk_size=chunk_size_kmeans, num_threads=num_threads)
+        if num_kmeans_iterations & 1:
+            Y = Y_new
+        del Y_new
+        
+        # Run Harmony. Unlike above, here we need to use single-threaded matrix
+        # multiplication to ensure consistent floating-point roundoff.
+        with threadpool_limits(1, user_api='blas'):
+            if original:
+                harmony_original = cython_functions['harmony_original']
+                harmony_original(
+                    PCs=PCs, Z=Z, Y=Y, batch_labels=batch_labels,
+                    max_iterations=max_iterations,
+                    max_clustering_iterations=max_clustering_iterations,
+                    block_proportion=block_proportion, tolerance=tolerance,
+                    early_stopping=early_stopping,
+                    clustering_tolerance=clustering_tolerance, alpha=alpha,
+                    sigma=sigma, chunk_size=chunk_size_Harmony, seed=seed,
+                    verbose=verbose)
+            else:
+                harmony = cython_functions['harmony']
+                harmony(PCs=PCs, Z=Z, Y=Y, batch_labels=batch_labels,
+                        max_iterations=max_iterations,
+                        max_clustering_iterations=max_clustering_iterations,
+                        block_proportion=block_proportion, tolerance=tolerance,
+                        early_stopping=early_stopping,
+                        clustering_tolerance=clustering_tolerance, alpha=alpha,
+                        sigma=sigma, chunk_size=chunk_size_Harmony, seed=seed,
+                        verbose=verbose, num_threads=num_threads)
+        
+        del batch_labels, PCs, Y
+        
+        # Store each dataset's Harmony embedding in its obsm
+        for dataset_index, (dataset, QC_col, num_cells, end_index) in \
+                enumerate(zip(datasets, QC_columns_NumPy,
+                              num_cells_per_dataset,
+                              num_cells_per_dataset.cumsum())):
+            start_index = end_index - num_cells
+            dataset_Harmony_embedding = Z[start_index:end_index]
+            # If `QC_col` is not `None` for this dataset, back-project from
+            # QCed cells to all cells, filling with `NaN`
+            if QC_col is not None:
+                dataset_Harmony_embedding_QCed = dataset_Harmony_embedding
+                dataset_Harmony_embedding = np.full(
+                    (len(dataset), dataset_Harmony_embedding_QCed.shape[1]),
+                    np.nan, dtype=np.float32)
+                # noinspection PyUnboundLocalVariable
+                dataset_Harmony_embedding[QC_col] = \
+                    dataset_Harmony_embedding_QCed
+            datasets[dataset_index] = SingleCell(
+                X=dataset._X, obs=dataset._obs, var=dataset._var,
+                obsm=dataset._obsm | {Harmony_key: dataset_Harmony_embedding},
+                varm=self._varm, uns=self._uns, num_threads=self._num_threads)
+        return tuple(datasets) if others else datasets[0]
+    
     def label_transfer_from_old(
             self,
             other: SingleCell,
@@ -24645,15 +30086,15 @@ class SingleCell:
         # Check that `num_neighbors` is a positive integer
         check_type(num_neighbors, 'num_neighbors', int, 'a positive integer')
         check_bounds(num_neighbors, 'num_neighbors', 1)
-        # Check that `num_clusters` is between 1 and the number of cells, and
-        # that `num_probes` is between 1 and the number of clusters. If either
-        # is `None`, set them to their default values.
+        # Check that `num_clusters` is between 1 and `num_cells_in_other`, and
+        # that `num_probes` is between 1 and `num_clusters`. If either is
+        # `None`, set them to their default values.
         if num_clusters is None:
             num_clusters = int(np.ceil(min(np.sqrt(num_cells_in_other),
                                            num_cells_in_other / 100)))
         else:
             check_type(num_clusters, 'num_clusters', int, 'a positive integer')
-            if not 1 <= num_clusters < num_cells_in_other:
+            if not 1 <= num_clusters <= num_cells_in_other:
                 error_message = (
                     f'num_clusters is {num_clusters:,}, but must be ≥ 1 and '
                     f'less than the number of cells in other '
@@ -24731,7 +30172,8 @@ class SingleCell:
             while True:
                 num_probes = min(num_probes * 2, num_clusters)
                 if verbose:
-                    print(f'{len(needs_update_X):,} cells '
+                    print(f'{len(needs_update_X):,} '
+                          f'{plural("cell", len(needs_update_X))} '
                           f'({len(needs_update_X) / len(self._obs):.2f}%) '
                           f'did not have enough neighbors with '
                           f'{index.nprobe:,} probes; re-running '
@@ -24901,10 +30343,10 @@ class SingleCell:
             other_QC_column: SingleCellColumn | None = 'passed_QC',
             Harmony_key: str = 'Harmony_PCs',
             cell_type_column: str = 'cell_type',
-            confidence_column: str = 'cell_type_confidence',
-            next_best_cell_type_column: str = 'next_best_cell_type',
-            next_best_confidence_column: str =
-                'next_best_cell_type_confidence',
+            confidence_column: str | None = None,
+            next_best: bool = False,
+            next_best_cell_type_column: str | None = None,
+            next_best_confidence_column: str | None = None,
             num_neighbors: int | np.integer = 20,
             num_clusters: int | np.integer | None = None,
             min_clusters_searched: int | np.integer | None = None,
@@ -24914,7 +30356,7 @@ class SingleCell:
             kmeans_barbar: bool = False,
             num_init_iterations: int | np.integer = 5,
             oversampling_factor: int | np.integer | float | np.floating = 1,
-            chunk_size: int | np.integer = 256,
+            chunk_size: int | np.integer | None = None,
             seed: int | np.integer = 0,
             overwrite: bool = False,
             verbose: bool = True,
@@ -24971,14 +30413,21 @@ class SingleCell:
                                common cell-type label. If multiple cell types
                                are equally common among the nearest neighbors,
                                tiebreak based on which of them is most common
-                               in `original_cell_type_column`.
+                               in `original_cell_type_column`. If `None`,
+                               defaults to `f'{cell_type_column}_confidence'`.
+            next_best: whether to also compute each cell's second-most likely
+                       cell type and confidence, or just its most likely
             next_best_cell_type_column: the name of a column to be added to
                                         `self.obs` indicating each cell's
                                         second-most likely cell type, i.e. the
                                         second-most common cell-type label
                                         among the cell's `num_neighbors`
                                         nearest neighbors in
-                                        `original_cell_type_column`
+                                        `original_cell_type_column`. If `None`,
+                                        defaults to
+                                        `f'next_best_{cell_type_column}'`. Can
+                                        only be specified when
+                                        `next_best=True`.
             next_best_confidence_column: the name of a column to be added to
                                          `self.obs` indicating each cell's
                                          cell-type confidence, i.e. the
@@ -24989,14 +30438,17 @@ class SingleCell:
                                          multiple cell types are equally common
                                          among the nearest neighbors, tiebreak
                                          based on which of them is most common
-                                         in `other`.
+                                         in `other`. If `None`, defaults to
+                                         `f'next_best_{cell_type_column}_
+                                         confidence'`. Can only be specified
+                                         when `next_best=True`.
             num_neighbors: the number of nearest neighbors to use when
                            determining a cell's label. All cell-type
                            confidences will be multiples of
                            `1 / num_neighbors`.
             num_clusters: the number of k-means clusters to use during the
-                          nearest-neighbor search. Must be positive and less
-                          than the number of cells. If `None`, will be set to
+                          nearest-neighbor search. Must be less than the number
+                          of cells. If `None`, will be set to
                           `ceil(min(sqrt(num_cells), num_cells / 100))`
                           clusters, i.e. the minimum of the square root of the
                           number of cells in `other` and 1% of the number of
@@ -25079,7 +30531,8 @@ class SingleCell:
                         search itself. Setting this to a power of 2 is
                         recommended; 256 was determined to be the optimal chunk
                         size by scikit-learn (for k-means clustering) and in
-                        our tests (for both steps).
+                        our tests (for both steps). Defaults to
+                        `min(256, number of cells in other)`.
             seed: the random seed to use when finding nearest neighbors
             overwrite: if `True`, overwrite `cell_type_column` and/or
                        `confidence_column` if already present in this dataset's
@@ -25094,29 +30547,84 @@ class SingleCell:
                          be the same as the original dataset's `num_threads`.
         
         Returns:
-            `self`, but with two additional columns: `cell_type_column`,
+            `self`, but with two columns added to `obs`: `cell_type_column`,
             containing the transferred cell-type labels, and
-            `confidence_column`, containing the cell-type confidences.
+            `confidence_column`, containing the cell-type confidences. If
+            `next_best=True`, also adds the columns
+            `next_best_cell_type_column` and `next_best_confidence_column`,
+            containing the second-most likely cell type and its confidence.
         """
+        # Check that `cell_type_column` is a string
+        check_type(cell_type_column, 'cell_type_column', str, 'a string')
+        
+        # Check that `confidence_column` is a string or `None`; if `None`, set 
+        # to `f'{cell_type_column}_confidence'`. 
+        if confidence_column is None:
+            confidence_column = f'{cell_type_column}_confidence'
+        else:
+            check_type(confidence_column, 'confidence_column', str,
+                       'a string or None')
+
+        # Check that `next_best` is Boolean
+        check_type(next_best, 'next_best', bool, 'Boolean')
+        
+        # If `next_best=False`, check that `next_best_cell_type_column` and 
+        # `next_best_confidence_column` are `None`. If `next_best=True`, check
+        # that they are strings or `None`; if `None, set to 
+        # `f'next_best_{cell_type_column}'` and 
+        # `f'next_best_{cell_type_column}_confidence'` respectively. 
+        if next_best:
+            if next_best_cell_type_column is None:
+                next_best_cell_type_column = f'next_best_{cell_type_column}'
+            else:
+                check_type(next_best_cell_type_column,
+                           'next_best_cell_type_column', str,
+                           'a string or None')
+            if next_best_confidence_column is None:
+                next_best_confidence_column = \
+                    f'next_best_{cell_type_column}_confidence'
+            else:
+                check_type(next_best_confidence_column, 
+                           'next_best_confidence_column', str, 
+                           'a string or None')
+        elif next_best_cell_type_column is not None:
+            error_message = \
+                'next_best_cell_type_column must be None unless next_best=True'
+            raise ValueError(error_message)
+        elif next_best_confidence_column is not None:
+            error_message = (
+                'next_best_confidence_column must be None unless '
+                'next_best=True')
+            raise ValueError(error_message)
+            
         # Check that `overwrite` is Boolean
         check_type(overwrite, 'overwrite', bool, 'Boolean')
         
-        # Check that `cell_type_column`, `confidence_column`,
-        # `next_best_cell_type_column` and `next_best_confidence_column` are
-        # strings and, unless `overwrite=True`, not already columns of
-        # `self.obs`
-        for column, column_name in (
-                (cell_type_column, 'cell_type_column'),
-                (confidence_column, 'confidence_column'),
-                (next_best_cell_type_column, 'next_best_cell_type_column'),
-                (next_best_confidence_column, 'next_best_confidence_column')):
-            check_type(column, column_name, str, 'a string')
-            if not overwrite and column in self._obs:
-                error_message = (
-                    f'{column_name} {column!r} is already a column '
-                    f'of obs; did you already run label_transfer_from()? Set '
-                    f'overwrite=True to overwrite.')
-                raise ValueError(error_message)
+        # If `overwrite=False`, check that `cell_type_column` and 
+        # `confidence_column` (and `next_best_cell_type_column` and 
+        # `next_best_confidence_column`, if `next_best=True`) are not already 
+        # columns of `self.obs`
+        if not overwrite:
+            for column, column_name in (
+                    (cell_type_column, 'cell_type_column'),
+                    (confidence_column, 'confidence_column')):
+                if column in self._obs:
+                    error_message = (
+                        f'{column_name} {column!r} is already a column '
+                        f'of obs; did you already run label_transfer_from()? '
+                        f'Set overwrite=True to overwrite.')
+                    raise ValueError(error_message)
+            for column, column_name in (
+                    (next_best_cell_type_column, 'next_best_cell_type_column'),
+                    (next_best_confidence_column, 
+                     'next_best_confidence_column')):
+                if column in self._obs:
+                    error_message = (
+                        f'{column_name} {column!r} is already a column '
+                        f'of obs; did you already run label_transfer_from()? '
+                        f'Set overwrite=True to overwrite, or next_best=False '
+                        f'to not compute {column_name}.')
+                    raise ValueError(error_message)
         
         # Check that `other` is a SingleCell dataset
         check_type(other, 'other', SingleCell, 'a SingleCell dataset')
@@ -25176,11 +30684,16 @@ class SingleCell:
                     f'before label_transfer_from()?')
                 raise ValueError(error_message)
         
-        # Check that `num_neighbors` is a positive integer
+        # Check that `num_neighbors` is between 1 and `num_cells_in_other - 1`
         check_type(num_neighbors, 'num_neighbors', int, 'a positive integer')
-        check_bounds(num_neighbors, 'num_neighbors', 1)
+        if not 1 <= num_neighbors < num_cells_in_other:
+            error_message = (
+                f'num_neighbors is {num_neighbors:,}, but must be ≥ 1 and '
+                f'less than the number of cells in other '
+                f'({num_cells_in_other:,})')
+            raise ValueError(error_message)
         
-        # Check that `num_clusters` is between 1 and the number of cells; if
+        # Check that `num_clusters` is between 1 and `num_cells_in_other`; if
         # `None`, set to `ceil(min(sqrt(num_cells_in_other),
         # num_cells_in_other / 100)))`
         if num_clusters is None:
@@ -25188,11 +30701,10 @@ class SingleCell:
                                            num_cells_in_other / 100)))
         else:
             check_type(num_clusters, 'num_clusters', int, 'a positive integer')
-            if not 1 <= num_clusters < num_cells_in_other:
+            if not 1 <= num_clusters <= num_cells_in_other:
                 error_message = (
-                    f'num_clusters is {num_clusters:,}, but must be ≥ 1 and '
-                    f'less than the number of cells in other '
-                    f'({num_cells_in_other:,})')
+                    f'num_clusters is {num_clusters:,}, but must be ≥ 1 and ≤ '
+                    f'the number of cells in other ({num_cells_in_other:,})')
                 raise ValueError(error_message)
         
         # Check that `max_clusters_searched` is between `num_neighbors` and
@@ -25210,7 +30722,7 @@ class SingleCell:
                 raise ValueError(error_message)
         
         # Check that `min_clusters_searched` is between 1 and
-        # `min_clusters_searched`; if `None`, set to
+        # `max_clusters_searched`; if `None`, set to
         # `min(10, num_neighbors, num_clusters)`
         if min_clusters_searched is None:
             min_clusters_searched = min(10, num_neighbors, num_clusters)
@@ -25225,7 +30737,7 @@ class SingleCell:
                 raise ValueError(error_message)
         
         # Check that `num_candidates_per_neighbor` is between 1 and
-        # `num_cells_in_other`
+        # `num_cells_in_other - 1`
         check_type(num_candidates_per_neighbor, 'num_candidates_per_neighbor',
                    int, 'a positive integer')
         if not 1 <= num_candidates_per_neighbor < num_cells_in_other:
@@ -25267,14 +30779,17 @@ class SingleCell:
                     'kmeans_barbar=True')
                 raise ValueError(error_message)
         
-        # Check that `chunk_size` is between 1 and `num_cells_in_other`
-        check_type(chunk_size, 'chunk_size', int, 'a positive integer')
-        if not 1 <= chunk_size < num_cells_in_other:
-            error_message = (
-                f'chunk_size is {chunk_size:,}, but must be ≥ 1 and '
-                f'less than the number of cells in other '
-                f'({num_cells_in_other:,})')
-            raise ValueError(error_message)
+        # If `chunk_size` is `None`, set it to `min(256, num_cells_in_other)`.
+        # Otherwise, check that it is between 1 and `num_cells_in_other`.
+        if chunk_size is None:
+            chunk_size = min(256, num_cells_in_other)
+        else:
+            check_type(chunk_size, 'chunk_size', int, 'a positive integer')
+            if not 1 <= chunk_size <= num_cells_in_other:
+                error_message = (
+                    f'chunk_size is {chunk_size:,}, but must be ≥ 1 and ≤ the '
+                    f'number of cells in other ({num_cells_in_other:,})')
+                raise ValueError(error_message)
         
         # Check that `seed` is an integer
         check_type(seed, 'seed', int, 'an integer')
@@ -25363,26 +30878,32 @@ class SingleCell:
         neighbors = np.empty((num_self, num_neighbors), dtype=np.uint32)
         distances = np.empty((num_self, num_neighbors), dtype=np.float32)
         with threadpool_limits(1, user_api='blas'):
-            knn = _kmeans_and_knn_functions['knn']
-            knn(Y=self_Harmony_embeddings, X=other_Harmony_embeddings,
-                cluster_labels=cluster_labels, centroids=centroids,
-                num_cells_per_cluster=num_cells_per_cluster,
-                neighbors=neighbors, distances=distances,
-                num_neighbors=num_neighbors,
-                min_clusters_searched=min_clusters_searched,
-                max_clusters_searched=max_clusters_searched,
-                num_candidates_per_neighbor=num_candidates_per_neighbor,
-                chunk_size=chunk_size, num_threads=num_threads)
+            knn_cross = _kmeans_and_knn_functions['knn_cross']
+            knn_cross(Y=self_Harmony_embeddings, X=other_Harmony_embeddings,
+                      cluster_labels=cluster_labels, centroids=centroids,
+                      num_cells_per_cluster=num_cells_per_cluster,
+                      neighbors=neighbors, distances=distances,
+                      num_neighbors=num_neighbors,
+                      min_clusters_searched=min_clusters_searched,
+                      max_clusters_searched=max_clusters_searched,
+                      num_candidates_per_neighbor=num_candidates_per_neighbor,
+                      chunk_size=chunk_size, num_threads=num_threads)
         
-        # Get the two most common cell types for each cell in `self` among its
-        # `num_neighbors` nearest neighbors in `other`. Pick the first element
-        # in case of ties, which according to our encoding is the most common
-        # cell type. Also get the cell-type confidence of these two cell types,
-        # i.e. their frequency among the nearest neighbors.
+        # Get the (two) most common cell type(s) for each cell in `self` among
+        # its `num_neighbors` nearest neighbors in `other`. Pick the first
+        # element in case of ties, which according to our encoding is the most
+        # common cell type. Also get the cell-type confidence of each cell's
+        # type(s), i.e. the frequency of the cell type among the cell's
+        # `num_neighbors` nearest neighbors.
         cell_types = np.empty(num_cells_in_self, dtype=np.uint32)
         confidences = np.empty(num_cells_in_self, dtype=np.float32)
-        next_best_cell_types = np.empty(num_cells_in_self, dtype=np.uint32)
-        next_best_confidences = np.empty(num_cells_in_self, dtype=np.float32)
+        if next_best:
+            next_best_cell_types = np.empty(num_cells_in_self, dtype=np.uint32)
+            next_best_confidences = \
+                np.empty(num_cells_in_self, dtype=np.float32)
+        else:
+            next_best_cell_types = np.array([], dtype=np.uint32)
+            next_best_confidences = np.array([], dtype=np.float32)
         cython_inline(_uninitialized_vector_import + r'''
         from cython.parallel cimport parallel, prange, threadid
         from libcpp.algorithm cimport fill
@@ -25395,79 +30916,92 @@ class SingleCell:
                            float[::1] confidences,
                            unsigned[::1] next_best_cell_types,
                            float[::1] next_best_confidences,
-                           const unsigned num_threads):
+                           unsigned num_threads):
             cdef unsigned i, j, thread_index, cell_type, count, \
                 most_common_cell_type, second_most_common_cell_type, \
                 max_count, second_max_count, \
                 num_cells = neighbors.shape[0], \
                 num_neighbors = neighbors.shape[1]
             cdef float inv_num_neighbors = 1.0 / num_neighbors
-            cdef uninitialized_vector[unsigned] counts
+            cdef uninitialized_vector[unsigned] counts_buffer
             cdef vector[uninitialized_vector[unsigned]] thread_counts
+            cdef unsigned[::1] counts
             
-            if num_threads == 1:
-                counts.resize(num_cell_types)
-                for i in range(num_cells):
-                    fill(counts.begin(), counts.end(), 0)
-                    for j in range(num_neighbors):
-                        # Get the cell-type label of this nearest neighbor
-                        # (using our integer encoding where the most common cell
-                        # type is 0, the next-most common 1, etc.)
-                        cell_type = original_cell_type_column[
-                            neighbors[i, j]]
-                        counts[cell_type] += 1
-                    if counts[0] >= counts[1]:
-                        max_count = counts[0]
-                        second_max_count = counts[1]
-                        most_common_cell_type = 0
-                        second_most_common_cell_type = 1
-                    else:
-                        max_count = counts[1]
-                        second_max_count = counts[0]
-                        most_common_cell_type = 1
-                        second_most_common_cell_type = 0
-                    for cell_type in range(2, num_cell_types):
-                        count = counts[cell_type]
-                        if count > max_count:
-                            second_max_count = max_count
-                            second_most_common_cell_type = \
-                                most_common_cell_type
-                            max_count = count
-                            most_common_cell_type = cell_type
-                        elif count > second_max_count:
-                            second_max_count = count
-                            second_most_common_cell_type = cell_type
-                    cell_types[i] = most_common_cell_type
-                    confidences[i] = max_count * inv_num_neighbors
-                    next_best_cell_types[i] = \
-                        second_most_common_cell_type
-                    next_best_confidences[i] = \
-                        second_max_count * inv_num_neighbors
-            else:
-                thread_counts.resize(num_threads)
-                with nogil, parallel(num_threads=num_threads):
-                    thread_index = threadid()
-                    thread_counts[thread_index].resize(num_cell_types)
-                    for i in prange(num_cells):
-                        fill(thread_counts[thread_index].begin(),
-                             thread_counts[thread_index].end(), 0)
+            num_threads = min(num_threads, num_cells)
+            if next_best_cell_types.shape[0] == 0:  # `next_best=False`
+                if num_threads == 1:
+                    counts_buffer.resize(num_cell_types)
+                    counts = <unsigned[:num_cell_types]> counts_buffer.data()
+                    for i in range(num_cells):
+                        counts[:] = 0
                         for j in range(num_neighbors):
-                            cell_type = original_cell_type_column[
-                                neighbors[i, j]]
-                            thread_counts[thread_index][cell_type] += 1
-                        if thread_counts[thread_index][0] >= \
-                                thread_counts[thread_index][1]:
-                            max_count = thread_counts[thread_index][0]
-                            second_max_count = thread_counts[thread_index][1]
+                            # Get the cell-type label of this nearest neighbor (using
+                            # our integer encoding where the most common cell type is
+                            # 0, the next-most common 1, etc.)
+                            cell_type = original_cell_type_column[neighbors[i, j]]
+                            counts[cell_type] += 1
+                        if counts[0] >= counts[1]:
+                            max_count = counts[0]
+                            most_common_cell_type = 0
+                        else:
+                            max_count = counts[1]
+                            most_common_cell_type = 1
+                        for cell_type in range(2, num_cell_types):
+                            count = counts[cell_type]
+                            if count > max_count:
+                                max_count = count
+                                most_common_cell_type = cell_type
+                        cell_types[i] = most_common_cell_type
+                        confidences[i] = max_count * inv_num_neighbors
+                else:
+                    thread_counts.resize(num_threads)
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        thread_counts[thread_index].resize(num_cell_types)
+                        for i in prange(num_cells):
+                            fill(thread_counts[thread_index].begin(),
+                                 thread_counts[thread_index].end(), 0)
+                            for j in range(num_neighbors):
+                                cell_type = original_cell_type_column[neighbors[i, j]]
+                                thread_counts[thread_index][cell_type] += 1
+                            if thread_counts[thread_index][0] >= \
+                                    thread_counts[thread_index][1]:
+                                max_count = thread_counts[thread_index][0]
+                                most_common_cell_type = 0
+                            else:
+                                max_count = thread_counts[thread_index][1]
+                                most_common_cell_type = 1
+                            for cell_type in range(2, num_cell_types):
+                                count = thread_counts[thread_index][cell_type]
+                                if count > max_count:
+                                    max_count = count
+                                    most_common_cell_type = cell_type
+                            cell_types[i] = most_common_cell_type
+                            confidences[i] = max_count * inv_num_neighbors
+            else:  # `next_best=True`; also compute the next-best cell type/confidence
+                if num_threads == 1:
+                    counts_buffer.resize(num_cell_types)
+                    counts = <unsigned[:num_cell_types]> counts_buffer.data()
+                    for i in range(num_cells):
+                        counts[:] = 0
+                        for j in range(num_neighbors):
+                            # Get the cell-type label of this nearest neighbor (using
+                            # our integer encoding where the most common cell type is
+                            # 0, the next-most common 1, etc.)
+                            cell_type = original_cell_type_column[neighbors[i, j]]
+                            counts[cell_type] += 1
+                        if counts[0] >= counts[1]:
+                            max_count = counts[0]
+                            second_max_count = counts[1]
                             most_common_cell_type = 0
                             second_most_common_cell_type = 1
                         else:
-                            max_count = thread_counts[thread_index][1]
-                            second_max_count = thread_counts[thread_index][0]
+                            max_count = counts[1]
+                            second_max_count = counts[0]
                             most_common_cell_type = 1
                             second_most_common_cell_type = 0
                         for cell_type in range(2, num_cell_types):
-                            count = thread_counts[thread_index][cell_type]
+                            count = counts[cell_type]
                             if count > max_count:
                                 second_max_count = max_count
                                 second_most_common_cell_type = \
@@ -25483,6 +31017,45 @@ class SingleCell:
                             second_most_common_cell_type
                         next_best_confidences[i] = \
                             second_max_count * inv_num_neighbors
+                else:
+                    thread_counts.resize(num_threads)
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        thread_counts[thread_index].resize(num_cell_types)
+                        for i in prange(num_cells):
+                            fill(thread_counts[thread_index].begin(),
+                                 thread_counts[thread_index].end(), 0)
+                            for j in range(num_neighbors):
+                                cell_type = original_cell_type_column[neighbors[i, j]]
+                                thread_counts[thread_index][cell_type] += 1
+                            if thread_counts[thread_index][0] >= \
+                                    thread_counts[thread_index][1]:
+                                max_count = thread_counts[thread_index][0]
+                                second_max_count = thread_counts[thread_index][1]
+                                most_common_cell_type = 0
+                                second_most_common_cell_type = 1
+                            else:
+                                max_count = thread_counts[thread_index][1]
+                                second_max_count = thread_counts[thread_index][0]
+                                most_common_cell_type = 1
+                                second_most_common_cell_type = 0
+                            for cell_type in range(2, num_cell_types):
+                                count = thread_counts[thread_index][cell_type]
+                                if count > max_count:
+                                    second_max_count = max_count
+                                    second_most_common_cell_type = \
+                                        most_common_cell_type
+                                    max_count = count
+                                    most_common_cell_type = cell_type
+                                elif count > second_max_count:
+                                    second_max_count = count
+                                    second_most_common_cell_type = cell_type
+                            cell_types[i] = most_common_cell_type
+                            confidences[i] = max_count * inv_num_neighbors
+                            next_best_cell_types[i] = \
+                                second_most_common_cell_type
+                            next_best_confidences[i] = \
+                                second_max_count * inv_num_neighbors
             ''')['label_transfer'](
                 neighbors=neighbors,
                 original_cell_type_column=original_cell_type_column.to_numpy(),
@@ -25498,16 +31071,20 @@ class SingleCell:
         cell_types = pl.Series(cell_type_column, cell_types)\
             .cast(pl.Enum(most_common_cell_types.to_list()))
         confidences = pl.Series(confidence_column, confidences)
-        next_best_cell_types = \
-            pl.Series(next_best_cell_type_column, next_best_cell_types)\
-            .cast(pl.Enum(most_common_cell_types.to_list()))
-        next_best_confidences = \
-            pl.Series(next_best_confidence_column, next_best_confidences)
+        if next_best:
+            next_best_cell_types = \
+                pl.Series(next_best_cell_type_column, next_best_cell_types)\
+                .cast(pl.Enum(most_common_cell_types.to_list()))
+            next_best_confidences = \
+                pl.Series(next_best_confidence_column, next_best_confidences)
+            columns = cell_types, confidences, next_best_cell_types, \
+                next_best_confidences
+        else:
+            columns = cell_types, confidences
         
-        # Add the four columns to `self.obs`. If `QC_column` was specified,
-        # back-project from QCed cells to all cells, filling with `null`.
-        columns = cell_types, confidences, next_best_cell_types, \
-            next_best_confidences
+        # Add the cell-type labels and confidences to `self.obs`. If
+        # `QC_column` was specified, back-project from QCed cells to all cells,
+        # filling with `null`.
         if QC_column is None:
             obs = self._obs.with_columns(columns)
         else:
@@ -26324,8 +31901,8 @@ class SingleCell:
                        returns a polars Series or 1D NumPy array. Set to `None`
                        to include all cells. Cells failing QC will be ignored.
             min_detection_rate: the minimum detection rate required to select
-                                a gene as a marker gene; must be positive and
-                                less than or equal to 1
+                                a gene as a marker gene; must be greater than 0
+                                and less than or equal to 1
             min_fold_change: the minimum fold change in detection rate required
                              to select a gene as a marker gene; must be greater
                              than 1
@@ -26427,12 +32004,12 @@ class SingleCell:
         groups = (cell_type_column.to_frame().lazy()
                   .with_columns(
                       _SingleCell_group_indices=pl.int_range(pl.len(),
-                                                             dtype=pl.Int32))
+                                                             dtype=pl.UInt32))
                   if QC_column is None else
                   pl.LazyFrame((cell_type_column, QC_column))
                   .with_columns(
                       _SingleCell_group_indices=pl.int_range(pl.len(),
-                                                             dtype=pl.Int32))
+                                                             dtype=pl.UInt32))
                   .filter(QC_column.name))\
             .group_by(cell_type_column_name)\
             .agg('_SingleCell_group_indices', _SingleCell_num_cells=pl.len())\
@@ -26461,7 +32038,6 @@ class SingleCell:
                 groups['_SingleCell_num_cells'].cum_sum().to_numpy()
             cython_inline(r'''
                 from cython.parallel cimport prange
-                from libcpp.algorithm cimport fill
                 
                 ctypedef fused numeric:
                     int
@@ -26478,13 +32054,12 @@ class SingleCell:
                 def groupby_getnnz_csr(
                         const signed_integer[::1] indices,
                         const signed_integer[::1] indptr,
-                        const int[::1] group_indices,
+                        const unsigned[::1] group_indices,
                         const unsigned[::1] group_ends,
                         unsigned[:, ::1] result,
                         const unsigned num_threads):
-                    cdef unsigned group, cell, num_groups = group_ends.shape[0], \
+                    cdef unsigned group, cell, row, num_groups = group_ends.shape[0], \
                         num_genes = result.shape[1]
-                    cdef int row
                     cdef unsigned long gene
                     
                     if num_threads == 1:
@@ -26508,7 +32083,7 @@ class SingleCell:
                     else:
                         for group in prange(num_groups, nogil=True,
                                             num_threads=num_threads):
-                            fill(&result[group, 0], &result[group, 0] + num_genes, 0)
+                            result[group, :] = 0
                             for cell in range(
                                     0 if group == 0 else group_ends[group - 1],
                                     group_ends[group]):
@@ -26522,7 +32097,7 @@ class SingleCell:
                 result=detection_count, num_threads=num_threads)
         else:
             # noinspection PyUnresolvedReferences
-            group_map = pl.int_range(X.shape[0], dtype=pl.Int32, eager=True)\
+            group_map = pl.int_range(X.shape[0], dtype=pl.UInt32, eager=True)\
                 .to_frame('_SingleCell_group_indices')\
                 .join(groups
                       .select('_SingleCell_group_indices',
@@ -26536,66 +32111,72 @@ class SingleCell:
                 group_map = group_map.fill_null(-1)
             group_map = group_map.to_numpy()
             # noinspection PyUnresolvedReferences
-            cython_inline('''
-                from cython.parallel cimport prange
-                
-                ctypedef fused numeric:
-                    int
-                    unsigned
-                    long
-                    unsigned long
-                    float
-                    double
-                
-                ctypedef fused signed_integer:
-                    int
-                    long
-                
-                def groupby_getnnz_csc(
-                        const signed_integer[::1] indices,
-                        const signed_integer[::1] indptr,
-                        const int[::1] group_map,
-                        const bint has_missing,
-                        unsigned[:, ::1] result,
-                        const unsigned num_threads):
-                    cdef unsigned column, num_columns = result.shape[1]
-                    cdef int group
-                    cdef unsigned long row
-                    
-                    if num_threads == 1:
-                        if has_missing:
-                            # For each gene (column of the sparse array)...
-                            for column in range(num_columns):
-                                # For each cell (row) that's non-zero for this gene...
-                                for row in range(<unsigned long> indptr[column], <unsigned long> indptr[column + 1]):
-                                    # Get the group index for this row (-1 if it failed
-                                    # QC)
-                                    group = group_map[indices[row]]
-                                    if group == -1:
-                                        continue
-                                    
-                                    # Add 1 to the total for this group and column
-                                    result[group, column] += 1
-                        else:
-                            for column in range(num_columns):
-                                for row in range(<unsigned long> indptr[column], <unsigned long> indptr[column + 1]):
-                                    group = group_map[indices[row]]
-                                    result[group, column] += 1
-                    else:
-                        if has_missing:
-                            for column in prange(num_columns, nogil=True,
-                                                 num_threads=num_threads):
-                                for row in range(<unsigned long> indptr[column], <unsigned long> indptr[column + 1]):
-                                    group = group_map[indices[row]]
-                                    if group == -1:
-                                        continue
-                                    result[group, column] += 1
-                        else:
-                            for column in prange(num_columns, nogil=True,
-                                                 num_threads=num_threads):
-                                for row in range(<unsigned long> indptr[column], <unsigned long> indptr[column + 1]):
-                                    group = group_map[indices[row]]
-                                    result[group, column] += 1
+            cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, threadid
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def groupby_getnnz_csc(
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                const int[::1] group_map,
+                const bint has_missing,
+                unsigned[:, ::1] result,
+                unsigned num_threads):
+            cdef unsigned column, thread_index, num_columns = result.shape[1]
+            cdef int group
+            cdef unsigned long row
+            cdef pair[unsigned, unsigned] col_range
+            
+            num_threads = min(num_threads, num_columns)
+            if num_threads == 1:
+                if has_missing:
+                    # For each gene (column of the sparse array)...
+                    for column in range(num_columns):
+                        # For each cell (row) that's non-zero for this gene...
+                        for row in range(<unsigned long> indptr[column],
+                                         <unsigned long> indptr[column + 1]):
+                            # Get the group index for this row (-1 if it failed
+                            # QC)
+                            group = group_map[indices[row]]
+                            if group == -1:
+                                continue
+                            
+                            # Add 1 to the total for this group and column
+                            result[group, column] += 1
+                else:
+                    for column in range(num_columns):
+                        for row in range(<unsigned long> indptr[column],
+                                         <unsigned long> indptr[column + 1]):
+                            group = group_map[indices[row]]
+                            result[group, column] += 1
+            else:
+                if has_missing:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for column in range(col_range.first, col_range.second):
+                            for row in range(<unsigned long> indptr[column],
+                                             <unsigned long> indptr[column + 1]):
+                                group = group_map[indices[row]]
+                                if group == -1:
+                                    continue
+                                result[group, column] += 1
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for column in range(col_range.first, col_range.second):
+                            for row in range(<unsigned long> indptr[column],
+                                             <unsigned long> indptr[column + 1]):
+                                group = group_map[indices[row]]
+                                result[group, column] += 1
                     ''', warn_undeclared=False)['groupby_getnnz_csc'](
                         indices=X.indices, indptr=X.indptr,
                         group_map=group_map, has_missing=has_missing,
@@ -26764,6 +32345,7 @@ class SingleCell:
                      *,
                      cells_to_plot_column: SingleCellColumn |
                                            None = 'passed_QC',
+                     cell_types: str | Iterable[str] | None = None,
                      figure_kwargs: dict[str, Any] | None = None,
                      colormap: str | 'Colormap' = 'RdBu_r',
                      colorbar: bool = True,
@@ -26814,6 +32396,10 @@ class SingleCell:
                                   takes in this SingleCell dataset and returns
                                   a polars Series or 1D NumPy array. Set to
                                   `None` to plot all cells passing QC.
+            cell_types: a list of cell types to plot; by default, plots all of
+                        them. Can also be used to change the order in which
+                        cell types are displayed, even if plotting all cell
+                        types.
             figure_kwargs: a dictionary of keyword arguments to be passed to
                            `plt.figure`, such as:
                            - `figsize`: a two-element sequence of the width and
@@ -26999,6 +32585,19 @@ class SingleCell:
                              QC_column=cells_to_plot_column)
         cell_type_column_name = cell_type_column.name
         
+        # If `cell_types` is not `None`, check that `cell_types` contains only
+        # cell type names present in `cell_type_column`
+        if cell_types is not None:
+            cell_types = to_tuple_checked(cell_types, 'cell_types', str,
+                                          'strings')
+            unique_cell_types = cell_type_column.unique(maintain_order=True)
+            for cell_type in cell_types:
+                if cell_type not in unique_cell_types:
+                    error_message = (
+                        f'cell_types contains a cell type, {cell_type!r}, not '
+                        f'present in cell_type_column')
+                    raise ValueError(error_message)
+        
         # If `filename` was specified, check that it is a string or
         # `pathlib.Path` and that its base directory exists; if `filename` is
         # `None`, make sure `savefig_kwargs` is also `None`
@@ -27078,22 +32677,30 @@ class SingleCell:
         groups = (cell_type_column.to_frame().lazy()
                   .with_columns(
                       _SingleCell_group_indices=pl.int_range(pl.len(),
-                                                             dtype=pl.Int32))
+                                                             dtype=pl.UInt32))
                   if cells_to_plot_column is None else
                   pl.LazyFrame((cell_type_column, cells_to_plot_column))
                   .with_columns(
                       _SingleCell_group_indices=pl.int_range(pl.len(),
-                                                             dtype=pl.Int32))
+                                                             dtype=pl.UInt32))
                   .filter(cells_to_plot_column.name))\
             .group_by(cell_type_column_name)\
             .agg('_SingleCell_group_indices', _SingleCell_num_cells=pl.len())\
             .sort(cell_type_column_name)\
             .collect()
         
+        # If `cell_types` is not `None`, reindex `groups` to contain only the
+        # cell types in `cell_types`, in the same order. Otherwise, get the
+        # list of cell types from `groups`.
+        if cell_types is not None:
+            groups = pl.DataFrame({cell_type_column_name: cell_types})\
+                .join(groups, on=cell_type_column_name, how='left')
+        else:
+            cell_types = groups[cell_type_column_name]
+        
         # Get a cell-type-by-gene matrix of the number of cells of each type
         # with non-zero expression of each gene in `genes`, i.e. the gene's
         # detection count in that cell type
-        cell_types = groups[cell_type_column_name]
         num_cell_types = len(cell_types)
         if num_cell_types == 1:
             cell_type_column_description = \
@@ -27126,7 +32733,6 @@ class SingleCell:
             gene_map = gene_map.fill_null(-1).to_numpy()
             cython_inline(r'''
                 from cython.parallel cimport prange
-                from libcpp.algorithm cimport fill
                 
                 ctypedef fused numeric:
                     int
@@ -27140,17 +32746,17 @@ class SingleCell:
                     int
                     long
                 
-                def groupby_getnnz_csr(
+                def groupby_getnnz_csr_for_gene_subset(
                         const signed_integer[::1] indices,
                         const signed_integer[::1] indptr,
-                        const int[::1] group_indices,
+                        const unsigned[::1] group_indices,
                         const unsigned[::1] group_ends,
                         const int[::1] gene_map,
                         unsigned[:, ::1] result,
                         const unsigned num_threads):
-                    cdef unsigned group, cell, num_groups = group_ends.shape[0], \
+                    cdef unsigned group, cell, row, num_groups = group_ends.shape[0], \
                         num_genes = result.shape[1]
-                    cdef int row, column
+                    cdef int column
                     cdef unsigned long gene
                     
                     if num_threads == 1:
@@ -27179,7 +32785,7 @@ class SingleCell:
                     else:
                         for group in prange(num_groups, nogil=True,
                                             num_threads=num_threads):
-                            fill(&result[group, 0], &result[group, 0] + num_genes, 0)
+                            result[group, :] = 0
                             for cell in range(
                                     0 if group == 0 else group_ends[group - 1],
                                     group_ends[group]):
@@ -27190,13 +32796,13 @@ class SingleCell:
                                     if column == -1:
                                         continue
                                     result[group, column] += 1
-            ''', warn_undeclared=False)['groupby_getnnz_csr'](
+            ''', warn_undeclared=False)['groupby_getnnz_csr_for_gene_subset'](
                 indices=X.indices, indptr=X.indptr,
                 group_indices=group_indices, group_ends=group_ends,
                 gene_map=gene_map, result=detection_count,
                 num_threads=num_threads)
         else:
-            group_map = pl.int_range(X.shape[0], dtype=pl.Int32, eager=True)\
+            group_map = pl.int_range(X.shape[0], dtype=pl.UInt32, eager=True)\
                 .to_frame('_SingleCell_group_indices')\
                 .join(groups
                       .select('_SingleCell_group_indices',
@@ -27222,81 +32828,84 @@ class SingleCell:
                 .select('index')\
                 .to_series()\
                 .to_numpy()
-            cython_inline('''
-                from cython.parallel cimport prange
-                
-                ctypedef fused numeric:
-                    int
-                    unsigned
-                    long
-                    unsigned long
-                    float
-                    double
-                
-                ctypedef fused signed_integer:
-                    int
-                    long
-                
-                def groupby_getnnz_csc(
-                        const signed_integer[::1] indices,
-                        const signed_integer[::1] indptr,
-                        const int[::1] group_map,
-                        const unsigned[::1] gene_map,
-                        const bint has_missing,
-                        unsigned[:, ::1] result,
-                        const unsigned num_threads):
-                    cdef unsigned column, gene, num_columns = result.shape[1]
-                    cdef int group
-                    cdef unsigned long cell
-                    
-                    if num_threads == 1:
-                        if has_missing:
-                            # For each gene...
-                            for column in range(num_columns):
-                                # Get the index of this gene in the count matrix
-                                gene = gene_map[column]
-                                # For each cell (row) that's non-zero for this gene...
-                                for cell in range(<unsigned long> indptr[gene],
-                                                  <unsigned long> indptr[gene + 1]):
-                                    # Get the group index for this cell (-1 if it
-                                    # failed QC)
-                                    group = group_map[indices[cell]]
-                                    if group == -1:
-                                        continue
-                                    
-                                    # Add 1 to the total for this group and gene
-                                    result[group, column] += 1
-                        else:
-                            for column in range(num_columns):
-                                gene = gene_map[column]
-                                for cell in range(<unsigned long> indptr[gene],
-                                                  <unsigned long> indptr[gene + 1]):
-                                    group = group_map[indices[cell]]
-                                    result[group, column] += 1
-                    else:
-                        if has_missing:
-                            for column in prange(num_columns, nogil=True,
-                                                 num_threads=num_threads):
-                                gene = gene_map[column]
-                                for cell in range(<unsigned long> indptr[gene],
-                                                  <unsigned long> indptr[gene + 1]):
-                                    group = group_map[indices[cell]]
-                                    if group == -1:
-                                        continue
-                                    result[group, column] += 1
-                        else:
-                            for column in prange(num_columns, nogil=True,
-                                                 num_threads=num_threads):
-                                gene = gene_map[column]
-                                for cell in range(<unsigned long> indptr[gene],
-                                                  <unsigned long> indptr[gene + 1]):
-                                    group = group_map[indices[cell]]
-                                    result[group, column] += 1
-                    ''', warn_undeclared=False)['groupby_getnnz_csc'](
-                        indices=X.indices, indptr=X.indptr,
-                        group_map=group_map, gene_map=gene_map,
-                        has_missing=has_missing, result=detection_count,
-                        num_threads=num_threads)
+            cython_inline(_thread_offset_import + r'''
+        from cython.parallel cimport parallel, threadid
+        
+        ctypedef fused numeric:
+            int
+            unsigned
+            long
+            unsigned long
+            float
+            double
+        
+        def groupby_getnnz_csc_for_gene_subset(
+                const signed_integer[::1] indices,
+                const signed_integer[::1] indptr,
+                const int[::1] group_map,
+                const unsigned[::1] gene_map,
+                const bint has_missing,
+                unsigned[:, ::1] result,
+                unsigned num_threads):
+            cdef unsigned column, gene, thread_index, num_columns = result.shape[1]
+            cdef int group
+            cdef unsigned long cell
+            cdef pair[unsigned, unsigned] col_range
+            
+            num_threads = min(num_threads, num_columns)
+            if num_threads == 1:
+                if has_missing:
+                    # For each gene...
+                    for column in range(num_columns):
+                        # Get the index of this gene in the count matrix
+                        gene = gene_map[column]
+                        # For each cell (row) that's non-zero for this gene...
+                        for cell in range(<unsigned long> indptr[gene],
+                                          <unsigned long> indptr[gene + 1]):
+                            # Get the group index for this cell (-1 if it
+                            # failed QC)
+                            group = group_map[indices[cell]]
+                            if group == -1:
+                                continue
+                            
+                            # Add 1 to the total for this group and gene
+                            result[group, column] += 1
+                else:
+                    for column in range(num_columns):
+                        gene = gene_map[column]
+                        for cell in range(<unsigned long> indptr[gene],
+                                          <unsigned long> indptr[gene + 1]):
+                            group = group_map[indices[cell]]
+                            result[group, column] += 1
+            else:
+                if has_missing:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for column in range(col_range.first, col_range.second):
+                            gene = gene_map[column]
+                            for cell in range(<unsigned long> indptr[gene],
+                                              <unsigned long> indptr[gene + 1]):
+                                group = group_map[indices[cell]]
+                                if group == -1:
+                                    continue
+                                result[group, column] += 1
+                else:
+                    with nogil, parallel(num_threads=num_threads):
+                        thread_index = threadid()
+                        col_range = get_thread_offset(indptr, thread_index, num_threads)
+                        for column in range(col_range.first, col_range.second):
+                            gene = gene_map[column]
+                            for cell in range(<unsigned long> indptr[gene],
+                                              <unsigned long> indptr[gene + 1]):
+                                group = group_map[indices[cell]]
+                                result[group, column] += 1
+                    ''', warn_undeclared=False)\
+                ['groupby_getnnz_csc_for_gene_subset'](
+                    indices=X.indices, indptr=X.indptr,
+                    group_map=group_map, gene_map=gene_map,
+                    has_missing=has_missing, result=detection_count,
+                    num_threads=num_threads)
         
         # For each cell type, calculate the detection rate and the fold change
         # of the detection rate. Also, initialize the candidate set of points
@@ -27565,7 +33174,7 @@ class SingleCell:
                                  distance to its 3rd, 4th, and 5th nearest
                                  neighbors, divided by `j`'s average Euclidean
                                  distance to its 3rd, 4th, and 5th nearest
-                                 neighbors. Must be a positive integer or 0.
+                                 neighbors. Must be a non-negative integer.
                                  Defaults to 10, instead of PaCMAP's original
                                  default of 50. `neighbors_key` must contain at
                                  least `num_neighbors + num_extra_neighbors`
@@ -27586,8 +33195,8 @@ class SingleCell:
                                      operations for single-threaded PaCMAP.
                                      This gives a modest (~15%) boost in
                                      single-threaded performance at the cost of
-                                     no longer exactly matching the embedding 
-                                     produced by the multithreaded version (due 
+                                     no longer exactly matching the embedding
+                                     produced by the multithreaded version (due
                                      to differences in floating-point error
                                      arising from the different order of
                                      operations). Must be `False` unless
@@ -27679,9 +33288,9 @@ class SingleCell:
                 (num_further_pairs, 'num_further_pairs')):
             check_type(variable, variable_name, int, 'a positive integer')
             check_bounds(variable, variable_name, 1)
-        # Check that `num_extra_neighbors` is a positive integer or 0
+        # Check that `num_extra_neighbors` is a non-negative integer
         check_type(num_extra_neighbors, 'num_extra_neighbors', int,
-                   'a positive integer or 0')
+                   'a non-negative integer')
         check_bounds(num_extra_neighbors, 'num_extra_neighbors', 0)
         # Check that `num_iterations` is an integer or length-3 tuple of
         # integers, or `None`
@@ -27731,13 +33340,11 @@ class SingleCell:
         # Define Cython functions
         cython_functions = cython_inline(_uninitialized_vector_import + r'''
         from cython.parallel cimport parallel, prange, threadid
+        from libc.limits cimport UINT_MAX
         from libc.string cimport memcpy
         from libcpp.algorithm cimport sort
         from libcpp.cmath cimport sqrt
         from libcpp.vector cimport vector
-        
-        cdef extern from "limits.h":
-            cdef unsigned UINT_MAX
         
         cdef extern from * nogil:
             """
@@ -27777,7 +33384,7 @@ class SingleCell:
             """
             cdef cppclass Compare:
                 Compare(const float*) noexcept
-                bint operator()(unsigned int, unsigned int) noexcept
+                bint operator()(unsigned, unsigned) noexcept
         
         cdef inline void argsort(const float* arr, unsigned* indices,
                                  const unsigned n) noexcept nogil:
@@ -28413,7 +34020,7 @@ class SingleCell:
                                     int | np.integer] | None = None,
               learning_rate: int | float | np.integer | np.floating = 1.0,
               seed: int | np.integer = 0,
-              faster_single_threading: bool = False,
+              match_parallel: bool = False,
               overwrite: bool = False,
               verbose: bool = True,
               num_threads: int | np.integer | None = None) -> SingleCell:
@@ -28469,7 +34076,7 @@ class SingleCell:
                                  distance to its 3rd, 4th, and 5th nearest
                                  neighbors, divided by `j`'s average Euclidean
                                  distance to its 3rd, 4th, and 5th nearest
-                                 neighbors. Must be a positive integer or 0.
+                                 neighbors. Must be a non-negative integer.
                                  Defaults to 10, instead of PaCMAP's original
                                  default of 50. `neighbors_key` must contain at
                                  least `num_neighbors + num_extra_neighbors`
@@ -28486,20 +34093,14 @@ class SingleCell:
                             two stages will be set to 100).
             learning_rate: the learning rate of the Adam optimizer for PaCMAP
             seed: the random seed toer use for PaCMAP
-            faster_single_threading: if `True`, use a different order of
-                                     operations for single-threaded PaCMAP.
-                                     This gives a modest (~15%) boost in
-                                     single-threaded performance at the cost of
-                                     no longer exactly matching the embedding
-                                     produced by the multithreaded version (due
-                                     to differences in floating-point error
-                                     arising from the different order of
-                                     operations). Must be `False` unless
-                                     `num_threads=1`. If you are always going
-                                     to run single-threaded and do not care
-                                     about exactly matching the multithreaded
-                                     version, there is no reason not to set
-                                     `faster_single_threading=True`.
+            match_parallel: if `False`, use a different order of operations for
+                            single-threaded PaCMAP. This gives a modest (~15%)
+                            boost in single-threaded performance at the cost of
+                            no longer exactly matching the embedding produced
+                            by the multithreaded version (due to differences in
+                            floating-point error arising from the different
+                            order of operations). Must be `False` unless
+                            `num_threads=1`.
             overwrite: if `True`, overwrite `embedding_key` if already present
                        in `obsm`, instead of raising an error
             verbose: whether to print details of the PaCMAP construction
@@ -28614,19 +34215,58 @@ class SingleCell:
             neighbors = neighbors[QCed_NumPy]
             distances = distances[QCed_NumPy]
         
-        # Check that `num_neighbors`, `num_mid_near_pairs` and
-        # `num_further_pairs` are positive integers
+        # Check that there are at least 7 cells (since
+        # `sample_mid_near_pairs() requires 6 other cells)
+        num_cells = PCs.shape[0]
+        if num_cells < 7:
+            error_message = (
+                f'there are fewer than 7 cells, so the embedding cannot be '
+                f'calculated')
+            raise ValueError(error_message)
+        
+        # Check that `num_neighbors` is between 1 and `num_cells - 1`
+        check_type(num_neighbors, 'num_neighbors', int, 'a positive integer')
+        if not 1 <= num_neighbors < num_cells:
+            error_message = (
+                f'num_neighbors is {num_neighbors:,}, but must be ≥ 1 and '
+                f'less than the number of cells ({num_cells:,})')
+            raise ValueError(error_message)
+        
+        # Check that `num_mid_near_pairs` and `num_further_pairs` are between 1
+        # and `num_cells`
         for variable, variable_name in (
-                (num_neighbors, 'num_neighbors'),
                 (num_mid_near_pairs, 'num_mid_near_pairs'),
                 (num_further_pairs, 'num_further_pairs')):
             check_type(variable, variable_name, int, 'a positive integer')
-            check_bounds(variable, variable_name, 1)
+            if not 1 <= variable <= num_cells:
+                error_message = (
+                    f'{variable_name} is {variable:,}, but must be ≥ 1 and ≤ '
+                    f'the number of cells ({num_cells:,})')
+                raise ValueError(error_message)
         
-        # Check that `num_extra_neighbors` is a positive integer or 0
+        # Check that there are at least `num_neighbors + num_further_pairs + 1`
+        # cells (since `sample_further_pairs()` requires
+        # `num_neighbors + num_further_pairs` other cells)
+        if num_cells < num_neighbors + num_further_pairs + 1:
+            error_message = (
+                f'there are fewer than '
+                f'{num_neighbors + num_further_pairs + 1} (num_neighbors + '
+                f'num_further_pairs + 1) cells, so the embedding cannot be '
+                f'calculated')
+            raise ValueError(error_message)
+        
+        # Check that `num_extra_neighbors` is ≥ 0 and that
+        # `num_neighbors + num_extra_neighbors` is less than `num_cells`
         check_type(num_extra_neighbors, 'num_extra_neighbors', int,
-                   'a positive integer or 0')
+                   'a non-negative integer')
         check_bounds(num_extra_neighbors, 'num_extra_neighbors', 0)
+        if num_neighbors + num_extra_neighbors >= num_cells:
+            error_message = (
+                f'num_neighbors ({num_neighbors:,}) + num_extra_neighbors '
+                f'({num_extra_neighbors:,}) is '
+                f'{num_neighbors + num_extra_neighbors:,}, but must be less '
+                f'than the number of cells ({num_cells:,})')
+            raise ValueError(error_message)
         
         # Check that `num_iterations` is an integer or length-3 tuple of
         # integers, or `None`
@@ -28665,32 +34305,25 @@ class SingleCell:
         # `None`, set to `self.num_threads`, and if -1, set to `os.cpu_count()`
         num_threads = self._process_num_threads(num_threads)
         
-        # Check that `faster_single_threading` is Boolean, and `False` unless
+        # Check that `match_parallel` is Boolean, and `False` unless
         # `num_threads=1`
-        check_type(faster_single_threading, 'faster_single_threading', bool,
-                   'Boolean')
-        if faster_single_threading and num_threads != 1:
+        check_type(match_parallel, 'match_parallel', bool, 'Boolean')
+        if match_parallel and num_threads != 1:
             error_message = \
-                'faster_single_threading must be False unless num_threads is 1'
+                'match_parallel must be False unless num_threads is 1'
             raise ValueError(error_message)
         
         # Check that `verbose` is Boolean
         check_type(verbose, 'verbose', bool, 'Boolean')
         
         # Define Cython functions
-        cython_functions = cython_inline(_uninitialized_vector_import + r'''
+        cython_functions = cython_inline(_uninitialized_vector_import + _heap_functions + r'''
         from cpython.exc cimport PyErr_CheckSignals
         from cython.parallel cimport parallel, prange, threadid
-        from libc.string cimport memcpy
-        from libcpp.algorithm cimport fill, sort
+        from libc.float cimport FLT_MAX
+        from libcpp.algorithm cimport sort
         from libcpp.cmath cimport sqrt
         from libcpp.vector cimport vector
-        
-        cdef extern from "float.h":
-            cdef float FLT_MAX
-        
-        cdef extern from "limits.h":
-            cdef unsigned UINT_MAX
         
         cdef extern from * nogil:
             """
@@ -28730,7 +34363,7 @@ class SingleCell:
             """
             cdef cppclass Compare:
                 Compare(const float*) noexcept
-                bint operator()(unsigned int, unsigned int) noexcept
+                bint operator()(unsigned, unsigned) noexcept
         
         cdef inline void argsort(const float* arr, unsigned* indices,
                                  const unsigned n) noexcept nogil:
@@ -28739,85 +34372,24 @@ class SingleCell:
                 indices[i] = i
             sort(indices, indices + n, Compare(arr))
         
-        cdef inline void max_heap_replace_top(unsigned* labels_i,
-                                              float* distances_i,
-                                              const unsigned label,
-                                              const float distance,
-                                              const unsigned k) noexcept nogil:
-            # Replaces the top element from the max-heap defined by `distances_i[0..k-1]`
-            # and `labels_i[0..k-1]`. Equivalent to `std::pop_heap` followed by
-            # `std::push_heap`, but done more efficiently as a single operation.
-
-            cdef unsigned j = 1, child
-            distances_i -= 1  # use 1-based indexing for easier node->child translation
-            labels_i -= 1
-            while True:
-                child = j << 1
-                if child > k:
-                    break
-                child += child < k and distances_i[child] <= distances_i[child + 1]
-                if distance > distances_i[child]:
-                    break
-                distances_i[j] = distances_i[child]
-                labels_i[j] = labels_i[child]
-                j = child
-            distances_i[j] = distance
-            labels_i[j] = label
-
-        cdef inline void max_heap_pop(unsigned* labels_i,
-                                      float* distances_i,
-                                      const unsigned k) noexcept nogil:
-            # Pops the top element from the max-heap defined by `distances_i[0..k-1]` and
-            # `labels_i[0..k-1]`. On output the `k-1`th element is undefined.
-
-            cdef unsigned label, j = 1, child
-            cdef float distance
-            distances_i -= 1  # use 1-based indexing for easier node->child translation
-            labels_i -= 1
-            distance = distances_i[k]
-            label = labels_i[k]
-            while True:
-                child = j << 1
-                if child > k:
-                    break
-                child += child < k and distances_i[child] <= distances_i[child + 1]
-                if distance > distances_i[child]:
-                    break
-                distances_i[j] = distances_i[child]
-                labels_i[j] = labels_i[child]
-                j = child
-            distances_i[j] = distance
-            labels_i[j] = label
-
-        cdef inline void max_heap_sort(unsigned* labels_i,
-                                       float* distances_i,
-                                       const unsigned k) noexcept nogil:
-            cdef unsigned j, label
-            cdef float distance
-            for j in range(k):
-                # Save the root (maximum element)
-                distance = distances_i[0]
-                label = labels_i[0]
-                # Restore the heap property with reduced size `k - i`
-                max_heap_pop(labels_i, distances_i, k - j)
-                # Place the maximum element after the end of the heap
-                distances_i[k - j - 1] = distance
-                labels_i[k - j - 1] = label
-        
         def get_neighbor_pairs(const float[:, ::1] X,
                                const unsigned[:, ::1] neighbors,
                                const float[:, ::1] distances,
                                unsigned[:, ::1] neighbor_pairs,
-                               const unsigned num_threads):
+                               unsigned num_threads):
             cdef unsigned i, j, k, neighbor, thread_index, num_cells = X.shape[0], \
                 num_total_neighbors = distances.shape[1], \
                 num_neighbors = neighbor_pairs.shape[1], num_PCs = X.shape[1], \
                 too_large = 0
             cdef float scaled_distance
-            cdef uninitialized_vector[float] average_distances, scaled_distances_i
+            cdef uninitialized_vector[float] average_distances_buffer, \
+                scaled_distances_i_buffer
             cdef vector[uninitialized_vector[float]] thread_scaled_distances_i
-            average_distances.resize(num_cells)
+            average_distances_buffer.resize(num_cells)
+            cdef float[::1] scaled_distances_i, average_distances = \
+                <float[:num_cells]> average_distances_buffer.data()
             
+            num_threads = min(num_threads, num_cells)
             if num_threads == 1:
                 # Calculate the average Euclidean distance from each cell to its 4th-,
                 # 5th-, and 6th-nearest neighbors
@@ -28828,13 +34400,17 @@ class SingleCell:
                     if average_distances[i] < 1e-10:
                         average_distances[i] = 1e-10
                 
-                # Select the `num_neighbors` of each cell's `num_total_neighbors`-nearest
-                # neighbors with the lowest scaled distances. PaCMAP defines the scaled distance
-                # between cells `i` and `j` as the squared Euclidean distance from `i` to `j`,
-                # divided by `average_distance[i] * average_distance[j]`. However, when ranking
-                # cells by their scaled distance to cell `i`, we can ignore the normalization
-                # by `average_distance[i]` since it is constant for all neighbors `j`.
-                scaled_distances_i.resize(num_neighbors)
+                # Select the `num_neighbors` of each cell's
+                # `num_total_neighbors`-nearest neighbors with the lowest scaled
+                # distances. PaCMAP defines the scaled distance between cells `i` and
+                # `j` as the squared Euclidean distance from `i` to `j`, divided by
+                # `average_distance[i] * average_distance[j]`. However, when ranking
+                # cells by their scaled distance to cell `i`, we can ignore the
+                # normalization by `average_distance[i]` since it is constant for all
+                # neighbors `j`.
+                scaled_distances_i_buffer.resize(num_neighbors)
+                scaled_distances_i = \
+                    <float[:num_neighbors]> scaled_distances_i_buffer.data()
                 for i in range(num_cells):
                     for j in range(num_neighbors):
                         scaled_distances_i[j] = FLT_MAX
@@ -28844,15 +34420,20 @@ class SingleCell:
                             return True
                         scaled_distance = distances[i, j] / average_distances[neighbor]
                         if scaled_distance < scaled_distances_i[0]:
-                            max_heap_replace_top(&neighbor_pairs[i, 0], scaled_distances_i.data(),
-                                                 neighbor, scaled_distance, num_neighbors)
+                            max_heap_replace_top(&neighbor_pairs[i, 0],
+                                                 &scaled_distances_i[0],
+                                                 neighbor, scaled_distance,
+                                                 num_neighbors)
                    
-                    # Sort the heap to get nearest neighbors in ascending order of scaled distance
-                    max_heap_sort(&neighbor_pairs[i, 0], scaled_distances_i.data(), num_neighbors)
+                    # Sort the heap to get nearest neighbors in ascending order of
+                    # scaled distance
+                    max_heap_sort(&neighbor_pairs[i, 0], &scaled_distances_i[0],
+                                  num_neighbors)
             else:
-                # Same as the single-threaded version, but use `thread_scaled_distances_i`
-                # instead of `scaled_distances_i`. Also, use hardware-level atomics
-                # to thread-safely flag out-of-range neighbors.
+                # Same as the single-threaded version, but use
+                # `thread_scaled_distances_i` instead of `scaled_distances_i`. Also,
+                # use hardware-level atomics to thread-safely flag out-of-range
+                # neighbors.
                 
                 with nogil:
                     for i in prange(num_cells, num_threads=num_threads):
@@ -28875,53 +34456,58 @@ class SingleCell:
                                     atomic_or(too_large, True)
                                     with gil:
                                         return too_large
-                                scaled_distance = distances[i, j] / average_distances[neighbor]
-                                if scaled_distance < thread_scaled_distances_i[thread_index][0]:
-                                    max_heap_replace_top(&neighbor_pairs[i, 0],
-                                                         thread_scaled_distances_i[thread_index].data(),
-                                                         neighbor, scaled_distance, num_neighbors)
-                            max_heap_sort(&neighbor_pairs[i, 0],
-                                          thread_scaled_distances_i[thread_index].data(),
-                                          num_neighbors)
+                                scaled_distance = \
+                                    distances[i, j] / average_distances[neighbor]
+                                if scaled_distance < \
+                                        thread_scaled_distances_i[thread_index][0]:
+                                    max_heap_replace_top(
+                                        &neighbor_pairs[i, 0],
+                                        thread_scaled_distances_i[thread_index].data(),
+                                        neighbor, scaled_distance, num_neighbors)
+                            max_heap_sort(
+                                &neighbor_pairs[i, 0],
+                                thread_scaled_distances_i[thread_index].data(),
+                                num_neighbors)
             return too_large
         
         def sample_mid_near_pairs(const float[:, ::1] X,
                                   unsigned[:, ::1] mid_near_pairs,
                                   const unsigned long seed,
                                   const unsigned num_threads):
-            cdef unsigned i, j, k, l, sampled_k, thread_index, \
-                n = X.shape[0], closest_cell = UINT_MAX, \
-                second_closest_cell = UINT_MAX, \
-                num_mid_near_pairs = mid_near_pairs.shape[1], \
-                num_PCs = X.shape[1]
+            cdef unsigned i, j, k, l, sampled_k, closest_cell, second_closest_cell, \
+                thread_index, n = X.shape[0], \
+                num_mid_near_pairs = mid_near_pairs.shape[1], num_PCs = X.shape[1]
             cdef float difference, distance, smallest, second_smallest
             cdef unsigned long state
-            cdef uninitialized_vector[unsigned] sampled
+            cdef uninitialized_vector[unsigned] sampled_buffer
             cdef vector[uninitialized_vector[unsigned]] thread_sampled
+            cdef unsigned[::1] sampled
             
             if num_threads == 1:
-                sampled.resize(6)
+                sampled_buffer.resize(6)
+                sampled = <unsigned[:6]> sampled_buffer.data()
                 for i in range(n):
                     state = srand(seed + i)
                     for j in range(num_mid_near_pairs):
                         # Randomly sample 6 cells (which are not the
                         # current cell) and select the 2nd-closest
-                        smallest = UINT_MAX
-                        second_smallest = UINT_MAX
+                        smallest = FLT_MAX
+                        second_smallest = FLT_MAX
                         for k in range(6):
                             while True:
                                 # Sample a random cell...
-                                sampled[k] = randint(n, &state)
+                                sampled_k = randint(n, &state)
                                 
                                 # ...that is not this cell...
-                                if sampled[k] == i:
+                                if sampled_k == i:
                                     continue
                                 
                                 # ...nor a previously sampled cell
                                 for l in range(k):
-                                    if sampled[k] == sampled[l]:
+                                    if sampled_k == sampled[l]:
                                         break
                                 else:
+                                    sampled[k] = sampled_k
                                     break
                         for k in range(6):
                             sampled_k = sampled[k]
@@ -28934,10 +34520,10 @@ class SingleCell:
                                 second_smallest = smallest
                                 second_closest_cell = closest_cell
                                 smallest = distance
-                                closest_cell = sampled[k]
+                                closest_cell = sampled_k
                             elif distance < second_smallest:
                                 second_smallest = distance
-                                second_closest_cell = sampled[k]
+                                second_closest_cell = sampled_k
                         mid_near_pairs[i, j] = second_closest_cell
             else:
                 thread_sampled.resize(num_threads)
@@ -28947,19 +34533,19 @@ class SingleCell:
                     for i in prange(n):
                         state = srand(seed + i)
                         for j in range(num_mid_near_pairs):
-                            smallest = UINT_MAX
-                            second_smallest = UINT_MAX
+                            smallest = FLT_MAX
+                            second_smallest = FLT_MAX
                             for k in range(6):
                                 while True:
-                                    thread_sampled[thread_index][k] = \
-                                        randint(n, &state)
-                                    if thread_sampled[thread_index][k] == i:
+                                    sampled_k = randint(n, &state)
+                                    if sampled_k == i:
                                         continue
                                     for l in range(k):
-                                        if thread_sampled[thread_index][k] == \
+                                        if sampled_k == \
                                                 thread_sampled[thread_index][l]:
                                             break
                                     else:
+                                        thread_sampled[thread_index][k] = sampled_k
                                         break
                             for k in range(6):
                                 sampled_k = thread_sampled[thread_index][k]
@@ -28972,10 +34558,10 @@ class SingleCell:
                                     second_smallest = smallest
                                     second_closest_cell = closest_cell
                                     smallest = distance
-                                    closest_cell = thread_sampled[thread_index][k]
+                                    closest_cell = sampled_k
                                 elif distance < second_smallest:
                                     second_smallest = distance
-                                    second_closest_cell = thread_sampled[thread_index][k]
+                                    second_closest_cell = sampled_k
                             mid_near_pairs[i, j] = second_closest_cell
         
         def sample_further_pairs(const float[:, ::1] X,
@@ -29037,7 +34623,10 @@ class SingleCell:
                                   unsigned[::1] pair_indptr):
             cdef unsigned i, j, k, dest_index, num_cells = pairs.shape[0], \
                 num_pairs_per_cell = pairs.shape[1]
-            cdef uninitialized_vector[unsigned] dest_indices
+            cdef uninitialized_vector[unsigned] dest_indices_buffer
+            dest_indices_buffer.resize(num_cells)
+            cdef unsigned[::1] dest_indices = \
+                <unsigned[:num_cells]> dest_indices_buffer.data()
             
             # Tabulate how often each cell appears in pairs; at a minimum, it
             # will appear `pairs.shape[1]` times (i.e. the number of
@@ -29059,9 +34648,7 @@ class SingleCell:
             # pairs' indices. Use a temporary buffer, `dest_indices`, to keep
             # track of the index within `pair_indptr` to write each cell's next
             # pair to.
-            dest_indices.resize(num_cells)
-            memcpy(dest_indices.data(), &pair_indptr[0],
-                   num_cells * sizeof(unsigned))
+            dest_indices[:] = pair_indptr[:num_cells]
             for i in range(num_cells):
                 for k in range(num_pairs_per_cell):
                     j = pairs[i, k]
@@ -29070,130 +34657,135 @@ class SingleCell:
                     dest_indices[i] += 1
                     dest_indices[j] += 1
 
-        cdef inline void get_gradients_fast(
-                const float[:, ::1] embedding,
-                const unsigned[:, ::1] neighbor_pairs,
-                const unsigned[:, ::1] mid_near_pairs,
-                const unsigned[:, ::1] further_pairs,
-                const float w_neighbors,
-                const float w_mid_near,
-                float* gradients) noexcept nogil:
+        cdef inline void get_gradients_fast(const float[:, ::1] embedding,
+                                            const unsigned[:, ::1] neighbor_pairs,
+                                            const unsigned[:, ::1] mid_near_pairs,
+                                            const unsigned[:, ::1] further_pairs,
+                                            const float w_neighbors,
+                                            const float w_mid_near,
+                                            float[:, ::1] gradients):
             cdef unsigned i, j, k, num_cells = neighbor_pairs.shape[0], \
                 num_neighbors = neighbor_pairs.shape[1], \
                 num_mid_near_pairs = mid_near_pairs.shape[1], \
                 num_further_pairs = further_pairs.shape[1]
-            cdef float distance_ij, embedding_ij_0, embedding_ij_1, w
+            cdef float embedding_i0, embedding_i1, gradients_i0, gradients_i1, \
+                embedding_ij_0, embedding_ij_1, distance_ij, w
             
-            # Nearest-neighbor pairs
             for i in range(num_cells):
+                embedding_i0 = embedding[i, 0]
+                embedding_i1 = embedding[i, 1]
+                gradients_i0 = 0
+                gradients_i1 = 0
+                
+                # Nearest-neighbor pairs
                 for k in range(num_neighbors):
                     j = neighbor_pairs[i, k]
-                    embedding_ij_0 = embedding[i, 0] - embedding[j, 0]
-                    embedding_ij_1 = embedding[i, 1] - embedding[j, 1]
+                    embedding_ij_0 = embedding_i0 - embedding[j, 0]
+                    embedding_ij_1 = embedding_i1 - embedding[j, 1]
                     distance_ij = 1 + embedding_ij_0 * embedding_ij_0 + \
                         embedding_ij_1 * embedding_ij_1
                     w = w_neighbors * (20 / ((10 + distance_ij) * (10 + distance_ij)))
-                    gradients[2 * i] += w * embedding_ij_0
-                    gradients[2 * j] -= w * embedding_ij_0
-                    gradients[2 * i + 1] += w * embedding_ij_1
-                    gradients[2 * j + 1] -= w * embedding_ij_1
-                    
-            # Mid-near pairs
-            for i in range(num_cells):
+                    gradients_i0 += w * embedding_ij_0
+                    gradients[j, 0] -= w * embedding_ij_0
+                    gradients_i1 += w * embedding_ij_1
+                    gradients[j, 1] -= w * embedding_ij_1
+                
+                # Mid-near pairs
                 for k in range(num_mid_near_pairs):
                     j = mid_near_pairs[i, k]
-                    embedding_ij_0 = embedding[i, 0] - embedding[j, 0]
-                    embedding_ij_1 = embedding[i, 1] - embedding[j, 1]
+                    embedding_ij_0 = embedding_i0 - embedding[j, 0]
+                    embedding_ij_1 = embedding_i1 - embedding[j, 1]
                     distance_ij = 1 + embedding_ij_0 * embedding_ij_0 + \
                         embedding_ij_1 * embedding_ij_1
                     w = w_mid_near * (20000 / ((10000 + distance_ij) *
                                                (10000 + distance_ij)))
-                    gradients[2 * i] += w * embedding_ij_0
-                    gradients[2 * j] -= w * embedding_ij_0
-                    gradients[2 * i + 1] += w * embedding_ij_1
-                    gradients[2 * j + 1] -= w * embedding_ij_1
-                    
-            # Further pairs
-            for i in range(num_cells):
+                    gradients_i0 += w * embedding_ij_0
+                    gradients[j, 0] -= w * embedding_ij_0
+                    gradients_i1 += w * embedding_ij_1
+                    gradients[j, 1] -= w * embedding_ij_1
+                
+                # Further pairs
                 for k in range(num_further_pairs):
                     j = further_pairs[i, k]
-                    embedding_ij_0 = embedding[i, 0] - embedding[j, 0]
-                    embedding_ij_1 = embedding[i, 1] - embedding[j, 1]
+                    embedding_ij_0 = embedding_i0 - embedding[j, 0]
+                    embedding_ij_1 = embedding_i1 - embedding[j, 1]
                     distance_ij = 1 + embedding_ij_0 * embedding_ij_0 + \
                         embedding_ij_1 * embedding_ij_1
                     w = 2 / ((1 + distance_ij) * (1 + distance_ij))
-                    gradients[2 * i] -= w * embedding_ij_0
-                    gradients[2 * j] += w * embedding_ij_0
-                    gradients[2 * i + 1] -= w * embedding_ij_1
-                    gradients[2 * j + 1] += w * embedding_ij_1
+                    gradients_i0 -= w * embedding_ij_0
+                    gradients[j, 0] += w * embedding_ij_0
+                    gradients_i1 -= w * embedding_ij_1
+                    gradients[j, 1] += w * embedding_ij_1
         
-        cdef inline void get_gradient(
-                const float[:, ::1] embedding,
-                const unsigned[::1] neighbor_pair_indices,
-                const unsigned[::1] neighbor_pair_indptr,
-                const unsigned[::1] mid_near_pair_indices,
-                const unsigned[::1] mid_near_pair_indptr,
-                const unsigned[::1] further_pair_indices,
-                const unsigned[::1] further_pair_indptr,
-                const float w_neighbors,
-                const float w_mid_near,
-                float* gradients,
-                const unsigned i) noexcept nogil:
+                gradients[i, 0] += gradients_i0
+                gradients[i, 1] += gradients_i1
+        
+        cdef inline void get_gradient(const float[:, ::1] embedding,
+                                      const unsigned[::1] neighbor_pair_indices,
+                                      const unsigned[::1] neighbor_pair_indptr,
+                                      const unsigned[::1] mid_near_pair_indices,
+                                      const unsigned[::1] mid_near_pair_indptr,
+                                      const unsigned[::1] further_pair_indices,
+                                      const unsigned[::1] further_pair_indptr,
+                                      const float w_neighbors,
+                                      const float w_mid_near,
+                                      float[:, ::1] gradients,
+                                      const unsigned i) noexcept nogil:
             cdef unsigned j, k, num_cells = embedding.shape[0]
-            cdef float distance_ij, embedding_ij_0, embedding_ij_1, w, \
-                gradient_0 = 0, gradient_1 = 0
+            cdef float embedding_ij_0, embedding_ij_1, distance_ij, w, \
+                embedding_i0 = embedding[i, 0], embedding_i1 = embedding[i, 1], \
+                gradient_i0 = 0, gradient_i1 = 0
             
             # Nearest-neighbor pairs
             for k in range(neighbor_pair_indptr[i],
                            neighbor_pair_indptr[i + 1]):
                 j = neighbor_pair_indices[k]
-                embedding_ij_0 = embedding[i, 0] - embedding[j, 0]
-                embedding_ij_1 = embedding[i, 1] - embedding[j, 1]
+                embedding_ij_0 = embedding_i0 - embedding[j, 0]
+                embedding_ij_1 = embedding_i1 - embedding[j, 1]
                 distance_ij = 1 + embedding_ij_0 * embedding_ij_0 + \
                     embedding_ij_1 * embedding_ij_1
                 w = w_neighbors * (20 / ((10 + distance_ij) * (10 + distance_ij)))
-                gradient_0 = gradient_0 + w * embedding_ij_0
-                gradient_1 = gradient_1 + w * embedding_ij_1
+                gradient_i0 = gradient_i0 + w * embedding_ij_0
+                gradient_i1 = gradient_i1 + w * embedding_ij_1
                 
             # Mid-near pairs
             for k in range(mid_near_pair_indptr[i],
                            mid_near_pair_indptr[i + 1]):
                 j = mid_near_pair_indices[k]
-                embedding_ij_0 = embedding[i, 0] - embedding[j, 0]
-                embedding_ij_1 = embedding[i, 1] - embedding[j, 1]
+                embedding_ij_0 = embedding_i0 - embedding[j, 0]
+                embedding_ij_1 = embedding_i1 - embedding[j, 1]
                 distance_ij = 1 + embedding_ij_0 * embedding_ij_0 + \
                     embedding_ij_1 * embedding_ij_1
                 w = w_mid_near * (20000 / ((10000 + distance_ij) *
                                            (10000 + distance_ij)))
-                gradient_0 = gradient_0 + w * embedding_ij_0
-                gradient_1 = gradient_1 + w * embedding_ij_1
+                gradient_i0 = gradient_i0 + w * embedding_ij_0
+                gradient_i1 = gradient_i1 + w * embedding_ij_1
                 
             # Further pairs
             for k in range(further_pair_indptr[i],
                            further_pair_indptr[i + 1]):
                 j = further_pair_indices[k]
-                embedding_ij_0 = embedding[i, 0] - embedding[j, 0]
-                embedding_ij_1 = embedding[i, 1] - embedding[j, 1]
+                embedding_ij_0 = embedding_i0 - embedding[j, 0]
+                embedding_ij_1 = embedding_i1 - embedding[j, 1]
                 distance_ij = 1 + embedding_ij_0 * embedding_ij_0 + \
                     embedding_ij_1 * embedding_ij_1
                 w = 2 / ((1 + distance_ij) * (1 + distance_ij))
-                gradient_0 = gradient_0 - w * embedding_ij_0
-                gradient_1 = gradient_1 - w * embedding_ij_1
+                gradient_i0 = gradient_i0 - w * embedding_ij_0
+                gradient_i1 = gradient_i1 - w * embedding_ij_1
             
-            gradients[2 * i] = gradient_0
-            gradients[2 * i + 1] = gradient_1
+            gradients[i, 0] = gradient_i0
+            gradients[i, 1] = gradient_i1
         
-        cdef inline void get_gradients(
-                const float[:, ::1] embedding,
-                const unsigned[::1] neighbor_pair_indices,
-                const unsigned[::1] neighbor_pair_indptr,
-                const unsigned[::1] mid_near_pair_indices,
-                const unsigned[::1] mid_near_pair_indptr,
-                const unsigned[::1] further_pair_indices,
-                const unsigned[::1] further_pair_indptr,
-                const float w_neighbors,
-                const float w_mid_near,
-                float* gradients) noexcept nogil:
+        cdef inline void get_gradients(const float[:, ::1] embedding,
+                                       const unsigned[::1] neighbor_pair_indices,
+                                       const unsigned[::1] neighbor_pair_indptr,
+                                       const unsigned[::1] mid_near_pair_indices,
+                                       const unsigned[::1] mid_near_pair_indptr,
+                                       const unsigned[::1] further_pair_indices,
+                                       const unsigned[::1] further_pair_indptr,
+                                       const float w_neighbors,
+                                       const float w_mid_near,
+                                       float[:, ::1] gradients):
             cdef unsigned i, num_cells = embedding.shape[0]
             
             for i in range(num_cells):
@@ -29212,7 +34804,7 @@ class SingleCell:
                 const unsigned[::1] further_pair_indptr,
                 const float w_neighbors,
                 const float w_mid_near,
-                float* gradients,
+                float[:, ::1] gradients,
                 const unsigned num_threads) noexcept nogil:
             cdef unsigned i, num_cells = embedding.shape[0]
             
@@ -29236,28 +34828,31 @@ class SingleCell:
             embedding -= learning_rate * momentum / (sqrt(velocity) + 1e-7)
         
         cdef inline void update_embedding_adam(
-                float* embedding,
-                const float* gradients,
-                float* momentum,
-                float* velocity,
+                float[:, ::1] embedding,
+                const float[:, ::1] gradients,
+                float[:, ::1] momentum,
+                float[:, ::1] velocity,
                 const unsigned num_cells,
                 const float beta1,
                 const float beta2,
                 float learning_rate,
-                const unsigned iteration) noexcept nogil:
+                const unsigned iteration):
             cdef unsigned i
             learning_rate = learning_rate * sqrt(1 - beta2 ** (iteration + 1)) / \
                 (1 - beta1 ** (iteration + 1))
-            for i in range(2 * num_cells):
-                update_cell_embedding_adam(embedding[i], gradients[i], momentum[i],
-                                           velocity[i], num_cells, beta1, beta2,
-                                           learning_rate)
+            for i in range(num_cells):
+                update_cell_embedding_adam(embedding[i, 0], gradients[i, 0], 
+                                           momentum[i, 0], velocity[i, 0], num_cells, 
+                                           beta1, beta2, learning_rate)
+                update_cell_embedding_adam(embedding[i, 1], gradients[i, 1], 
+                                           momentum[i, 1], velocity[i, 1], num_cells, 
+                                           beta1, beta2, learning_rate)
         
         cdef inline void update_embedding_adam_parallel(
-                float* embedding,
-                const float* gradients,
-                float* momentum,
-                float* velocity,
+                float[:, ::1] embedding,
+                const float[:, ::1] gradients,
+                float[:, ::1] momentum,
+                float[:, ::1] velocity,
                 const unsigned num_cells,
                 const float beta1,
                 const float beta2,
@@ -29267,10 +34862,13 @@ class SingleCell:
             cdef unsigned i
             learning_rate = learning_rate * sqrt(1 - beta2 ** (iteration + 1)) / \
                 (1 - beta1 ** (iteration + 1))
-            for i in prange(2 * num_cells, num_threads=num_threads):
-                update_cell_embedding_adam(embedding[i], gradients[i], momentum[i],
-                                           velocity[i], num_cells, beta1, beta2,
-                                           learning_rate)
+            for i in prange(num_cells, num_threads=num_threads):
+                update_cell_embedding_adam(embedding[i, 0], gradients[i, 0], 
+                                           momentum[i, 0], velocity[i, 0], num_cells, 
+                                           beta1, beta2, learning_rate)
+                update_cell_embedding_adam(embedding[i, 1], gradients[i, 1], 
+                                           momentum[i, 1], velocity[i, 1], num_cells, 
+                                           beta1, beta2, learning_rate)
         
         def PaCMAP_fast(const float[:, ::1] PCs,
                         float[:, ::1] embedding,
@@ -29285,18 +34883,22 @@ class SingleCell:
                 num_iterations = num_phase_1_iterations + \
                 num_phase_2_iterations + num_phase_3_iterations, \
                 w_mid_near_init = 1000
-            cdef float iteration_fraction, w_mid_near, w_neighbors, beta1 = 0.9, beta2 = 0.999
-            cdef uninitialized_vector[float] gradients
-            cdef vector[float] momentum, velocity
+            cdef float iteration_fraction, w_mid_near, w_neighbors, beta1 = 0.9, \
+                beta2 = 0.999
+            cdef uninitialized_vector[float] gradients_buffer
+            cdef vector[float] momentum_buffer, velocity_buffer
+            gradients_buffer.resize(num_cells * 2)
+            momentum_buffer.resize(num_cells * 2)
+            velocity_buffer.resize(num_cells * 2)
+            cdef float[:, ::1] \
+                gradients = <float[:num_cells, :2]> gradients_buffer.data(), \
+                momentum = <float[:num_cells, :2]> momentum_buffer.data(), \
+                velocity = <float[:num_cells, :2]> velocity_buffer.data()
             
-            # Initialize the embedding and allocate storage for the gradients
-            # and Adam momentum and velocity
+            # Initialize the embedding
             for i in range(num_cells):
                 embedding[i, 0] = 0.01 * PCs[i, 0]
                 embedding[i, 1] = 0.01 * PCs[i, 1]
-            gradients.resize(2 * num_cells)
-            momentum.resize(2 * num_cells)
-            velocity.resize(2 * num_cells)
             
             # Optimize the embedding
             for iteration in range(num_iterations):
@@ -29313,16 +34915,16 @@ class SingleCell:
                     w_neighbors = 1
                     
                 # Calculate gradients
-                fill(gradients.begin(), gradients.end(), 0)
+                gradients[:] = 0
                 get_gradients_fast(embedding, neighbor_pairs, mid_near_pairs,
                                    further_pairs, w_neighbors, w_mid_near,
-                                   gradients.data())
+                                   gradients)
                 
                 # Update the embedding based on the gradients, via the Adam
                 # optimizer
-                update_embedding_adam(&embedding[0, 0], gradients.data(),
-                                      momentum.data(), velocity.data(), num_cells,
-                                      beta1, beta2, learning_rate, iteration)
+                update_embedding_adam(embedding, gradients, momentum, velocity,
+                                      num_cells, beta1, beta2, learning_rate,
+                                      iteration)
                 
                 # Check for KeyboardInterrupts every 10 iterations
                 if iteration % 10 == 9:
@@ -29344,18 +34946,22 @@ class SingleCell:
                 num_iterations = num_phase_1_iterations + \
                 num_phase_2_iterations + num_phase_3_iterations, \
                 w_mid_near_init = 1000
-            cdef float iteration_fraction, w_mid_near, w_neighbors, beta1 = 0.9, beta2 = 0.999
-            cdef uninitialized_vector[float] gradients
-            cdef vector[float] momentum, velocity
+            cdef float iteration_fraction, w_mid_near, w_neighbors, beta1 = 0.9, \
+                beta2 = 0.999
+            cdef uninitialized_vector[float] gradients_buffer
+            cdef vector[float] momentum_buffer, velocity_buffer
+            gradients_buffer.resize(num_cells * 2)
+            momentum_buffer.resize(num_cells * 2)
+            velocity_buffer.resize(num_cells * 2)
+            cdef float[:, ::1] \
+                gradients = <float[:num_cells, :2]> gradients_buffer.data(), \
+                momentum = <float[:num_cells, :2]> momentum_buffer.data(), \
+                velocity = <float[:num_cells, :2]> velocity_buffer.data()
             
-            # Initialize the embedding and allocate storage for the gradients
-            # and Adam momentum and velocity
+            # Initialize the embedding
             for i in range(num_cells):
                 embedding[i, 0] = 0.01 * PCs[i, 0]
                 embedding[i, 1] = 0.01 * PCs[i, 1]
-            gradients.resize(2 * num_cells)
-            momentum.resize(2 * num_cells)
-            velocity.resize(2 * num_cells)
             
             # Optimize the embedding
             for iteration in range(num_iterations):
@@ -29375,16 +34981,12 @@ class SingleCell:
                 get_gradients(embedding, neighbor_pair_indices, neighbor_pair_indptr,
                               mid_near_pair_indices, mid_near_pair_indptr,
                               further_pair_indices, further_pair_indptr, w_neighbors,
-                              w_mid_near, gradients.data())
+                              w_mid_near, gradients)
                 
-                # Update the embedding based on the gradients, via the Adam optimizer.
-                # Unfortunately, this seems to need to be run with
-                # `prange(..., num_threads=1)` to match the parallel version under
-                # -ffast-math.
-                update_embedding_adam_parallel(&embedding[0, 0], gradients.data(),
-                                               momentum.data(), velocity.data(),
-                                               num_cells, beta1, beta2, learning_rate,
-                                               iteration, num_threads=1)
+                # Update the embedding based on the gradients, via the Adam optimizer
+                update_embedding_adam(embedding, gradients, momentum, velocity,
+                                      num_cells, beta1, beta2, learning_rate,
+                                      iteration)
                 
                 # Check for KeyboardInterrupts every 10 iterations
                 if iteration % 10 == 9:
@@ -29407,19 +35009,23 @@ class SingleCell:
                 num_iterations = num_phase_1_iterations + \
                 num_phase_2_iterations + num_phase_3_iterations, \
                 w_mid_near_init = 1000
-            cdef float iteration_fraction, w_mid_near, w_neighbors, beta1 = 0.9, beta2 = 0.999
-            cdef uninitialized_vector[float] gradients
-            cdef vector[float] momentum, velocity
+            cdef float iteration_fraction, w_mid_near, w_neighbors, beta1 = 0.9, \
+                beta2 = 0.999
+            cdef uninitialized_vector[float] gradients_buffer
+            cdef vector[float] momentum_buffer, velocity_buffer
+            gradients_buffer.resize(num_cells * 2)
+            momentum_buffer.resize(num_cells * 2)
+            velocity_buffer.resize(num_cells * 2)
+            cdef float[:, ::1] \
+                gradients = <float[:num_cells, :2]> gradients_buffer.data(), \
+                momentum = <float[:num_cells, :2]> momentum_buffer.data(), \
+                velocity = <float[:num_cells, :2]> velocity_buffer.data()
             
             with nogil:
-                # Initialize the embedding and allocate storage for the gradients
-                # and Adam momentum and velocity
+                # Initialize the embedding
                 for i in prange(num_cells, num_threads=num_threads):
                     embedding[i, 0] = 0.01 * PCs[i, 0]
                     embedding[i, 1] = 0.01 * PCs[i, 1]
-                gradients.resize(2 * num_cells)
-                momentum.resize(2 * num_cells)
-                velocity.resize(2 * num_cells)
                 
                 # Optimize the embedding
                 for iteration in range(num_iterations):
@@ -29440,14 +35046,14 @@ class SingleCell:
                                            neighbor_pair_indptr, mid_near_pair_indices,
                                            mid_near_pair_indptr, further_pair_indices,
                                            further_pair_indptr, w_neighbors,
-                                           w_mid_near, gradients.data(), num_threads)
+                                           w_mid_near, gradients, num_threads)
                     
                     # Update the embedding based on the gradients, via the Adam
                     # optimizer
-                    update_embedding_adam_parallel(&embedding[0, 0], gradients.data(),
-                                                   momentum.data(), velocity.data(),
-                                                   num_cells, beta1, beta2, learning_rate,
-                                                   iteration, num_threads)
+                    update_embedding_adam_parallel(embedding, gradients, momentum,
+                                                   velocity, num_cells, beta1, beta2,
+                                                   learning_rate, iteration,
+                                                   num_threads)
                     
                     # Check for KeyboardInterrupts every 10 iterations
                     if iteration % 10 == 9:
@@ -29461,7 +35067,6 @@ class SingleCell:
         # Select the `num_neighbors` of the
         # `num_neighbors + num_extra_neighbors` nearest-neighbor pairs with the
         # lowest scaled distances
-        num_cells = PCs.shape[0]
         neighbor_pairs = np.empty((num_cells, num_neighbors), dtype=np.uint32)
         too_large = get_neighbor_pairs(
             X=PCs, neighbors=neighbors, distances=distances,
@@ -29490,7 +35095,7 @@ class SingleCell:
                              seed + mid_near_pairs.size, num_threads)
         
         # Run PaCMAP. If multithreaded, or single-threaded with
-        # `faster_single_threading=False`, reformat the three lists of pairs to
+        # `match_parallel=True`, reformat the three lists of pairs to
         # ensure deterministic parallelism. Specifically, transform pairs of
         # cell indices from the original format of a 2D array `pairs` where
         # `pairs[i]` contains all js for which (i, j) is a pair, to a pair of
@@ -29504,7 +35109,7 @@ class SingleCell:
         num_phase_1_iterations, num_phase_2_iterations, \
             num_phase_3_iterations = num_iterations
         embedding = np.empty((num_cells, 2), dtype=np.float32)
-        if faster_single_threading:
+        if num_threads == 1 and not match_parallel:
             PaCMAP_fast = cython_functions['PaCMAP_fast']
             PaCMAP_fast(PCs, embedding, neighbor_pairs, mid_near_pairs,
                         further_pairs, num_phase_1_iterations,
@@ -30459,11 +36064,44 @@ class Pseudobulk:
                  Enum, or Categorical.
             num_threads: the default number of threads to use for all
                          subsequent operations on this Pseudobulk dataset. By
-                         default (`num_threads=-1`), use all available cores,
-                         as determined by `os.cpu_count()`.
+                         default (`num_threads=None`), use all available cores,
+                         as determined by `os.cpu_count()`, if running
+                         free-threaded Python 3.13+, and one core otherwise.
         """
         # Initialize this Pseudobulk dataset's `num_threads`
-        self.num_threads = num_threads  # calls the setter, which validates it
+        if num_threads is None:
+            try:
+                # noinspection PyUnresolvedReferences
+                self._num_threads = \
+                    1 if sys._is_gil_enabled() else os.cpu_count()
+            except AttributeError:
+                self._num_threads = 1
+        else:
+            check_type(num_threads, 'num_threads', int,
+                       'a positive integer, -1, or None')
+            if num_threads == 1:
+                self._num_threads = 1
+            else:
+                num_threads = int(num_threads)
+                if num_threads <= 0 and num_threads != -1:
+                    error_message = (
+                        f'num_threads is {num_threads:,}, but must be a '
+                        f'positive integer, -1, or None')
+                    raise ValueError(error_message)
+                try:
+                    # noinspection PyUnresolvedReferences
+                    has_GIL = sys._is_gil_enabled()
+                except AttributeError:
+                    has_GIL = True
+                if has_GIL:
+                    error_message = (
+                        f'num_threads is {num_threads}, but multithreading '
+                        f'for Pseudobulk datasets is only supported for '
+                        f'"free-threaded" builds of Python 3.13 and later '
+                        f'with the global interpreter lock (GIL) disabled')
+                    raise ValueError(error_message)
+                self._num_threads = \
+                    os.cpu_count() if num_threads == -1 else num_threads
         
         if isinstance(X, dict):
             if obs is None:
@@ -30562,21 +36200,19 @@ class Pseudobulk:
                     f'{self._X[cell_type].shape[1]:,}')
                 raise ValueError(error_message)
             if self._obs[cell_type][:, 0].dtype not in \
-                    (pl.String, pl.Categorical, pl.Enum) and \
-                    self._obs[cell_type][:, 0].dtype not in pl.INTEGER_DTYPES:
+                    (pl.String, pl.Categorical, pl.Enum):
                 error_message = (
                     f'the first column of obs[{cell_type!r}] '
                     f'({self._obs[cell_type].columns[0]!r}) must be String, '
-                    f'Enum, Categorical, or integer, but has data type '
+                    f'Enum, or Categorical, but has data type '
                     f'{self._obs[cell_type][:, 0].dtype.base_type()!r}')
                 raise ValueError(error_message)
             if self._var[cell_type][:, 0].dtype not in \
-                    (pl.String, pl.Categorical, pl.Enum) and \
-                    self._var[cell_type][:, 0].dtype not in pl.INTEGER_DTYPES:
+                    (pl.String, pl.Categorical, pl.Enum):
                 error_message = (
                     f'the first column of var[{cell_type!r}] '
                     f'({self._var[cell_type].columns[0]!r}) must be String, '
-                    f'Enum, Categorical, or integer, but has data type '
+                    f'Enum, or Categorical, but has data type '
                     f'{self._var[cell_type][:, 0].dtype.base_type()!r}')
                 raise ValueError(error_message)
     
@@ -30954,8 +36590,8 @@ class Pseudobulk:
     def keys(self) -> KeysView[str]:
         """
         Get a KeysView (like you would get from `dict.keys()`) of this
-        Pseudobulk dataset's cell types. `for cell_type in pb.keys()` is
-        equivalent to `for cell_type in pb`.
+        Pseudobulk dataset's cell types. `for cell_type in pb.keys():` is
+        equivalent to `for cell_type in pb:`.
         
         Returns:
             A KeysView of the cell types.
@@ -31168,31 +36804,26 @@ class Pseudobulk:
                 Pseudobulk._getitem_error(item)
             return slice(start, stop, step)
         elif isinstance(subitem, (list, np.ndarray, pl.Series)):
-            df_0_dtype = df[:, 0].dtype
-            already_series = isinstance(subitem, pl.Series)
-            if already_series:
-                subitem_dtype = subitem.dtype
-            else:
-                subitem = pl.Series(subitem, dtype=df_0_dtype)
-                subitem_dtype = df_0_dtype
+            subitem = pl.Series(subitem)
             if subitem.is_null().any():
                 error_message = 'your indexer contains missing values'
                 raise ValueError(error_message)
-            if subitem_dtype == pl.String or subitem_dtype == \
-                    pl.Categorical or subitem_dtype == pl.Enum:
-                if already_series and subitem_dtype != df_0_dtype:
-                    subitem = subitem.cast(df_0_dtype)
+            dtype = subitem.dtype
+            if dtype in (pl.String, pl.Categorical, pl.Enum):
+                names_dtype = df[:, 0].dtype
+                if dtype != names_dtype:
+                    subitem = subitem.cast(names_dtype)
                 indices = subitem\
                     .to_frame(df.columns[0])\
                     .join(df.with_columns(_Pseudobulk_index=pl.int_range(
-                              pl.len(), dtype=pl.Int32)),
+                              pl.len(), dtype=pl.UInt32)),
                           on=df.columns[0], how='left')\
                     ['_Pseudobulk_index']
                 if indices.null_count():
                     error_message = subitem.filter(indices.is_null())[0]
                     raise KeyError(error_message)
                 return indices
-            elif subitem.dtype.is_integer() or subitem.dtype == pl.Boolean:
+            elif dtype.is_integer() or dtype == pl.Boolean:
                 return subitem
             else:
                 Pseudobulk._getitem_error(item)
@@ -31242,29 +36873,52 @@ class Pseudobulk:
             A new Pseudobulk dataset subset to the specified cell types,
             samples, and/or genes.
         """
+        is_slice = False
         if isinstance(item, tuple):
             if not 1 <= len(item) <= 3:
                 self._getitem_error(item)
-            cell_types = to_tuple(item[0])
-        elif isinstance(item, list):
+            if isinstance(item[0], slice):
+                if item[0] == slice(None):
+                    cell_types = tuple(self._X)
+                    is_slice = True
+                else:
+                    error_message = (
+                        'slicing cell types is not currently supported, '
+                        'except for selecting all cell types (e.g. pb[:, '
+                        'samples, genes])')
+                    raise ValueError(error_message)
+            else:
+                cell_types = to_tuple(item[0])
+        elif isinstance(item, (list, np.ndarray, pl.Series)):
             cell_types = to_tuple(item)
         elif isinstance(item, str):
             cell_types = item,
+        elif isinstance(item, slice):
+            if item == slice(None):
+                cell_types = tuple(self._X)
+                is_slice = True
+            else:
+                error_message = (
+                    'slicing cell types is not currently supported, except '
+                    'for selecting all cell types (e.g. pb[:, samples, '
+                    'genes])')
+                raise ValueError(error_message)
         else:
             self._getitem_error(item)
-        # noinspection PyUnboundLocalVariable
-        for cell_type in cell_types:
-            if cell_type not in self._X:
-                if isinstance(cell_type, str):
-                    error_message = (
-                        f'tried to select {cell_type!r}, which is not a cell '
-                        f'type in this Pseudobulk')
-                    raise ValueError(error_message)
-                else:
-                    error_message = (
-                        f'tried to select a non-existent cell type of type '
-                        f'{type(cell_type).__name__!r}')
-                    raise TypeError(error_message)
+        if not is_slice:
+            # noinspection PyUnboundLocalVariable
+            for cell_type in cell_types:
+                if cell_type not in self._X:
+                    if isinstance(cell_type, str):
+                        error_message = (
+                            f'tried to select {cell_type!r}, which is not a '
+                            f'cell type in this Pseudobulk')
+                        raise ValueError(error_message)
+                    else:
+                        error_message = (
+                            f'tried to select a non-existent cell type of '
+                            f'type {type(cell_type).__name__!r}')
+                        raise TypeError(error_message)
         if not isinstance(item, tuple) or len(item) == 1:
             return Pseudobulk(X={cell_type: self._X[cell_type]
                                  for cell_type in cell_types},
@@ -31360,18 +37014,16 @@ class Pseudobulk:
         Returns:
             A string summarizing the dataset.
         """
-        min_num_samples = min(len(obs) for obs in self._obs.values())
-        max_num_samples = max(len(obs) for obs in self._obs.values())
-        min_num_genes = min(len(var) for var in self._var.values())
-        max_num_genes = max(len(var) for var in self._var.values())
-        samples_string = \
-            f'{min_num_samples:,} {plural("sample", max_num_samples)}' \
-            if min_num_samples == max_num_samples else \
-            f'{min_num_samples:,}-{max_num_samples:,} samples'
-        genes_string = \
-            f'{min_num_genes:,} {plural("gene", max_num_genes)}' \
-            if min_num_genes == max_num_genes else \
-            f'{min_num_genes:,}-{max_num_genes:,} genes'
+        min_samples = min(len(obs) for obs in self._obs.values())
+        max_samples = max(len(obs) for obs in self._obs.values())
+        min_genes = min(len(var) for var in self._var.values())
+        max_genes = max(len(var) for var in self._var.values())
+        samples_string = f'{min_samples:,} {plural("sample", max_samples)}' \
+            if min_samples == max_samples else \
+            f'{min_samples:,}-{max_samples:,} samples'
+        genes_string = f'{min_genes:,} {plural("gene", max_genes)}' \
+            if min_genes == max_genes else \
+            f'{min_genes:,}-{max_genes:,} genes'
         try:
             terminal_width = os.get_terminal_size().columns
         except AttributeError:
@@ -31984,7 +37636,7 @@ class Pseudobulk:
             custom_error: a custom error message for when (an element of)
                           `columns` is a string and is not found in
                           `obs`/`var`; use `{}` as a placeholder for the names
-                          of the column and cell type (which must appear in 
+                          of the column and cell type (which must appear in
                           that order)
             allow_None: whether to allow `columns` or its elements to be `None`
             allow_null: whether to allow `columns` to contain `null` values
@@ -32289,7 +37941,7 @@ class Pseudobulk:
             if cell_type in cell_types:
                 obs[cell_type] = self._obs[cell_type]\
                     .with_columns(__Pseudobulk_index=pl.int_range(
-                        pl.len(), dtype=pl.Int32))\
+                        pl.len(), dtype=pl.UInt32))\
                     .filter(*predicates, **constraints)
                 X[cell_type] = self._X[cell_type][
                     obs[cell_type]['__Pseudobulk_index'].to_numpy()]
@@ -32336,7 +37988,7 @@ class Pseudobulk:
             if cell_type in cell_types:
                 var[cell_type] = self._var[cell_type]\
                     .with_columns(__Pseudobulk_index=pl.int_range(
-                        pl.len(), dtype=pl.Int32))\
+                        pl.len(), dtype=pl.UInt32))\
                     .filter(*predicates, **constraints)
                 X[cell_type] = self._X[cell_type][
                     :, var[cell_type]['__Pseudobulk_index'].to_numpy()]
@@ -33290,7 +38942,7 @@ class Pseudobulk:
                     by_name = cell_type_by_column.name
                     group_counts = by_frame\
                         .group_by(by_name)\
-                        .agg(pl.len(), n=(n * pl.len() / len(by_column))
+                        .agg(pl.len(), n=(n / len(by_column) * pl.len())
                                          .round().cast(pl.Int32))\
                         .drop_nulls(by_name)
                     diff = n - group_counts['n'].sum()
@@ -33320,7 +38972,7 @@ class Pseudobulk:
                 if cell_type in cell_types:
                     cell_type_obs = cell_type_obs\
                         .with_columns(__Pseudobulk_index=pl.int_range(
-                            pl.len(), dtype=pl.Int32))\
+                            pl.len(), dtype=pl.UInt32))\
                         .filter(expressions[cell_type])
                     X[cell_type] = self._X[cell_type][
                         cell_type_obs['__Pseudobulk_index'].to_numpy()]
@@ -33447,7 +39099,7 @@ class Pseudobulk:
                     by_name = cell_type_by_column.name
                     group_counts = by_frame\
                         .group_by(by_name)\
-                        .agg(pl.len(), n=(n * pl.len() / len(by_column))
+                        .agg(pl.len(), n=(n / len(by_column) * pl.len())
                                          .round().cast(pl.Int32))\
                         .drop_nulls(by_name)
                     diff = n - group_counts['n'].sum()
@@ -33477,7 +39129,7 @@ class Pseudobulk:
                 if cell_type in cell_types:
                     cell_type_var = cell_type_var\
                         .with_columns(__Pseudobulk_index=pl.int_range(
-                            pl.len(), dtype=pl.Int32))\
+                            pl.len(), dtype=pl.UInt32))\
                         .filter(expressions[cell_type])
                     X[cell_type] = self._X[cell_type][
                         cell_type_var['__Pseudobulk_index'].to_numpy()]
@@ -33811,13 +39463,14 @@ class Pseudobulk:
                 .drop_nulls()
             if len(too_small_groups) > 0:
                 if verbose:
+                    count = too_small_groups['count'][-1]
                     group_description = (
-                        f'{too_small_groups["count"][-1]:,} samples where '
+                        f'{count:,} {plural("sample", count)} where '
                         f'group_column = {too_small_groups.to_series()[-1]}')
                     if len(too_small_groups) > 1:
                         group_description = (
-                            ', '.join(f'{count:,} samples where '
-                                      f'group_column = {group}'
+                            ', '.join(f'{count:,} {plural("sample", count)} '
+                                      f'where group_column = {group}'
                                       for group, count in
                                       too_small_groups[:-1].iter_rows()) +
                             f' and {group_description}')
@@ -34012,8 +39665,9 @@ class Pseudobulk:
                               f'to being present in excluded_cell_types')
                 continue
             if verbose:
-                print(f'\n[{cell_type}] Starting with {len(obs):,} samples '
-                      f'and {len(var):,} genes.')
+                print(f'\n[{cell_type}] Starting with {len(obs):,} '
+                      f'{plural("sample", len(obs))} and {len(var):,} '
+                      f'{plural("gene", len(var))}.')
             
             # Get the group column for this cell type.
             groups = \
@@ -34031,8 +39685,12 @@ class Pseudobulk:
                 sample_mask = custom_filter[cell_type]
                 if sample_mask is not None:
                     if verbose:
-                        print(f'[{cell_type}] {sample_mask.sum():,} samples '
-                              f'remain after applying the custom filter.')
+                        num_samples = sample_mask.sum()
+                        remain_string = 'sample remains' \
+                            if num_samples == 1 else 'samples remain'
+                        print(
+                            f'[{cell_type}] {num_samples:,} {remain_string} '
+                            f'after applying the custom filter.')
             else:
                 sample_mask = None
             
@@ -34049,9 +39707,12 @@ class Pseudobulk:
                     else:
                         sample_mask &= groups.is_not_null()
                     if verbose:
-                        print(f'[{cell_type}] {sample_mask.sum():,} samples '
-                              f'remain after filtering to samples with '
-                              f'non-missing values for group_column.')
+                        num_samples = sample_mask.sum()
+                        remain_string = 'sample remains' \
+                            if num_samples == 1 else 'samples remain'
+                        print(f'[{cell_type}] {num_samples:,} {remain_string} '
+                              f'after filtering to samples with non-missing '
+                              f'values for group_column.')
             
             # Get a mask of samples with at least `min_cells` cells of this
             # cell type, if `min_cells` was specified. Combine this with the
@@ -34059,15 +39720,20 @@ class Pseudobulk:
             if min_cells is not None:
                 if verbose:
                     print(f'[{cell_type}] Filtering to samples with at least '
-                          f'{min_cells} {cell_type} cells...')
+                          f'{min_cells:,} {cell_type} '
+                          f'{plural("cell", min_cells)}...')
                 if sample_mask is None:
                     sample_mask = obs['num_cells'] >= min_cells
                 else:
                     sample_mask &= obs['num_cells'] >= min_cells
                 if verbose:
-                    print(f'[{cell_type}] {sample_mask.sum():,} samples '
-                          f'remain after filtering to samples with at least '
-                          f'{min_cells} {cell_type} cells.')
+                    num_samples = sample_mask.sum()
+                    remain_string = 'sample remains' \
+                        if num_samples == 1 else 'samples remain'
+                    print(f'[{cell_type}] {num_samples:,} {remain_string} '
+                          f'after filtering to samples with at least '
+                          f'{min_cells:,} {cell_type} '
+                          f'{plural("cell", min_cells)}.')
             
             # Now apply the sample mask, which contains the samples passing the
             # custom filter and/or `min_cells` filter
@@ -34102,7 +39768,9 @@ class Pseudobulk:
                 if groups is not None:
                     groups = groups.filter(sample_mask)
                 if verbose:
-                    print(f'[{cell_type}] {len(obs):,} samples remain after '
+                    remain_string = 'sample remains' \
+                        if len(obs) == 1 else 'samples remain'
+                    print(f'[{cell_type}] {len(obs):,} {remain_string} after '
                           f'filtering to samples where the number of genes '
                           f'with 0 counts is <{max_standard_deviations} '
                           f'standard deviations above the mean.')
@@ -34132,7 +39800,9 @@ class Pseudobulk:
                     X = X[:, gene_mask]
                     var = var.filter(gene_mask)
                     if verbose:
-                        print(f'[{cell_type}] {len(var):,} genes remain '
+                        remain_string = 'gene remains' \
+                            if len(var) == 1 else 'genes remain'
+                        print(f'[{cell_type}] {len(var):,} {remain_string} '
                               f'after filtering to genes with at least one '
                               f'count in {100 * min_nonzero_fraction}% of '
                               f'samples in each group.')
@@ -34146,13 +39816,23 @@ class Pseudobulk:
                     X = X[:, gene_mask]
                     var = var.filter(gene_mask)
                     if verbose:
-                        print(f'[{cell_type}] {len(var):,} genes remain '
+                        remain_string = 'gene remains' \
+                            if len(var) == 1 else 'genes remain'
+                        print(f'[{cell_type}] {len(var):,} {remain_string} '
                               f'after filtering to genes with at least one '
                               f'count in {100 * min_nonzero_fraction}% of '
                               f'samples.')
             X_qced[cell_type] = np.ascontiguousarray(X)
             obs_qced[cell_type] = obs
             var_qced[cell_type] = var
+        if not X_qced:
+            error_message = (
+                'all cell types were skipped due to having too few samples '
+                'passing one or more QC filters')
+            if not verbose:
+                error_message += \
+                    '; re-run with verbose=True to see which filter(s)'
+            raise ValueError(error_message)
         return Pseudobulk(X=X_qced, obs=obs_qced, var=var_qced,
                           num_threads=self._num_threads)
     
@@ -34291,30 +39971,30 @@ class Pseudobulk:
         
         cdef extern from * nogil:
             """
-            struct Compare {
+            struct CompareLess {
                 const float* data;
-                Compare() noexcept {}
-                Compare(const float* d) noexcept : data(d) {}
+                CompareLess() noexcept {}
+                CompareLess(const float* d) noexcept : data(d) {}
                 bool operator()(unsigned a, unsigned b) const noexcept {
                     return data[a] < data[b];
                 }
             };
             """
-            cdef cppclass Compare:
-                Compare(const float*) noexcept
-                bint operator()(unsigned int, unsigned int) noexcept
+            cdef cppclass CompareLess:
+                CompareLess(const float*) noexcept
+                bint operator()(unsigned, unsigned) noexcept
         
         cdef inline void argsort(const float* arr, unsigned* indices,
                                  const unsigned n) noexcept nogil:
             cdef unsigned i
             for i in range(n):
                 indices[i] = i
-            sort(indices, indices + n, Compare(arr))
+            sort(indices, indices + n, CompareLess(arr))
 
         cdef inline void rankdata(const float* data,
                                   unsigned* indices,
                                   float* ranks,
-                                  const unsigned n) noexcept nogil:
+                                  const unsigned n):
             cdef unsigned i = 0, start_pos = 0
             cdef float current_val, rank
             cdef bint end = False
@@ -34357,30 +40037,44 @@ class Pseudobulk:
             cdef numeric2 ref_library_size
             cdef unsigned i, j, n, loL, hiL, loS, hiS, \
                 num_samples = X.shape[0], num_genes = X.shape[1]
-            cdef float inverse_ref_library_size, logR_, absE_, \
-                inverse_library_size, total_inverse_library_size, \
+            cdef float inverse_ref_library_size, inverse_relative_library_size_i, \
+                logR_, absE_, inverse_library_size, total_inverse_library_size, \
                 norm_factor, total_weight, variance, weight, scale
             cdef bint large_enough_logR
-            cdef uninitialized_vector[float] inv_relative_library_size, \
-                log_normalized_X_ref, logR, absE, logR_rank, absE_rank
-            cdef uninitialized_vector[numeric] counts, ref_counts
-            cdef uninitialized_vector[unsigned] indices
-            
-            inv_relative_library_size.resize(num_samples)
-            log_normalized_X_ref.resize(num_genes)
-            logR.resize(num_genes)
-            absE.resize(num_genes)
-            counts.resize(num_genes)
-            ref_counts.resize(num_genes)
-            indices.resize(num_genes)
-            logR_rank.resize(num_genes)
-            absE_rank.resize(num_genes)
+            cdef uninitialized_vector[float] inverse_relative_library_size_buffer, \
+                log_normalized_X_ref_buffer, logR_buffer, absE_buffer, \
+                logR_rank_buffer, absE_rank_buffer
+            cdef uninitialized_vector[numeric] counts_buffer, ref_counts_buffer
+            cdef uninitialized_vector[unsigned] indices_buffer
+            inverse_relative_library_size_buffer.resize(num_samples)
+            log_normalized_X_ref_buffer.resize(num_genes)
+            logR_buffer.resize(num_genes)
+            absE_buffer.resize(num_genes)
+            logR_rank_buffer.resize(num_genes)
+            absE_rank_buffer.resize(num_genes)
+            counts_buffer.resize(num_genes)
+            ref_counts_buffer.resize(num_genes)
+            indices_buffer.resize(num_genes)
+            cdef float[::1] \
+                inverse_relative_library_size = \
+                    <float[:num_samples]> \
+                        inverse_relative_library_size_buffer.data(), \
+                log_normalized_X_ref = <float[:num_genes]> \
+                    log_normalized_X_ref_buffer.data(), \
+                logR = <float[:num_genes]> logR_buffer.data(), \
+                absE = <float[:num_genes]> absE_buffer.data(), \
+                logR_rank = <float[:num_genes]> logR_rank_buffer.data(), \
+                absE_rank = <float[:num_genes]> absE_rank_buffer.data()
+            cdef numeric[::1] \
+                counts = <numeric[:num_genes]> counts_buffer.data(), \
+                ref_counts = <numeric[:num_genes]> ref_counts_buffer.data()
+            cdef unsigned[::1] indices = <unsigned[:num_genes]> indices_buffer.data()
             
             # Calculate each sample's library size relative to the
             # reference sample's (to use in the `logR` calculation)
             ref_library_size = library_size[ref_sample]
             for i in range(num_samples):
-                inv_relative_library_size[i] = \
+                inverse_relative_library_size[i] = \
                     <float> ref_library_size / library_size[i]
 
             # Calculate each gene's log normalized expression (to use in
@@ -34394,6 +40088,7 @@ class Pseudobulk:
             # Calculate the normalization factor for each sample
             for i in range(num_samples):
                 inverse_library_size = 1. / library_size[i]
+                inverse_relative_library_size_i = inverse_relative_library_size[i]
                 large_enough_logR = False
                 n = 0
                 for j in range(num_genes):
@@ -34409,7 +40104,7 @@ class Pseudobulk:
 
                     # Calculate the log ratio of expression accounting for
                     # library size
-                    logR_ = log2(inv_relative_library_size[i] * (
+                    logR_ = log2(inverse_relative_library_size_i * (
                         <float> count / ref_count))
 
                     # Calculate "absolute expression": the average log2
@@ -34446,8 +40141,8 @@ class Pseudobulk:
                 hiL = n - loL
                 loS = <unsigned> (n * sum_trim)
                 hiS = n - loS
-                rankdata(logR.data(), indices.data(), logR_rank.data(), n)
-                rankdata(absE.data(), indices.data(), absE_rank.data(), n)
+                rankdata(&logR[0], &indices[0], &logR_rank[0], n)
+                rankdata(&absE[0], &indices[0], &absE_rank[0], n)
 
                 # Calculate the norm factors themselves. Find genes with
                 # intermediate ranks of both `logR` and `absE` (this is the
@@ -34759,8 +40454,8 @@ class Pseudobulk:
         """
         # Get the library size column
         library_sizes = self._get_column(
-            'obs', library_size_column, 'library_size_column', 
-            'floating-point', 
+            'obs', library_size_column, 'library_size_column',
+            'floating-point',
             custom_error='library_size_column {} is not a column of obs[{}]; '
                          'did you forget to run library_size()?',
             allow_None=False)
@@ -34844,8 +40539,8 @@ class Pseudobulk:
                                    cell_type: str,
                                    obs: pl.DataFrame) -> list[str]:
         """
-        Check that all variables referenced in `formula` are Categorical, Enum, 
-        Boolean, integer, or floating-point columns of `obs`. Make a set of 
+        Check that all variables referenced in `formula` are Categorical, Enum,
+        Boolean, integer, or floating-point columns of `obs`. Make a set of
         these variables. Used by `DE()` and `regress_out()`.
         
         Args:
@@ -34924,8 +40619,8 @@ class Pseudobulk:
             if null_count > 0:
                 error_message = (
                     f'{column.name} contains {null_count:,} '
-                    f'{plural("null value", null_count)}, but must not '
-                    f'contain any')
+                    f'{plural("null value", null_count)} for cell type '
+                    f'{cell_type!r}, but must not contain any')
                 raise ValueError(error_message)
         
         # Convert the integer columns in `categorical_columns` to Enums, after
@@ -34989,10 +40684,16 @@ class Pseudobulk:
             error_message = (
                 f'the design matrix must have more rows (samples) than '
                 f'columns (one plus the number of covariates), but has '
-                f'{height:,} rows and {width:,} columns for cell type '
-                f'{cell_type!r}. Either reduce the number of covariates, or '
-                f'exclude this cell type with e.g. '
-                f'excluded_cell_types={cell_type!r}.')
+                f'{height:,} {plural("row", height)} and {width:,} '
+                f'{plural("column", width)} for cell type {cell_type!r}. '
+                f'Either reduce the number of covariates, or exclude this '
+                f'cell type with e.g. excluded_cell_types={cell_type!r}.')
+            raise ValueError(error_message)
+        
+        # Check that the design matrix is non-empty (which can happen e.g. if
+        # the user specifies `formula='~0'`)
+        if width == 0:
+            error_message = 'the design matrix is empty'
             raise ValueError(error_message)
     
     # noinspection PyTypeChecker
@@ -35310,7 +41011,7 @@ class Pseudobulk:
     
     # A slightly reformatted version of the voomByGroup source code from
     # github.com/YOU-k/voomByGroup/blob/main/voomByGroup.R, which is available
-    # under the MIT license. Copyright (c) 2023 Yue You. Also added 
+    # under the MIT license. Copyright (c) 2023 Yue You. Also added
     # `drop=FALSE` to the `countsi` subsetting to avoid an error with length-1
     # groups.
     _voomByGroup_source_code = r'''
@@ -35602,7 +41303,8 @@ class Pseudobulk:
             Pseudobulk._create_design_matrix(formula, cell_type, obs,
                                              obs_names, obs_columns,
                                              categorical_columns, prefix)
-            design_matrix_columns = to_py(f'colnames({prefix}.design.matrix)')
+            design_matrix_columns = to_py(f'colnames({prefix}.design.matrix)',
+                                          squeeze=False)
             
             # Check that the design matrix is full-rank
             rank = to_py(f'qr({prefix}.design.matrix)$rank')
@@ -35649,12 +41351,13 @@ class Pseudobulk:
                 # are >= the design matrix width
                 for coef in coefficient:
                     if isinstance(coef, (int, np.integer)) and coef >= width:
+                        contains_string = 'is' \
+                            if len(coefficient) == 1 else 'contains the number'
                         error_message = (
-                            f'coefficient '
-                            f'{"is" if len(coefficient) == 1 else "contains"} '
-                            f'the integer {coef}, which is more than the '
-                            f'number of columns of the design matrix '
-                            f'({width:,}) minus 1 for cell type {cell_type!r}')
+                            f'coefficient {contains_string} {coef}, which is '
+                            f'more than the number of columns of the design '
+                            f'matrix ({width:,}) minus 1 for cell type '
+                            f'{cell_type!r}')
                         raise ValueError(error_message)
                 coefficient = [design_matrix_columns[coef]
                                if isinstance(coef, (int, np.integer)) else coef
@@ -35711,23 +41414,33 @@ class Pseudobulk:
                 # 2. Mapping each column of the design matrix listed in
                 #    `coefficient` or `contrasts` back to the integer index of
                 #    the term in `formula` it was derived from, using the
-                #    design matrix's `assign` attribute. Subtract 1 to convert
-                #    from 1-based to 0-based indexing.
-                assign = to_py(f'attr({prefix}.design.matrix, "assign")')
+                #    design matrix's `assign` attribute. This is 0-based, where
+                #    0 indicates the intercept.
+                assign = to_py(f'attr({prefix}.design.matrix, "assign")',
+                               squeeze=False)
                 referenced_term_indices = assign\
                     .filter(design_matrix_columns
-                            .is_in(referenced_design_matrix_columns)) - 1
+                            .is_in(referenced_design_matrix_columns))
                 
                 # 3. Using R's `terms()` function to expand the formula into
-                #    the list of terms corresponding to these integer indices.
+                #    a list of its component terms. This does not include the
+                #    intercept.
                 term_labels = \
                     to_py(f'attr(terms({prefix}.formula), "term.labels")',
                           squeeze=False)
                 
                 # 4. Pulling out the terms corresponding to the indices from
                 #    step 2, to get the terms of `formula` referenced in
-                #    `coefficient` or `contrasts`.
-                referenced_terms = term_labels[referenced_term_indices]
+                #    `coefficient` or `contrasts`. Since
+                #    `referenced_term_indices` includes the intercept but
+                #    `term_labels` does not, there's an off-by-one issue. To
+                #    fix it, remove any 0s present in `referenced_term_indices`
+                #    (we don't care about references to the intercept, since we
+                #    are looking for columns of obs referenced in the formula,
+                #    and the intercept is not a column of obs), then subtract 1
+                #    from `referenced_term_indices`.
+                referenced_terms = term_labels[referenced_term_indices.filter(
+                    referenced_term_indices != 0) - 1]
                 
                 # 5. Getting the unique variables in these terms. These are the
                 #    columns of `obs` referenced in `coefficient` or
@@ -36174,7 +41887,7 @@ class Pseudobulk:
             A DE object with a `table` attribute containing a polars DataFrame
             of the DE results, with columns:
             - cell_type: the cell type in which DE was tested
-            - coefficient: the coefficient (or contrast) for which DE was 
+            - coefficient: the coefficient (or contrast) for which DE was
                            tested
             - gene: the gene for which DE was tested
             - logFC: the log2 fold change of the gene, i.e. its effect size
@@ -36624,7 +42337,7 @@ class DE:
         Args:
             table: a polars DataFrame containing the DE results, with columns:
                    - cell_type: the cell type in which DE was tested
-                   - coefficient: the coefficient (or contrast) for which DE 
+                   - coefficient: the coefficient (or contrast) for which DE
                                   was tested
                    - gene: the gene for which DE was tested
                    - logFC: the log2 fold change of the gene, i.e. its effect
@@ -37010,9 +42723,9 @@ class DE:
                          arguments, respectively.
             legend: whether to add a legend with the colors for each group when
                     using voomByGroup. Only `legend=False` has an effect, and
-                    it can only be specified when using voomByGroup. Without 
-                    groups, there will never be a legend, so specifying 
-                    `legend=False` would be redundant.                     
+                    it can only be specified when using voomByGroup. Without
+                    groups, there will never be a legend, so specifying
+                    `legend=False` would be redundant.
             legend_kwargs: a dictionary of keyword arguments to be passed to
                            `ax.legend()` to modify the legend, such as:
                            - `loc`, `bbox_to_anchor`, and `bbox_transform` to
@@ -37945,7 +43658,7 @@ class DE:
                 default_label_kwargs = dict(
                     ax=ax, x=x_to_label, y=y_to_label,
                     text_list=genes_to_label,
-                    x_scatter=table['logFC'].to_numpy(), 
+                    x_scatter=table['logFC'].to_numpy(),
                     y_scatter=table[significance_column].to_numpy(),
                     min_distance=0, max_distance=0.02, draw_lines=False)
                 label_kwargs = default_label_kwargs | label_kwargs \
