@@ -11,11 +11,11 @@ import single_cell as sc
 
 # TODO: update function to handle label transfer case.
 def profile_faiss_michael(training_data: sc.SingleCell,
-                          validation_data: np.ndarray, num_clusters: int,
-                          min_clusters_searched: int,
-                          max_clusters_searched: int,
+                          validation_data: np.ndarray | None, num_clusters: int | None,
+                          min_clusters_searched: int | None,
+                          max_clusters_searched: int | None,
                           num_candidates_per_neighbour: int,
-                          num_kmeans_iterations, kmeans_barbar: int, num_neighbours: int):
+                          num_kmeans_iterations, num_neighbours: int):
     """
     Monitors performance of Michael's FAISS implementation.
     Note that this doesn't handle label transfer, i.e., querying neighbours of
@@ -31,7 +31,7 @@ def profile_faiss_michael(training_data: sc.SingleCell,
     :param num_kmeans_iterations: number of iterations run.
     :param kmeans_barbar: true if parallel initialisation vs random
     initialisation
-    :return:
+    :return: computed neighbours and runtime in a 2-tuple.
     """
     start = time.perf_counter()
     sc = training_data.neighbors(num_clusters=num_clusters,
@@ -39,9 +39,9 @@ def profile_faiss_michael(training_data: sc.SingleCell,
                                  max_clusters_searched=max_clusters_searched,
                                  num_candidates_per_neighbor=num_candidates_per_neighbour,
                                  num_kmeans_iterations=num_kmeans_iterations,
-                                 kmeans_barbar=bool(kmeans_barbar),
+                                 kmeans_barbar=True,
                                  num_neighbors=num_neighbours,
-                                 overwrite=True)
+                                 overwrite=True, num_threads=-1)
     runtime = time.perf_counter() - start
 
     return sc.obsm['neighbors'], runtime

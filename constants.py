@@ -1,9 +1,10 @@
 # Remote computer.
-SYSTEM = 'narval'
+SYSTEM = 'niagara'
 
 # System constants.
 SCRATCH_DIR = f'scratch' if SYSTEM == 'narval' else '/scratch/w/wainberg'
 PROJECT_DIR = 'projects/def-wainberg' if SYSTEM == 'narval' else SCRATCH_DIR
+DATA_DIR = PROJECT_DIR if SYSTEM == 'narval' else f'{PROJECT_DIR}/wainberg'
 HOME_DIR = f'{PROJECT_DIR}/jeesonja'
 CONTROLLED_ACCESS = f'projects/rrg-wainberg/CommonMind/ControlledAccess'
 
@@ -30,7 +31,7 @@ TRAINING_DATASET = 'scratch/training.npy'
 TRUE_NEIGHBOURS = 'scratch/true_nn.npy'
 
 
-### Schizoprhenia ###
+### Schizophrenia ###
 SCHIZO_DIR_SINGLE_CELL = f'{HOME_DIR}/schizo/single_cell'
 SCHIZO_DIR_GWAS = f'{HOME_DIR}/schizo/gwas'
 SCHIZO_DIR_SINGLE_CELL_RAW = f'{PROJECT_DIR}/single-cell/SZBDMulticohort'

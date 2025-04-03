@@ -1,4 +1,5 @@
 import os
+import time
 import typing
 
 import plotly.graph_objects
@@ -19,11 +20,25 @@ import optuna
 from knn_algorithms import profile_faiss_ivf, profile_faiss_michael
 
 from networkx import DiGraph, all_topological_sorts
+import timeout_decorator
+
+import logging
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG, filename="logfile", filemode="a+",
+                        format="%(asctime)-15s %(levelname)-8s %(message)s")
 
 NUM_NEIGHBOURS = 5
 APPLICATION = 'umap'
 TRAINING_SPLIT = 70
-NUM_TRIALS = 2
+NUM_TRIALS = 15
+# Split is 50 seconds for kNN, 30 seconds for accuracy computation, 10 seconds
+# for other stuff (topological ordering, flops, etc.)
+TIMEOUT_INTERVAL = 120
+
+# For pruning study so that unsuccessful trials aren't considered.
+MINIMUM_ACCURACY = 0.9
+MAXIMUM_RUNTIME = 50
 
 
 def brute_force_knn(train_data: np.ndarray, test_data: np.ndarray,
@@ -116,16 +131,12 @@ def get_num_centroids_michael(num_cells: int, centroid_scale_factor: float,
 
 
 def compute_accuracies(true_neighbours: np.ndarray,
-                       testable_neighbours: np.ndarray, num_neighbours) -> \
-        tuple[
-            float, float, float]:
-    # Is the first neighbour the element itself?
-    mean_acc_nn = np.equal(testable_neighbours[:, 0],
-                           range(len(testable_neighbours))).mean()
-
-    # Compares neighbours position by position. Probably not a useful metric.
-    mean_acc_bf_strict = np.equal(testable_neighbours,
-                                  true_neighbours).mean()
+                       testable_neighbours: np.ndarray,
+                       num_neighbours) -> float:
+    """
+    Return accuracy of nearest neigbhours (position independent).
+    """
+    # Verify that indices are being passed in.
 
     # Overall overlap regardless of ordering.
     overlap_counts = np.array([len(np.intersect1d(
@@ -137,7 +148,7 @@ def compute_accuracies(true_neighbours: np.ndarray,
     mean_acc_bf_lenient = sum(overlap_counts) / (
             len(testable_neighbours) * num_neighbours)
 
-    return mean_acc_nn, mean_acc_bf_strict, mean_acc_bf_lenient
+    return mean_acc_bf_lenient
 
 
 # Multi-objective function.
@@ -163,7 +174,7 @@ def old_objective(trial: optuna.Trial, training_dataset, validation_dataset,
                                             num_centroids, 5,
                                             validation_dataset,
                                             subsampling_factor)
-    _, _, accuracy = compute_accuracies(true_neighbours, neighbours, 5)
+    accuracy = compute_accuracies(true_neighbours, neighbours, 5)
 
     return float(runtime), float(accuracy)
 
@@ -204,6 +215,10 @@ def compute_hyperparameter_ordering(hyperparams: dict) -> list[str]:
     return list(all_topological_sorts(dependency_graph))[0]
 
 
+# Apply timeout decorator to time out kNN computation if it takes too long.
+@timeout_decorator.timeout(TIMEOUT_INTERVAL,
+                           timeout_exception=optuna.TrialPruned,
+                           use_signals=True)
 def objective_knn(trial: optuna.Trial, training_dataset,
                   validation_dataset,
                   hyperparam_ranges: dict, other_objective_params: dict,
@@ -253,7 +268,15 @@ def objective_knn(trial: optuna.Trial, training_dataset,
             max_val = trial.params[max_val]
 
         # Suggest the right type.
-        if param_type == 'int':
+        # If we're selecting max_clusters or min_clusters, make sure that their
+        # values are below 2750 to prevent segfault.
+        if hyperparam == 'max_clusters_searched' or \
+                hyperparam == 'min_clusters_searched':
+            current_hyperparams[hyperparam] = trial.suggest_int(
+                hyperparam, min_val,
+                min(max_val, 2749),
+                log=is_log)
+        elif param_type == 'int':
             current_hyperparams[hyperparam] = trial.suggest_int(
                 hyperparam, min_val,
                 max_val,
@@ -264,47 +287,63 @@ def objective_knn(trial: optuna.Trial, training_dataset,
                 max_val,
                 log=is_log)
 
+    print(f'Hyperparameters: {current_hyperparams}')
     # Add on non-hyperparameters
     current_hyperparams['training_data'], current_hyperparams[
         'validation_data'], current_hyperparams[
         'num_neighbours'] = training_dataset, validation_dataset, NUM_NEIGHBOURS
+
     # Compute objective values.
     neighbours, runtime = algorithm(
         **current_hyperparams)
-    _, _, accuracy = compute_accuracies(true_neighbours, neighbours,
-                                        NUM_NEIGHBOURS)
 
+    start = time.perf_counter()
+    accuracy = compute_accuracies(true_neighbours, neighbours,
+                                  NUM_NEIGHBOURS)
+    print(
+        f'Computing accuracy took {time.perf_counter() - start:.3f} seconds...')
     return float(runtime), float(accuracy)
 
 
 # TODO: update function after updating Michael's implementation to handle label
 #  transfer case. Probably need to update how validation data is passed.
 def auto_optimise(training_data: np.ndarray | SingleCell,
-                  validation_data: np.ndarray | SingleCell,
+                  validation_data: np.ndarray | None, true_nn: np.ndarray,
                   num_trials: int, objective: typing.Callable,
                   hyperparam_ranges: dict, algorithm: typing.Callable) -> tuple[
     pl.DataFrame, optuna.Study]:
     # If we are working with Michael's implementation, make sure we pass only
     # the PCs to FAISS.
-    # TODO: validation data is not in correct format.
-    if isinstance(training_data, SingleCell):
-        true_nn = brute_force_knn(training_data.obsm['PCs'],
-                                  validation_data.obsm['PCs'], NUM_NEIGHBOURS,
-                                  False, 'faiss',
-                                  None, None, reject_self_neighbours=True)
-    else:
-        true_nn = brute_force_knn(training_data, validation_data,
-                                  NUM_NEIGHBOURS,
-                                  False, 'faiss',
-                                  None, None, reject_self_neighbours=False)
     # Compile other parameters for the algorithm.
     other_obj_params = {'true_neighbours': true_nn}
     # Minimize runtime and maximize accuracy.
     study = optuna.create_study(directions=['minimize', 'maximize'])
-    study.optimize(
-        lambda trial: objective(trial, training_data, validation_data,
-                                hyperparam_ranges, other_obj_params, algorithm),
-        n_trials=num_trials)
+
+    for _ in range(num_trials):
+        study.optimize(
+            lambda trial: objective(trial, training_data, validation_data,
+                                    hyperparam_ranges, other_obj_params,
+                                    algorithm),
+            n_trials=1)
+        # Don't deepcopy since we want mutation to persist.
+        trials = study.get_trials(deepcopy=False)
+        last_trial = trials[-1]
+
+        # values_0 is runtime, values_1 is acc.
+        # Mark trial failed if it was to slow or very inaccurate or was pruned due to timeout.
+        if last_trial.state == optuna.trial.TrialState.PRUNED:
+            print(
+                f'Trial is a failure because it timed out')
+            last_trial.state = optuna.trial.TrialState.FAIL
+        elif last_trial.values[0] > MAXIMUM_RUNTIME or last_trial.values[
+            1] < MINIMUM_ACCURACY:
+            print(
+                f'Trial is a failure because runtime was {last_trial.values[0]} and accuracy was {last_trial.values[1]}')
+            last_trial.state = optuna.trial.TrialState.FAIL
+        else:
+            print(
+                f'Trial is a success because runtime was {last_trial.values[0]} and accuracy was {last_trial.values[1]}')
+            last_trial.state = optuna.trial.TrialState.COMPLETE
 
     results: pd.DataFrame = study.trials_dataframe()
     # print(results.columns)
@@ -328,22 +367,48 @@ def save_plots(study, dataset_name: str, algorithm_name: str, size: int):
         target_names=["runtime",
                       "accuracy"])
     pareto.write_image(
-        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_sample_pareto.png')
+        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_sample_pareto_{NUM_NEIGHBOURS}_nn.png')
 
     # Plot params corresponding to highest accuracy trials.
-    parallel_accuracy: plotly.graph_objects.Figure = optuna.visualization.plot_parallel_coordinate(
-        study,
+    # parallel_accuracy: plotly.graph_objects.Figure = optuna.visualization.plot_parallel_coordinate(
+    #     study,
+    #     target=lambda targets: targets.values[1], target_name="accuracy")
+    #
+    # # Reverse direction of scale because it defaults to minimization (even
+    # # for accuracy) and apply changes.
+    # colorscale = plotly.colors.sequential.Blues[::-1]
+    #
+    # parallel_accuracy.update_traces(line=dict(colorscale=colorscale))
+    #
+    # parallel_accuracy.write_image(
+    #     f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_sample_parallel_accuracy.png')
+
+    # # Plot param importances.
+    # param_importances: plotly.graph_objects.Figure = optuna.visualization.plot_param_importances(
+    #     study)
+    #
+    # param_importances.write_image(
+    #     f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_param_importances.png')
+
+    # Plot contours for important parameters.
+    candidates_clusters_contour: plotly.graph_objects.Figure = optuna.visualization.plot_contour(
+        study, params=['num_candidates_per_neighbour', 'num_clusters'],
         target=lambda targets: targets.values[1], target_name="accuracy")
 
-    parallel_accuracy.write_image(
-        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_sample_parallel_accuracy.png')
+    candidates_iterations_contour: plotly.graph_objects.Figure = optuna.visualization.plot_contour(
+        study, params=['num_candidates_per_neighbour', 'num_kmeans_iterations'],
+        target=lambda targets: targets.values[1], target_name="accuracy")
 
-    # Plot param importances.
-    param_importances: plotly.graph_objects.Figure = optuna.visualization.plot_param_importances(
-        study)
+    clusters_iterations_contour: plotly.graph_objects.Figure = optuna.visualization.plot_contour(
+        study, params=['num_clusters', 'num_kmeans_iterations'],
+        target=lambda targets: targets.values[1], target_name="accuracy")
 
-    param_importances.write_image(
-        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_param_importances.png')
+    candidates_clusters_contour.write_image(
+        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_candidates_clusters_contour_{NUM_NEIGHBOURS}_nn.png')
+    candidates_iterations_contour.write_image(
+        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_candidates_iterations_contour_{NUM_NEIGHBOURS}_nn.png')
+    clusters_iterations_contour.write_image(
+        f'{KNN_DIR}/faiss/{algorithm_name}_{dataset_name}_auto_tuning_{size}_clusters_iterations_contour_{NUM_NEIGHBOURS}_nn.png')
 
 
 if __name__ == '__main__':
@@ -440,166 +505,293 @@ if __name__ == '__main__':
     #         save_plots(seaad_study, 'seaad', 'default', size)
 
     ### Auto-optimisation w/ Michael's implementation. ###
-    sizes = [1]
-    green_subsamples, seaad_subsamples = [], []
-
+    size = 100
     # Load up datasets.
-    for i in range(len(sizes)):
-        size = sizes[i]
-        # First Green...
-        sampled_cells = SingleCell(
-            f'{PROJECT_DIR}/single-cell/Subsampled/Green_{size}.h5ad',
-            X=False)
-        green_subsamples.append(sampled_cells)
+    # First Green...
+    sampled_cells = SingleCell(
+        f'{DATA_DIR}/single-cell/Subsampled/Green_{size}.h5ad',
+        X=False)
+    green_train, green_val = sampled_cells, sampled_cells
 
-        # Now SEAAD.
-        sampled_cells = SingleCell(
-            f'{PROJECT_DIR}/single-cell/Subsampled/SEAAD_{size}.h5ad',
-            X=False)
-        seaad_subsamples.append(sampled_cells)
+    # Now SEAAD.
+    sampled_cells = SingleCell(
+        f'{DATA_DIR}/single-cell/Subsampled/SEAAD_{size}.h5ad',
+        X=False)
+    seaad_train, seaad_val = sampled_cells, sampled_cells
+
+    # First, run with default parameters to get baseline performance over a couple of trials.
+    green_baseline = {
+        "accuracy": [],
+        'runtime': [],
+        "num_clusters": [],
+        "min_clusters_searched": [],
+        "max_clusters_searched": [],
+        "num_candidates_per_neighbour": [],
+        "num_kmeans_iterations": [],
+        "kmeans_barbar": [],
+    }
+
+    seaad_baseline = {
+        "accuracy": [],
+        'runtime': [],
+        "num_clusters": [],
+        "min_clusters_searched": [],
+        "max_clusters_searched": [],
+        "num_candidates_per_neighbour": [],
+        "num_kmeans_iterations": [],
+        "kmeans_barbar": [],
+    }
+
+    # Get true neighbours and cache if required.
+    if not os.path.exists(
+            f'{KNN_DIR}/data/seaad_true_{NUM_NEIGHBOURS}_nn_{size}.npy'):
+        true_nn_green = brute_force_knn(green_train.obsm['PCs'],
+                                        green_val.obsm['PCs'], NUM_NEIGHBOURS,
+                                        False, 'faiss',
+                                        f'{KNN_DIR}/data/green_true_{NUM_NEIGHBOURS}_nn_{size}.npy',
+                                        None, reject_self_neighbours=True)
+
+        true_nn_seaad = brute_force_knn(seaad_train.obsm['PCs'],
+                                        seaad_val.obsm['PCs'], NUM_NEIGHBOURS,
+                                        False, 'faiss',
+                                        f'{KNN_DIR}/data/seaad_true_{NUM_NEIGHBOURS}_nn_{size}.npy',
+                                        None, reject_self_neighbours=True)
+    else:
+        true_nn_green = brute_force_knn(green_train.obsm['PCs'],
+                                        green_val.obsm['PCs'], NUM_NEIGHBOURS,
+                                        True, 'faiss',
+                                        f'{KNN_DIR}/data/green_true_{NUM_NEIGHBOURS}_nn_{size}.npy',
+                                        None, reject_self_neighbours=True)
+
+        true_nn_seaad = brute_force_knn(seaad_train.obsm['PCs'],
+                                        seaad_val.obsm['PCs'], NUM_NEIGHBOURS,
+                                        True, 'faiss',
+                                        f'{KNN_DIR}/data/seaad_true_{NUM_NEIGHBOURS}_nn_{size}.npy',
+                                        None, reject_self_neighbours=True)
+
+    NUM_BASELINE_TRIALS = 1
+
+    # Compute green defaults.
+    num_green_cells = len(green_train.obsm['PCs'])
+    num_clusters_green = np.ceil(
+        np.minimum(np.sqrt(num_green_cells), num_green_cells / 100)).astype(
+        int)
+    min_clusters_searched_green = min(10,
+                                      NUM_NEIGHBOURS,
+                                      num_clusters_green)
+    max_clusters_searched_green = min(NUM_NEIGHBOURS,
+                                      num_clusters_green)
+    num_kmeans_iterations_green, num_kmeans_iterations_seaad = 10, 10
+    num_candidates_per_neighbour_green, num_candidates_per_neighbour_seaad = 10, 10
+    kmeans_barbar_green, kmeans_barbar_seaad = False, False
+
+    # Compute seaad defaults.
+    num_seaad_cells = len(seaad_train.obsm['PCs'])
+    num_clusters_seaad = np.ceil(
+        np.minimum(np.sqrt(num_seaad_cells), num_seaad_cells / 100)).astype(
+        int)
+    min_clusters_seaad = min(10, NUM_NEIGHBOURS, num_clusters_seaad)
+    max_clusters_seaad = min(NUM_NEIGHBOURS, num_clusters_seaad)
+
+    # Report sizes of datasets.
+    print(
+        f'Green has {num_green_cells} cells and SEAAD has {num_seaad_cells} cells.')
+
+    for i in range(NUM_BASELINE_TRIALS):
+        # First green, then seaad.
+        neighbours_green, runtime_green = profile_faiss_michael(green_train,
+                                                                None,
+                                                                num_clusters=None,
+                                                                min_clusters_searched=None,
+                                                                max_clusters_searched=None,
+                                                                num_candidates_per_neighbour=10,
+                                                                num_kmeans_iterations=10,
+                                                                num_neighbours=NUM_NEIGHBOURS)
+
+        # Compute accuracy.
+        accuracy_green = compute_accuracies(true_nn_green,
+                                            neighbours_green,
+                                            NUM_NEIGHBOURS)
+
+        # Add to results dict.
+        green_baseline["num_clusters"].append(num_clusters_green)
+        green_baseline["min_clusters_searched"].append(
+            min_clusters_searched_green)
+        green_baseline["max_clusters_searched"].append(
+            max_clusters_searched_green)
+
+        green_baseline["num_candidates_per_neighbour"].append(
+            num_candidates_per_neighbour_green)
+        green_baseline["num_kmeans_iterations"].append(
+            num_kmeans_iterations_green)
+        green_baseline['kmeans_barbar'].append(kmeans_barbar_green)
+
+        green_baseline["runtime"].append(runtime_green)
+        green_baseline["accuracy"].append(accuracy_green)
+
+        neighbours_seaad, runtime_seaad = profile_faiss_michael(seaad_train,
+                                                                None,
+                                                                num_clusters=None,
+                                                                min_clusters_searched=None,
+                                                                max_clusters_searched=None,
+                                                                num_candidates_per_neighbour=10,
+                                                                num_kmeans_iterations=10,
+                                                                num_neighbours=NUM_NEIGHBOURS)
+
+        accuracy_seaad = compute_accuracies(true_nn_seaad,
+                                            neighbours_seaad,
+                                            NUM_NEIGHBOURS)
+
+        seaad_baseline["num_clusters"].append(num_clusters_seaad)
+        seaad_baseline["min_clusters_searched"].append(min_clusters_seaad)
+        seaad_baseline["max_clusters_searched"].append(max_clusters_seaad)
+
+        seaad_baseline["num_candidates_per_neighbour"].append(
+            num_candidates_per_neighbour_green)
+        seaad_baseline["num_kmeans_iterations"].append(
+            num_kmeans_iterations_green)
+        seaad_baseline['kmeans_barbar'].append(kmeans_barbar_green)
+
+        seaad_baseline["runtime"].append(runtime_seaad)
+        seaad_baseline["accuracy"].append(accuracy_seaad)
+
+    # Convert to polars dataframe and write.
+    seaad_baseline_df = pl.DataFrame(seaad_baseline)
+    green_baseline_df = pl.DataFrame(green_baseline)
+    seaad_baseline_df.write_csv(
+        f'{KNN_DIR}/faiss/michael_seaad_{size}_sample_baseline_{NUM_NEIGHBOURS}_nn',
+        separator='\t')
+    green_baseline_df.write_csv(
+        f'{KNN_DIR}/faiss/michael_green_{size}_sample_baseline_{NUM_NEIGHBOURS}_nn',
+        separator='\t')
 
     # Auto-optimise.
-    for i in range(len(sizes)):
-        size = sizes[i]
-        green_data, seaad_data = green_subsamples[i], seaad_subsamples[i]
-        # TODO: split up data after generalising Michael's function to
-        #  label transfer case.
-        green_train, green_val = green_data, green_data
-        seaad_train, seaad_val = seaad_data, seaad_data
+    # Initialise hyperparams.
+    # 39 value was obtained from FAISS docs - specifies maximum number of
+    # clusters suggested.
+    # We should obviously split into at least as many clusters as there are neighbours.
+    NUM_CLUSTERS_GREEN = (
+        len(green_train) / 1500, len(green_train) / 150, 'int', True)
+    NUM_CLUSTERS_SEAAD = (
+        len(green_train) / 1500, len(seaad_train) / 150, 'int', True)
 
-        # TODO: Decide on hyperparam ranges.
-        # Initialise hyperparams.
-        # 39 value was obtained from FAISS docs - specifies maximum number of
-        # clusters suggested.
-        # We should obviously split into at least as many clusters as there are neighbours.
-        NUM_CLUSTERS_GREEN = (
-        NUM_NEIGHBOURS, len(green_train) / 39, 'int', True)
-        NUM_CLUSTERS_SEAAD = (
-        NUM_NEIGHBOURS, len(seaad_train) / 39, 'int', True)
-
-        # Shouldn't try to search more clusters than there exist clusters.
-        # Clearly we should try to search at least as many clusters as there are neighbours.
-        MIN_CLUSTERS_SEARCHED = (NUM_NEIGHBOURS, 'num_clusters', 'int', True)
-        MAX_CLUSTERS_SEARCHED = (
+    # Shouldn't try to search more clusters than there exist clusters.
+    # Clearly we should try to search at least as many clusters as there are neighbours.
+    MIN_CLUSTERS_SEARCHED = (NUM_NEIGHBOURS, 'num_clusters', 'int', True)
+    MAX_CLUSTERS_SEARCHED = (
         'min_clusters_searched', 'num_clusters', 'int', True)
 
-        NUM_CANDIDATES_PER_NEIGHBOUR = (5, 100, 'int', True)
-        NUM_KMEANS_ITERATIONS = (1, 10, 'int', True)
-        KMEANS_BARBAR = (0, 1, 'int', False)
+    NUM_CANDIDATES_PER_NEIGHBOUR = (5, 50, 'int', True)
+    NUM_KMEANS_ITERATIONS = (1, 10, 'int', True)
 
-        hyperparam_ranges_faiss_default_green = {
-            'num_clusters': NUM_CLUSTERS_GREEN,
-            'min_clusters_searched': MIN_CLUSTERS_SEARCHED,
-            'max_clusters_searched': MAX_CLUSTERS_SEARCHED,
-            'num_candidates_per_neighbour': NUM_CANDIDATES_PER_NEIGHBOUR,
-            'num_kmeans_iterations': NUM_KMEANS_ITERATIONS,
-            'kmeans_barbar': KMEANS_BARBAR}
+    hyperparam_ranges_faiss_default_green = {
+        'num_clusters': NUM_CLUSTERS_GREEN,
+        'min_clusters_searched': MIN_CLUSTERS_SEARCHED,
+        'max_clusters_searched': MAX_CLUSTERS_SEARCHED,
+        'num_candidates_per_neighbour': NUM_CANDIDATES_PER_NEIGHBOUR,
+        'num_kmeans_iterations': NUM_KMEANS_ITERATIONS,
+    }
 
-        hyperparam_ranges_faiss_default_seaad = {
-            'num_clusters': NUM_CLUSTERS_SEAAD,
-            'min_clusters_searched': MIN_CLUSTERS_SEARCHED,
-            'max_clusters_searched': MAX_CLUSTERS_SEARCHED,
-            'num_candidates_per_neighbour': NUM_CANDIDATES_PER_NEIGHBOUR,
-            'num_kmeans_iterations': NUM_KMEANS_ITERATIONS,
-            'kmeans_barbar': KMEANS_BARBAR}
+    hyperparam_ranges_faiss_default_seaad = {
+        'num_clusters': NUM_CLUSTERS_SEAAD,
+        'min_clusters_searched': MIN_CLUSTERS_SEARCHED,
+        'max_clusters_searched': MAX_CLUSTERS_SEARCHED,
+        'num_candidates_per_neighbour': NUM_CANDIDATES_PER_NEIGHBOUR,
+        'num_kmeans_iterations': NUM_KMEANS_ITERATIONS,
+    }
+    # First Green.
+    results, green_study = auto_optimise(green_train, None,
+                                         true_nn_green,
+                                         NUM_TRIALS, objective_knn,
+                                         hyperparam_ranges_faiss_default_green,
+                                         profile_faiss_michael)
+    results = results.sort('accuracy', descending=True)
+    results.write_csv(
+        f'{KNN_DIR}/faiss/michael_green_auto_tuning_{size}_sample_results_{NUM_NEIGHBOURS}_nn',
+        separator='\t')
+    save_plots(green_study, 'green', 'michael', size)
 
-        # First Green.
-        if not os.path.exists(
-                f'{KNN_DIR}/faiss/michael_green_auto_tuning_{size}_sample_results'):
-            current_sampled_green_pcs = green_subsamples[i]
-        results, green_study = auto_optimise(green_train, green_val,
-                                             NUM_TRIALS, objective_knn,
-                                             hyperparam_ranges_faiss_default_green,
-                                             profile_faiss_michael)
-        results = results.sort('accuracy', descending=True)
-        results.write_csv(
-            f'{KNN_DIR}/faiss/michael_green_auto_tuning_{size}_sample_results',
-            separator='\t')
-        save_plots(green_study, 'green', 'michael', size)
+    # Now SEAAD.
+    results, seaad_study = auto_optimise(seaad_train, None,
+                                         true_nn_seaad,
+                                         NUM_TRIALS, objective_knn,
+                                         hyperparam_ranges_faiss_default_seaad,
+                                         profile_faiss_michael)
+    results = results.sort('accuracy', descending=True)
+    results.write_csv(
+        f'{KNN_DIR}/faiss/michael_seaad_auto_tuning_{size}_sample_results_{NUM_NEIGHBOURS}_nn',
+        separator='\t')
+    save_plots(seaad_study, 'seaad', 'michael', size)
 
-        # Now SEAAD.
-        if not os.path.exists(
-                f'{KNN_DIR}/faiss/michael_seaad_auto_tuning_{size}_sample_results'):
-            current_sampled_seadd_pcs = seaad_subsamples[i]
-        results, seaad_study = auto_optimise(seaad_train, seaad_val,
-                                             NUM_TRIALS, objective_knn,
-                                             hyperparam_ranges_faiss_default_seaad,
-                                             profile_faiss_michael)
-        results = results.sort('accuracy', descending=True)
-        results.write_csv(
-            f'{KNN_DIR}/faiss/michael_seaad_auto_tuning_{size}_sample_results',
-            separator='\t')
-        save_plots(seaad_study, 'seaad', 'michael', size)
-
-        # ### Manual optimisation. ###
-        # sample, sample_indices, sample_train_data, sample_test_data = sample_data(
-        #     pcs, 50)
-        #
-        # # full_train_data, full_test_data = split_data(pcs, 50, f'{KNN_DIR}/rosmap_pcs_full_train', f'{KNN_DIR}/rosmap_pcs_full_test')
-        #
-        # train_data, test_data = sample_train_data, sample_test_data
-        #
-        # # Keep in mind that FAISS recommended scaling factors are 39 - 256 cells per cluster, 4 - 16 times sqrt(num cells).
-        # centroid_scaling_factor_list = list(range(4, 20, 4))
-        # num_cells_per_centroid_list = list(range(39, 256, 50))
-        #
-        # if not os.path.exists(f'{KNN_DIR}/faiss/results'):
-        #     results = pl.DataFrame(schema={'centroid_scale_factor': pl.Float64,
-        #                                    'num_cells_per_centroid': pl.Int64,
-        #                                    'num_centroid_generator': pl.String,
-        #                                    'time': pl.Float64,
-        #                                    'application': pl.String})
-        # else:
-        #     results = pl.read_csv(
-        #         f'{KNN_DIR}/faiss/results', separator='\t')
-        #
-        # entries = {'centroid_scale_factor': [],
-        #            'num_cells_per_centroid': [],
-        #            'num_centroid_generator': [],
-        #            'time': [],
-        #            'application': []}
-        #
-        # for centroid_scale_factor in centroid_scaling_factor_list:
-        #     for num_cells_per_centroid in num_cells_per_centroid_list:
-        #         num_centroids = get_num_centroids_michael(len(train_data),
-        #                                                   centroid_scale_factor,
-        #                                                   num_cells_per_centroid)
-        #         # Label transfer.
-        #         _, index_time, search_time = profile_faiss_ivf(train_data,
-        #                                                        30,
-        #                                                        num_centroids, 5,
-        #                                                        test_data,
-        #                                                        True)
-        #         entries['centroid_scale_factor'].append(centroid_scale_factor)
-        #         entries['num_cells_per_centroid'].append(num_cells_per_centroid)
-        #         entries['num_centroid_generator'].append(
-        #             get_num_centroids_michael.__name__)
-        #         entries['time'].append(search_time + index_time)
-        #         entries['application'].append(LABEL_TRANSFER)
-        #
-        #         # UMAP.
-        #         _, index_time, search_time = profile_faiss_ivf(train_data,
-        #                                                        30,
-        #                                                        num_centroids, 5,
-        #                                                        test_data,
-        #                                                        True)
-        #         entries['centroid_scale_factor'].append(
-        #             centroid_scale_factor)
-        #         entries['num_cells_per_centroid'].append(
-        #             num_cells_per_centroid)
-        #         entries['num_centroid_generator'].append(
-        #             get_num_centroids_michael.__name__)
-        #         entries['time'].append(search_time + index_time)
-        #         entries['application'].append(UMAP)
-        #
-        # results = results.vstack(
-        #     pl.DataFrame(entries, schema={'centroid_scale_factor': pl.Float64,
-        #                                   'num_cells_per_centroid': pl.Int64,
-        #                                   'num_centroid_generator': pl.String,
-        #                                   'time': pl.Float64,
-        #                                   'application': pl.String}))
-        # # Ensures that all rows are in a contiguous block of memory.
-        # results.rechunk()
-        # results.write_csv(
-        #     file=f'{KNN_DIR}/faiss/manual_tuning_results',
-        #     separator='\t')
+    # ### Manual optimisation. ###
+    # sample, sample_indices, sample_train_data, sample_test_data = sample_data(
+    #     pcs, 50)
+    #
+    # # full_train_data, full_test_data = split_data(pcs, 50, f'{KNN_DIR}/rosmap_pcs_full_train', f'{KNN_DIR}/rosmap_pcs_full_test')
+    #
+    # train_data, test_data = sample_train_data, sample_test_data
+    #
+    # # Keep in mind that FAISS recommended scaling factors are 39 - 256 cells per cluster, 4 - 16 times sqrt(num cells).
+    # centroid_scaling_factor_list = list(range(4, 20, 4))
+    # num_cells_per_centroid_list = list(range(39, 256, 50))
+    #
+    # if not os.path.exists(f'{KNN_DIR}/faiss/results'):
+    #     results = pl.DataFrame(schema={'centroid_scale_factor': pl.Float64,
+    #                                    'num_cells_per_centroid': pl.Int64,
+    #                                    'num_centroid_generator': pl.String,
+    #                                    'time': pl.Float64,
+    #                                    'application': pl.String})
+    # else:
+    #     results = pl.read_csv(
+    #         f'{KNN_DIR}/faiss/results', separator='\t')
+    #
+    # entries = {'centroid_scale_factor': [],
+    #            'num_cells_per_centroid': [],
+    #            'num_centroid_generator': [],
+    #            'time': [],
+    #            'application': []}
+    #
+    # for centroid_scale_factor in centroid_scaling_factor_list:
+    #     for num_cells_per_centroid in num_cells_per_centroid_list:
+    #         num_centroids = get_num_centroids_michael(len(train_data),
+    #                                                   centroid_scale_factor,
+    #                                                   num_cells_per_centroid)
+    #         # Label transfer.
+    #         _, index_time, search_time = profile_faiss_ivf(train_data,
+    #                                                        30,
+    #                                                        num_centroids, 5,
+    #                                                        test_data,
+    #                                                        True)
+    #         entries['centroid_scale_factor'].append(centroid_scale_factor)
+    #         entries['num_cells_per_centroid'].append(num_cells_per_centroid)
+    #         entries['num_centroid_generator'].append(
+    #             get_num_centroids_michael.__name__)
+    #         entries['time'].append(search_time + index_time)
+    #         entries['application'].append(LABEL_TRANSFER)
+    #
+    #         # UMAP.
+    #         _, index_time, search_time = profile_faiss_ivf(train_data,
+    #                                                        30,
+    #                                                        num_centroids, 5,
+    #                                                        test_data,
+    #                                                        True)
+    #         entries['centroid_scale_factor'].append(
+    #             centroid_scale_factor)
+    #         entries['num_cells_per_centroid'].append(
+    #             num_cells_per_centroid)
+    #         entries['num_centroid_generator'].append(
+    #             get_num_centroids_michael.__name__)
+    #         entries['time'].append(search_time + index_time)
+    #         entries['application'].append(UMAP)
+    #
+    # results = results.vstack(
+    #     pl.DataFrame(entries, schema={'centroid_scale_factor': pl.Float64,
+    #                                   'num_cells_per_centroid': pl.Int64,
+    #                                   'num_centroid_generator': pl.String,
+    #                                   'time': pl.Float64,
+    #                                   'application': pl.String}))
+    # # Ensures that all rows are in a contiguous block of memory.
+    # results.rechunk()
+    # results.write_csv(
+    #     file=f'{KNN_DIR}/faiss/manual_tuning_results',
+    #     separator='\t')
